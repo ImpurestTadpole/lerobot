@@ -42,6 +42,8 @@ def suppress_output():
 
 def init_rerun(
     session_name: str = "lerobot_control_loop",
+    ip: str | None = None,
+    port: int | None = None,
     headless: bool = True,
     grpc_port: int = 9876,
     web_port: int = 9090,
@@ -52,26 +54,37 @@ def init_rerun(
     
     Args:
         session_name: Name of the Rerun session.
+        ip: Optional IP for connecting to a Rerun server (upstream compatibility).
+        port: Optional port for connecting to a Rerun server (upstream compatibility).
         headless: If True, run in headless mode with gRPC server (default).
                   If False, spawn a local GUI viewer.
                   Can be overridden by RERUN_HEADLESS env var ("true"/"false").
+                  Ignored if ip and port are provided.
         grpc_port: Port for gRPC server (default 9876).
         web_port: Port for web viewer (default 9090) - DEPRECATED, not used anymore.
         open_browser: Whether to attempt opening browser (default False for headless).
         server_memory_limit: Server-side buffer for late viewers (default "25%").
     
     Notes:
-        In headless mode (default), only the gRPC server is started on the Jetson.
+        If ip and port are provided, uses upstream's connection logic.
+        Otherwise, uses advanced headless mode: only the gRPC server is started on the Jetson.
         To view data, run the web viewer on your external computer (with GPU):
             rerun --serve-web --web-viewer-port 9090 --connect "rerun+http://JETSON_IP:9876/proxy"
         Then open http://localhost:9090 on your external computer's browser.
     """
-    # Existing env tweaks
     batch_size = os.getenv("RERUN_FLUSH_NUM_BYTES", "8000")
     os.environ["RERUN_FLUSH_NUM_BYTES"] = batch_size
     
     rr.init(session_name)
     
+    # Upstream compatibility: if ip and port are provided, use upstream's logic
+    if ip and port:
+        memory_limit = os.getenv("LEROBOT_RERUN_MEMORY_LIMIT", "10%")
+        rr.connect_grpc(url=f"rerun+http://{ip}:{port}/proxy")
+        rr.spawn(memory_limit=memory_limit)
+        return
+
+    # User's advanced headless mode logic
     # Check if headless mode is overridden by environment variable
     headless_env = os.getenv("RERUN_HEADLESS")
     if headless_env is not None:
@@ -134,6 +147,7 @@ def _downsample_image(image: np.ndarray, scale_factor: float) -> np.ndarray:
 def log_rerun_data(
     observation: dict[str, Any] | None = None,
     action: dict[str, Any] | None = None,
+    compress_images: bool = False,
 ) -> None:
     """
     Logs observation and action data to Rerun for real-time visualization.
@@ -142,7 +156,8 @@ def log_rerun_data(
     to the Rerun viewer. It handles different data types appropriately:
     - Scalars values (floats, ints) are logged as `rr.Scalars`.
     - 3D NumPy arrays that resemble images (e.g., with 1, 3, or 4 channels first) are transposed
-      from CHW to HWC format and logged as `rr.Image`. Images are downsampled for bandwidth reduction.
+      from CHW to HWC format, (optionally) compressed to JPEG and logged as `rr.Image` or `rr.EncodedImage`.
+      Images are downsampled for bandwidth reduction if RERUN_DOWNSAMPLE_FACTOR is set.
     - 1D NumPy arrays are logged as a series of individual scalars, with each element indexed.
     - Other multi-dimensional arrays are flattened and logged as individual scalars.
 
@@ -155,6 +170,7 @@ def log_rerun_data(
     Args:
         observation: An optional dictionary containing observation data to log.
         action: An optional dictionary containing action data to log.
+        compress_images: Whether to compress images before logging to save bandwidth & memory in exchange for cpu and quality.
     """
     # Get downsample factor from environment (default: 0.5 for half resolution)
     downsample_factor = float(os.getenv("RERUN_DOWNSAMPLE_FACTOR", "0.5"))
@@ -183,7 +199,8 @@ def log_rerun_data(
                     for i, vi in enumerate(arr):
                         rr.log(f"{key}_{i}", rr.Scalars(float(vi)))
                 else:
-                    rr.log(key, rr.Image(arr), static=True)
+                    img_entity = rr.Image(arr).compress() if compress_images else rr.Image(arr)
+                    rr.log(key, entity=img_entity, static=True)
 
     if action:
         for k, v in action.items():
