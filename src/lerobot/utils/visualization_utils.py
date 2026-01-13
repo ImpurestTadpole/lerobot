@@ -16,13 +16,14 @@ import contextlib
 import numbers
 import os
 import sys
-from typing import Any
 
 import cv2
 import numpy as np
 import rerun as rr
 
-from .constants import OBS_PREFIX, OBS_STR
+from lerobot.processor import RobotAction, RobotObservation
+
+from .constants import ACTION, ACTION_PREFIX, OBS_PREFIX, OBS_STR
 
 
 @contextlib.contextmanager
@@ -145,8 +146,8 @@ def _downsample_image(image: np.ndarray, scale_factor: float) -> np.ndarray:
 
 
 def log_rerun_data(
-    observation: dict[str, Any] | None = None,
-    action: dict[str, Any] | None = None,
+    observation: RobotObservation | None = None,
+    action: RobotAction | None = None,
     compress_images: bool = False,
 ) -> None:
     """
@@ -206,7 +207,7 @@ def log_rerun_data(
         for k, v in action.items():
             if v is None:
                 continue
-            key = k if str(k).startswith("action.") else f"action.{k}"
+            key = k if str(k).startswith(ACTION_PREFIX) else f"{ACTION}.{k}"
 
             if _is_scalar(v):
                 rr.log(key, rr.Scalars(float(v)))
