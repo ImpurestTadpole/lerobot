@@ -16,7 +16,7 @@ from dataclasses import dataclass, field
 
 from lerobot.cameras.configs import CameraConfig, Cv2Rotation, ColorMode
 from lerobot.cameras.opencv.configuration_opencv import OpenCVCameraConfig
-from lerobot.cameras.realsense import RealSenseCamera, RealSenseCameraConfig
+from lerobot.cameras.realsense.configuration_realsense import RealSenseCameraConfig
 
 from ..config import RobotConfig
 
@@ -34,21 +34,36 @@ def xlerobot_cameras_config() -> dict[str, CameraConfig]:
     needing rename_map during training or inference.
     
     Note: camera1 MUST be opened FIRST to avoid resource conflicts.
+    Head camera MUST be opened FIRST to avoid resource conflicts.
+    Opening it after wrist cameras causes it to fail.
     """
     return {
-        # camera1: Top/overhead view (was "head")
+        # camera1: Top/overhead view (head) - Intel RealSense D435i
         # MUST be opened FIRST to avoid resource conflicts
-        "camera1": OpenCVCameraConfig(
-            index_or_path="/dev/video4", 
+        # NOTE: Replace "YOUR_D435i_SERIAL_NUMBER" with your actual D435i serial number
+        # You can find it by running: rs-enumerate-devices
+        "head": RealSenseCameraConfig(
+            serial_number_or_name="342222071125",  # Replace with your D435i serial number
             fps=30,
-            width=640,
-            height=480,
-            fourcc="MJPG",
+            width=1280,
+            height=720,
+            color_mode=ColorMode.BGR,  # Request BGR output
             rotation=Cv2Rotation.NO_ROTATION,
+            use_depth=True,
         ),
         
+        # Original RGB camera (commented out, can be re-enabled if needed)
+        # "head": OpenCVCameraConfig(
+        #     index_or_path="/dev/video0", 
+        #     fps=30,
+        #     width=640,
+        #     height=480,
+        #     fourcc="MJPG",
+        #     rotation=Cv2Rotation.NO_ROTATION,
+        # ),
+        
         # camera2: Wrist view (was "left_wrist")
-        "camera2": OpenCVCameraConfig(
+        "left_wrist": OpenCVCameraConfig(
             index_or_path="/dev/video2",
             fps=30,
             width=640,
@@ -56,27 +71,16 @@ def xlerobot_cameras_config() -> dict[str, CameraConfig]:
             fourcc="MJPG",
             rotation=Cv2Rotation.NO_ROTATION,
         ),     
-        
+
         # camera3: Additional view (was "right_wrist")
-        "camera3": OpenCVCameraConfig(
-            index_or_path="/dev/video0",
+        "right_wrist": OpenCVCameraConfig(
+            index_or_path="/dev/video4",
             fps=30,
             width=640,
             height=480,
             fourcc="MJPG",
             rotation=Cv2Rotation.NO_ROTATION,
-        ),
-        
-        # Optional: RealSense camera configuration (commented out)
-        # "camera1": RealSenseCameraConfig(
-        #     serial_number_or_name="125322060037",  # Replace with camera SN
-        #     fps=30,
-        #     width=1280,
-        #     height=720,
-        #     color_mode=ColorMode.BGR, # Request BGR output
-        #     rotation=Cv2Rotation.NO_ROTATION,
-        #     use_depth=True
-        # ),
+        ),        
     }
 
 
@@ -84,10 +88,9 @@ def xlerobot_cameras_config() -> dict[str, CameraConfig]:
 @dataclass
 class XLerobotConfig(RobotConfig):
     
-    port1: str = "/dev/ttyACM1"  # port to connect to the bus (left arm motors 1-6)
-    port2: str = "/dev/ttyACM2"  # port to connect to the bus (right arm motors 1-6)
-    port3: str = "/dev/ttyACM0"  # port to connect to the bus (base motors 7-9)
-    camera_start_order: tuple[str, ...] | None = ("camera1", "camera2", "camera3")
+    port1: str = "/dev/ttyACM1"  # port to connect to the bus (left arm motors 1-6 + base motors 7-9)
+    port2: str = "/dev/ttyACM2"  # port to connect to the bus (right arm motors 1-6 + head motors 7-8)
+    camera_start_order: tuple[str, ...] | None = ("head", "left_wrist", "right_wrist")
     camera_start_delay_s: float = 0.5
     disable_torque_on_disconnect: bool = True
 
