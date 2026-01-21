@@ -315,10 +315,11 @@ class SimpleTeleopArm:
                                                self.target_positions["elbow_flex"] + self.pitch)
    
         # Handle gripper state directly
+        # RANGE_0_100: 0 = fully open, 100 = fully closed
         if vr_goal.metadata.get('trigger', 0) > 0.5:
-            self.target_positions["gripper"] = 45
+            self.target_positions["gripper"] = 100.0  # Fully closed
         else:
-            self.target_positions["gripper"] = 0.0
+            self.target_positions["gripper"] = 0.0  # Fully open
 
     def p_control_action(self, robot_obs):
         """
@@ -337,6 +338,85 @@ class SimpleTeleopArm:
             error = self.target_positions[j] - current[j]
             control = self.kp * error
             action[f"{self.joint_map[j]}.pos"] = current[j] + control
+        return action
+
+
+class SimpleHeadControl:
+    """
+    A class for controlling robot head motors using VR headset orientation.
+    
+    Maps VR headset yaw (pan) and pitch (tilt) to head motor commands with proportional control.
+    """
+    
+    def __init__(self, initial_obs, kp=1.0, max_pan_deg=90, max_tilt_deg=45):
+        """
+        Initialize head control.
+        
+        Args:
+            initial_obs: Initial robot observation to get current head positions
+            kp: Proportional control gain
+            max_pan_deg: Maximum pan angle in degrees (default ±90)
+            max_tilt_deg: Maximum tilt angle in degrees (default ±45)
+        """
+        self.kp = kp
+        self.max_pan_deg = max_pan_deg
+        self.max_tilt_deg = max_tilt_deg
+        
+        # Initialize head motor positions from observation
+        self.target_positions = {
+            "head_pan": initial_obs.get("head_pan.pos", 0.0),
+            "head_tilt": initial_obs.get("head_tilt.pos", 0.0),
+        }
+        self.zero_pos = {"head_pan": 0.0, "head_tilt": 0.0}
+        
+    def handle_vr_input(self, headset_goal):
+        """
+        Handle VR headset orientation data.
+        
+        Args:
+            headset_goal: ControlGoal with headset metadata containing head_pan and head_tilt in degrees
+        """
+        if headset_goal is None or not hasattr(headset_goal, 'metadata'):
+            return
+            
+        # Extract head pan and tilt from headset goal metadata
+        # head_pan: yaw angle (left/right), head_tilt: pitch angle (up/down)
+        # Invert both pan and tilt to match robot movement direction
+        head_pan_deg = -headset_goal.metadata.get('head_pan', 0.0)  # Inverted
+        head_tilt_deg = -headset_goal.metadata.get('head_tilt', 0.0)  # Inverted
+        
+        # Clamp to safe ranges
+        head_pan_deg = max(-self.max_pan_deg, min(self.max_pan_deg, head_pan_deg))
+        head_tilt_deg = max(-self.max_tilt_deg, min(self.max_tilt_deg, head_tilt_deg))
+        
+        # Update target positions (in degrees, will be normalized by motor calibration)
+        self.target_positions["head_pan"] = head_pan_deg
+        self.target_positions["head_tilt"] = head_tilt_deg
+        
+    def move_to_zero_position(self, robot):
+        """Move head to zero position."""
+        print(f"[HEAD] Moving to Zero Position: {self.zero_pos} ......")
+        self.target_positions = self.zero_pos.copy()
+        action = self.p_control_action(robot)
+        robot.send_action(action)
+        return action
+
+    def p_control_action(self, robot_obs):
+        """
+        Generate proportional control action for head motors.
+        
+        Args:
+            robot_obs: Robot observation dictionary
+            
+        Returns:
+            dict: Action dictionary with position commands for head motors
+        """
+        action = {}
+        for motor_name in self.target_positions:
+            current = robot_obs.get(f"{motor_name}.pos", 0.0)
+            error = self.target_positions[motor_name] - current
+            control = self.kp * error
+            action[f"{motor_name}.pos"] = current + control
         return action
 
 
@@ -457,6 +537,9 @@ class XLerobotVRTeleop(Teleoperator):
         # Arm controllers (initialized during calibrate, guarded elsewhere)
         self.left_arm = None
         self.right_arm = None
+        
+        # Head controller (initialized during calibrate)
+        self.head_control = None
         
         # Base speed control
         self.current_base_speed = 0.0
@@ -597,7 +680,12 @@ class XLerobotVRTeleop(Teleoperator):
                 prefix="right", kp=self.config.kp
             )
             
-            logger.info("[VR] Controllers initialized successfully")
+            # Initialize head controller
+            self.head_control = SimpleHeadControl(
+                robot_obs, kp=self.config.kp
+            )
+            
+            logger.info("[VR] Controllers initialized successfully (arms + head)")
             self._calibrated = True
             
         except Exception as e:
@@ -635,6 +723,7 @@ class XLerobotVRTeleop(Teleoperator):
                 
             left_goal = dual_goals.get("left")
             right_goal = dual_goals.get("right")
+            headset_goal = dual_goals.get("headset")
             
         except Exception as e:
             logger.warning(f"VR data acquisition failed: {e}")
@@ -680,6 +769,10 @@ class XLerobotVRTeleop(Teleoperator):
             if right_goal is not None and self.right_arm is not None:
                 self.right_arm.handle_vr_input(right_goal, None)
             
+            # Head control - process headset orientation
+            if headset_goal is not None and self.head_control is not None:
+                self.head_control.handle_vr_input(headset_goal)
+            
             # Event processing - optimized frequency (10Hz)
             if (current_time - self.last_event_update_time) >= 0.1:
                 if left_goal is not None:
@@ -689,6 +782,7 @@ class XLerobotVRTeleop(Teleoperator):
             # Generate action dictionary
             left_action = self.left_arm.p_control_action(robot_obs) if self.left_arm is not None else {}
             right_action = self.right_arm.p_control_action(robot_obs) if self.right_arm is not None else {}
+            head_action = self.head_control.p_control_action(robot_obs) if self.head_control is not None else {}
             
             # DIAGNOSTIC: Log what's in the VR goals
             if left_goal is not None and hasattr(left_goal, 'metadata'):
@@ -721,6 +815,7 @@ class XLerobotVRTeleop(Teleoperator):
             # Merge actions
             action.update(left_action)
             action.update(right_action)
+            action.update(head_action)
             action.update(base_action)
             
             # Verify base action was merged (debug)

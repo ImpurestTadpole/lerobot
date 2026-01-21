@@ -70,23 +70,32 @@ class XLerobot(Robot):
                 "left_arm_wrist_flex": self.calibration.get("left_arm_wrist_flex"),
                 "left_arm_wrist_roll": self.calibration.get("left_arm_wrist_roll"),
                 "left_arm_gripper": self.calibration.get("left_arm_gripper"),
+                "base_left_wheel": self.calibration.get("base_left_wheel"),
+                "base_back_wheel": self.calibration.get("base_back_wheel"),
+                "base_right_wheel": self.calibration.get("base_right_wheel"),
             }
         else:
             calibration1 = self.calibration
         
+        # Bus 1 (port1): Left arm motors (IDs 1-6) + Base motors (IDs 7-9)
         self.bus1 = FeetechMotorsBus(
             port=self.config.port1,
             motors={
-                # left arm
+                # Left arm motors (6 motors, position control)
                 "left_arm_shoulder_pan": Motor(1, "sts3215", norm_mode_body),
                 "left_arm_shoulder_lift": Motor(2, "sts3215", norm_mode_body),
                 "left_arm_elbow_flex": Motor(3, "sts3215", norm_mode_body),
                 "left_arm_wrist_flex": Motor(4, "sts3215", norm_mode_body),
                 "left_arm_wrist_roll": Motor(5, "sts3215", norm_mode_body),
                 "left_arm_gripper": Motor(6, "sts3215", MotorNormMode.RANGE_0_100),
+                # Base motors (3 motors, velocity control) - 3-wheel omni
+                "base_left_wheel": Motor(7, "sts3215", MotorNormMode.RANGE_M100_100),
+                "base_back_wheel": Motor(8, "sts3215", MotorNormMode.RANGE_M100_100),
+                "base_right_wheel": Motor(9, "sts3215", MotorNormMode.RANGE_M100_100),
             },
-            calibration= calibration1,
+            calibration=calibration1,
         )
+        # Bus 2 (port2): Right arm motors (IDs 1-6) + Head motors (IDs 7-8)
         if self.calibration.get("right_arm_shoulder_pan") is not None:
             calibration2 = {
                 "right_arm_shoulder_pan": self.calibration.get("right_arm_shoulder_pan"),
@@ -95,45 +104,32 @@ class XLerobot(Robot):
                 "right_arm_wrist_flex": self.calibration.get("right_arm_wrist_flex"),
                 "right_arm_wrist_roll": self.calibration.get("right_arm_wrist_roll"),
                 "right_arm_gripper": self.calibration.get("right_arm_gripper"),
+                "head_pan": self.calibration.get("head_pan"),
+                "head_tilt": self.calibration.get("head_tilt"),
             }
         else:
             calibration2 = self.calibration
         self.bus2 = FeetechMotorsBus(
             port=self.config.port2,
             motors={
-                # right arm
+                # Right arm motors (6 motors, position control)
                 "right_arm_shoulder_pan": Motor(1, "sts3215", norm_mode_body),
                 "right_arm_shoulder_lift": Motor(2, "sts3215", norm_mode_body),
                 "right_arm_elbow_flex": Motor(3, "sts3215", norm_mode_body),
                 "right_arm_wrist_flex": Motor(4, "sts3215", norm_mode_body),
                 "right_arm_wrist_roll": Motor(5, "sts3215", norm_mode_body),
                 "right_arm_gripper": Motor(6, "sts3215", MotorNormMode.RANGE_0_100),
+                # Head motors (2 motors, position control)
+                "head_pan": Motor(7, "sts3215", norm_mode_body),
+                "head_tilt": Motor(8, "sts3215", norm_mode_body),
             },
             calibration=calibration2,
         )
         
-        if self.calibration.get("base_left_wheel") is not None:
-            calibration3 = {
-                "base_left_wheel": self.calibration.get("base_left_wheel"),
-                "base_back_wheel": self.calibration.get("base_back_wheel"),
-                "base_right_wheel": self.calibration.get("base_right_wheel"),
-            }
-        else:
-            calibration3 = self.calibration
-        self.bus3 = FeetechMotorsBus(
-            port=self.config.port3,
-            motors={
-                # base
-                "base_left_wheel": Motor(7, "sts3215", MotorNormMode.RANGE_M100_100),
-                "base_back_wheel": Motor(8, "sts3215", MotorNormMode.RANGE_M100_100),
-                "base_right_wheel": Motor(9, "sts3215", MotorNormMode.RANGE_M100_100),
-            },
-            calibration=calibration3,
-        )
-        
         self.left_arm_motors = [motor for motor in self.bus1.motors if motor.startswith("left_arm")]
         self.right_arm_motors = [motor for motor in self.bus2.motors if motor.startswith("right_arm")]
-        self.base_motors = [motor for motor in self.bus3.motors if motor.startswith("base")]
+        self.head_motors = [motor for motor in self.bus2.motors if motor.startswith("head")]
+        self.base_motors = [motor for motor in self.bus1.motors if motor.startswith("base")]
         self.cameras = make_cameras_from_configs(config.cameras)
         
         # Create persistent thread pool for parallel bus reads (avoid overhead of creating/destroying)
@@ -155,6 +151,8 @@ class XLerobot(Robot):
                 "right_arm_wrist_flex.pos",
                 "right_arm_wrist_roll.pos",
                 "right_arm_gripper.pos",
+                "head_pan.pos",
+                "head_tilt.pos",
                 "x.vel",
                 "y.vel",
                 "theta.vel",
@@ -178,9 +176,9 @@ class XLerobot(Robot):
 
     @property
     def is_connected(self) -> bool:
-        return self.bus1.is_connected and self.bus2.is_connected and self.bus3.is_connected and all(
-            cam.is_connected for cam in self.cameras.values()
-        )
+        # Robot is connected if buses are connected
+        # Cameras are optional - robot can function without all cameras
+        return self.bus1.is_connected and self.bus2.is_connected
 
     def connect(self, calibrate: bool = True) -> None:
         if self.is_connected:
@@ -188,7 +186,6 @@ class XLerobot(Robot):
 
         self.bus1.connect()
         self.bus2.connect()
-        self.bus3.connect()
         
         # Check if calibration file exists and ask user if they want to restore it
         if self.calibration_fpath.is_file():
@@ -202,13 +199,11 @@ class XLerobot(Robot):
                     # Load calibration data into bus memory
                     self.bus1.calibration = {k: v for k, v in self.calibration.items() if k in self.bus1.motors}
                     self.bus2.calibration = {k: v for k, v in self.calibration.items() if k in self.bus2.motors}
-                    self.bus3.calibration = {k: v for k, v in self.calibration.items() if k in self.bus3.motors}
                     logger.info("Calibration data loaded into bus memory successfully!")
                     
                     # Write calibration data to motors
                     self.bus1.write_calibration({k: v for k, v in self.calibration.items() if k in self.bus1.motors})
                     self.bus2.write_calibration({k: v for k, v in self.calibration.items() if k in self.bus2.motors})
-                    self.bus3.write_calibration({k: v for k, v in self.calibration.items() if k in self.bus3.motors})
                     logger.info("Calibration restored successfully from file!")
                     
                 except Exception as e:
@@ -254,7 +249,7 @@ class XLerobot(Robot):
 
     @property
     def is_calibrated(self) -> bool:
-        return self.bus1.is_calibrated and self.bus2.is_calibrated and self.bus3.is_calibrated
+        return self.bus1.is_calibrated and self.bus2.is_calibrated
 
     def calibrate(self) -> None:
         logger.info(f"\nRunning calibration of {self}")
@@ -266,27 +261,24 @@ class XLerobot(Robot):
         input(
             "Move left arm motors to the middle of their range of motion and press ENTER...."
         )
-        homing_offsets = self.bus1.set_half_turn_homings(left_motors)
-        homing_offsets.update(dict.fromkeys(self.right_arm_motors, 0))
-        homing_offsets.update(dict.fromkeys(self.base_motors, 0))
+        homing_offsets_left = self.bus1.set_half_turn_homings(left_motors)
         
         print(
             f"Move all left arm joints sequentially through their "
             "entire ranges of motion.\nRecording positions. Press ENTER to stop..."
         )
-        range_mins, range_maxes = self.bus1.record_ranges_of_motion(left_motors)
+        range_mins_left, range_maxes_left = self.bus1.record_ranges_of_motion(left_motors)
         
         calibration_left = {}
-        for name, motor in self.bus1.motors.items():
+        for name in left_motors:
+            motor = self.bus1.motors[name]
             calibration_left[name] = MotorCalibration(
                 id=motor.id,
                 drive_mode=0,
-                homing_offset=homing_offsets[name],
-                range_min=range_mins[name],
-                range_max=range_maxes[name],
+                homing_offset=homing_offsets_left[name],
+                range_min=range_mins_left[name],
+                range_max=range_maxes_left[name],
             )
-        
-        self.bus1.write_calibration(calibration_left)
         
         # calib right arm motors
         self.bus2.disable_torque(self.right_arm_motors)
@@ -297,28 +289,54 @@ class XLerobot(Robot):
             "Move right arm motors to the middle of their range of motion and press ENTER...."
         )
         
-        homing_offsets = self.bus2.set_half_turn_homings(self.right_arm_motors)
+        homing_offsets_right = self.bus2.set_half_turn_homings(self.right_arm_motors)
         
         print(
             f"Move all right arm joints sequentially through their "
             "entire ranges of motion.\nRecording positions. Press ENTER to stop..."
         )
-        range_mins, range_maxes = self.bus2.record_ranges_of_motion(self.right_arm_motors)
+        range_mins_right, range_maxes_right = self.bus2.record_ranges_of_motion(self.right_arm_motors)
         
         calibration_right = {}
-        
-        for name, motor in self.bus2.motors.items():
+        for name in self.right_arm_motors:
+            motor = self.bus2.motors[name]
             calibration_right[name] = MotorCalibration(
                 id=motor.id,
                 drive_mode=0,
-                homing_offset=homing_offsets[name],
-                range_min=range_mins[name],
-                range_max=range_maxes[name],
+                homing_offset=homing_offsets_right[name],
+                range_min=range_mins_right[name],
+                range_max=range_maxes_right[name],
             )
         
-        self.bus2.write_calibration(calibration_right)
+        # calib head motors (on bus2)
+        self.bus2.disable_torque(self.head_motors)
+        for name in self.head_motors:
+            self.bus2.write("Operating_Mode", name, OperatingMode.POSITION.value)
         
-        # calib base motors
+        input(
+            "Move head motors to the middle of their range of motion and press ENTER...."
+        )
+        
+        homing_offsets_head = self.bus2.set_half_turn_homings(self.head_motors)
+        
+        print(
+            f"Move head pan and tilt through their "
+            "entire ranges of motion.\nRecording positions. Press ENTER to stop..."
+        )
+        range_mins_head, range_maxes_head = self.bus2.record_ranges_of_motion(self.head_motors)
+        
+        calibration_head = {}
+        for name in self.head_motors:
+            motor = self.bus2.motors[name]
+            calibration_head[name] = MotorCalibration(
+                id=motor.id,
+                drive_mode=0,
+                homing_offset=homing_offsets_head[name],
+                range_min=range_mins_head[name],
+                range_max=range_maxes_head[name],
+            )
+        
+        # calib base motors (on bus1)
         print("Base wheels use full turn mode, setting range to 0-4095...")
         range_mins_base = {}
         range_maxes_base = {}
@@ -329,32 +347,42 @@ class XLerobot(Robot):
         homing_offsets_base = dict.fromkeys(self.base_motors, 0)
         
         calibration_base = {}
-        for name, motor in self.bus3.motors.items():
-            calibration_base[name] = MotorCalibration(
-                id=motor.id,
-                drive_mode=0,
-                homing_offset=homing_offsets_base[name],
-                range_min=range_mins_base[name],
-                range_max=range_maxes_base[name],
-            )
+        for name, motor in self.bus1.motors.items():
+            if name.startswith("base"):
+                calibration_base[name] = MotorCalibration(
+                    id=motor.id,
+                    drive_mode=0,
+                    homing_offset=homing_offsets_base[name],
+                    range_min=range_mins_base[name],
+                    range_max=range_maxes_base[name],
+                )
         
-        self.bus3.write_calibration(calibration_base)
-        self.calibration = {**calibration_left, **calibration_right, **calibration_base}
+        # Merge calibrations: bus1 = left arm + base, bus2 = right arm + head
+        calibration_bus1 = {**calibration_left, **calibration_base}
+        calibration_bus2 = {**calibration_right, **calibration_head}
+        self.bus1.write_calibration(calibration_bus1)
+        self.bus2.write_calibration(calibration_bus2)
+        self.calibration = {**calibration_left, **calibration_right, **calibration_head, **calibration_base}
         self._save_calibration()
         print("Calibration saved to", self.calibration_fpath)
         
 
     def configure(self):
-        # Set-up arm actuators (position mode)
-        # We assume that at connection time, arm is in a rest position,
-        # and torque can be safely disabled to run calibration        
+        # Set-up actuators for both buses
+        # Bus1: left arm (position mode) + base (velocity mode)
+        # Bus2: right arm (position mode) + head (position mode)
+        # We assume that at connection time, arms are in rest position,
+        # and torque can be safely disabled to run configuration
+        
+        # Disable torque on both buses
         self.bus1.disable_torque()
         self.bus2.disable_torque()
-        self.bus3.disable_torque()
+        
+        # Configure motors on both buses
         self.bus1.configure_motors()
         self.bus2.configure_motors()
-        self.bus3.configure_motors()
         
+        # Configure left arm motors (bus1) - position mode
         for name in self.left_arm_motors:
             self.bus1.write("Operating_Mode", name, OperatingMode.POSITION.value)
             # Set P_Coefficient to lower value to avoid shakiness (Default is 32)
@@ -363,6 +391,7 @@ class XLerobot(Robot):
             self.bus1.write("I_Coefficient", name, 0)
             self.bus1.write("D_Coefficient", name, 43)
         
+        # Configure right arm motors (bus2) - position mode
         for name in self.right_arm_motors:
             self.bus2.write("Operating_Mode", name, OperatingMode.POSITION.value)
             # Set P_Coefficient to lower value to avoid shakiness (Default is 32)
@@ -371,13 +400,20 @@ class XLerobot(Robot):
             self.bus2.write("I_Coefficient", name, 0)
             self.bus2.write("D_Coefficient", name, 43)
         
+        # Configure head motors (bus2) - position mode
+        for name in self.head_motors:
+            self.bus2.write("Operating_Mode", name, OperatingMode.POSITION.value)
+            self.bus2.write("P_Coefficient", name, 16)
+            self.bus2.write("I_Coefficient", name, 0)
+            self.bus2.write("D_Coefficient", name, 43)
+        
+        # Configure base motors (bus1) - velocity mode
         for name in self.base_motors:
-            self.bus3.write("Operating_Mode", name, OperatingMode.VELOCITY.value)
+            self.bus1.write("Operating_Mode", name, OperatingMode.VELOCITY.value)
         
-        
+        # Enable torque on both buses
         self.bus1.enable_torque()
         self.bus2.enable_torque()
-        self.bus3.enable_torque()
         
 
     def setup_motors(self) -> None:
@@ -392,11 +428,17 @@ class XLerobot(Robot):
             self.bus2.setup_motor(motor)
             print(f"'{motor}' motor id set to {self.bus2.motors[motor].id}")
         
-        # Set up base motors
+        # Set up base motors (on bus1)
         for motor in reversed(self.base_motors):
             input(f"Connect the controller board to the '{motor}' motor only and press enter.")
-            self.bus3.setup_motor(motor)
-            print(f"'{motor}' motor id set to {self.bus3.motors[motor].id}")
+            self.bus1.setup_motor(motor)
+            print(f"'{motor}' motor id set to {self.bus1.motors[motor].id}")
+        
+        # Set up head motors (on bus2)
+        for motor in reversed(self.head_motors):
+            input(f"Connect the controller board to the '{motor}' motor only and press enter.")
+            self.bus2.setup_motor(motor)
+            print(f"'{motor}' motor id set to {self.bus2.motors[motor].id}")
         
 
     @staticmethod
@@ -569,43 +611,39 @@ class XLerobot(Robot):
         """
         Get robot observation with parallel bus reads and detailed profiling.
         
-        Optimization: Reads from 3 serial buses in parallel using persistent thread pool.
+        Optimization: Reads from 2 serial buses in parallel using persistent thread pool.
         """
         if not self.is_connected:
             raise DeviceNotConnectedError(f"{self} is not connected.")
 
         total_start = time.perf_counter()
         
-        # Parallel read from all 3 buses using persistent executor
+        # Parallel read from both buses using persistent executor
         bus_start = time.perf_counter()
         
-        def read_left_arm():
+        def read_bus1():
+            """Read left arm positions and base velocities from bus1"""
             t0 = time.perf_counter()
-            result = self.bus1.sync_read("Present_Position", self.left_arm_motors)
-            logger.debug(f"Left arm read: {(time.perf_counter()-t0)*1e3:.1f}ms")
-            return result
+            left_arm_pos = self.bus1.sync_read("Present_Position", self.left_arm_motors)
+            base_wheel_vel = self.bus1.sync_read("Present_Velocity", self.base_motors)
+            logger.debug(f"Bus1 (left arm + base) read: {(time.perf_counter()-t0)*1e3:.1f}ms")
+            return left_arm_pos, base_wheel_vel
         
-        def read_right_arm():
+        def read_bus2():
+            """Read right arm positions and head positions from bus2"""
             t0 = time.perf_counter()
-            result = self.bus2.sync_read("Present_Position", self.right_arm_motors)
-            logger.debug(f"Right arm read: {(time.perf_counter()-t0)*1e3:.1f}ms")
-            return result
+            right_arm_pos = self.bus2.sync_read("Present_Position", self.right_arm_motors)
+            head_pos = self.bus2.sync_read("Present_Position", self.head_motors)
+            logger.debug(f"Bus2 (right arm + head) read: {(time.perf_counter()-t0)*1e3:.1f}ms")
+            return right_arm_pos, head_pos
         
-        def read_base():
-            t0 = time.perf_counter()
-            result = self.bus3.sync_read("Present_Velocity", self.base_motors)
-            logger.debug(f"Base read: {(time.perf_counter()-t0)*1e3:.1f}ms")
-            return result
-        
-        # Submit all reads to persistent thread pool
-        future_left = self._executor.submit(read_left_arm)
-        future_right = self._executor.submit(read_right_arm)
-        future_base = self._executor.submit(read_base)
+        # Submit all reads to persistent thread pool (2 buses = 2 threads max)
+        future_bus1 = self._executor.submit(read_bus1)
+        future_bus2 = self._executor.submit(read_bus2)
         
         # Wait for all reads to complete
-        left_arm_pos = future_left.result()
-        right_arm_pos = future_right.result()
-        base_wheel_vel = future_base.result()
+        left_arm_pos, base_wheel_vel = future_bus1.result()
+        right_arm_pos, head_pos = future_bus2.result()
         
         bus_dt_ms = (time.perf_counter() - bus_start) * 1e3
         logger.debug(f"🔧 Parallel bus reads: {bus_dt_ms:.1f}ms")
@@ -620,7 +658,8 @@ class XLerobot(Robot):
         
         left_arm_state = {f"{k}.pos": v for k, v in left_arm_pos.items()}
         right_arm_state = {f"{k}.pos": v for k, v in right_arm_pos.items()}
-        obs_dict = {**left_arm_state, **right_arm_state, **base_vel}
+        head_state = {f"{k}.pos": v for k, v in head_pos.items()}
+        obs_dict = {**left_arm_state, **right_arm_state, **head_state, **base_vel}
         proc_dt_ms = (time.perf_counter() - proc_start) * 1e3
         logger.debug(f"Processing: {proc_dt_ms:.1f}ms")
 
@@ -630,13 +669,21 @@ class XLerobot(Robot):
         def read_camera(cam_key, cam):
             try:
                 if cam.is_connected:
-                    return cam_key, cam.async_read()
+                    color_frame = cam.async_read()
+                    # For RealSense cameras with depth enabled, also read depth
+                    depth_frame = None
+                    if hasattr(cam, 'use_depth') and cam.use_depth and hasattr(cam, 'async_read_depth'):
+                        try:
+                            depth_frame = cam.async_read_depth()
+                        except Exception as e:
+                            logger.debug(f"⚠️  Failed to read depth from camera '{cam_key}': {e}")
+                    return cam_key, color_frame, depth_frame
                 else:
                     logger.debug(f"⚠️  Camera '{cam_key}' not connected, skipping")
-                    return cam_key, None
+                    return cam_key, None, None
             except Exception as e:
                 logger.warning(f"⚠️  Failed to read from camera '{cam_key}': {e}")
-                return cam_key, None
+                return cam_key, None, None
         
         # Submit all camera reads to thread pool
         camera_futures = [
@@ -646,9 +693,12 @@ class XLerobot(Robot):
         
         # Collect results
         for future in camera_futures:
-            cam_key, frame = future.result()
-            if frame is not None:
-                obs_dict[cam_key] = frame
+            cam_key, color_frame, depth_frame = future.result()
+            if color_frame is not None:
+                obs_dict[cam_key] = color_frame
+            if depth_frame is not None:
+                # Add depth frame with "_depth" suffix for rerun display
+                obs_dict[f"{cam_key}_depth"] = depth_frame
                 
         cam_dt_ms = (time.perf_counter() - cam_start) * 1e3
         logger.debug(f"📷 Camera capture: {cam_dt_ms:.1f}ms")
@@ -676,6 +726,7 @@ class XLerobot(Robot):
         
         left_arm_pos = {k: v for k, v in action.items() if k.startswith("left_arm_") and k.endswith(".pos")}
         right_arm_pos = {k: v for k, v in action.items() if k.startswith("right_arm_") and k.endswith(".pos")}
+        head_pos = {k: v for k, v in action.items() if k.startswith("head_") and k.endswith(".pos")}
         base_goal_vel = {k: v for k, v in action.items() if k.endswith(".vel")}
         base_wheel_goal_vel = self._body_to_wheel_raw(
             base_goal_vel.get("x.vel", 0.0),
@@ -704,24 +755,33 @@ class XLerobot(Robot):
         
         left_arm_pos_raw = {k.replace(".pos", ""): v for k, v in left_arm_pos.items()}
         right_arm_pos_raw = {k.replace(".pos", ""): v for k, v in right_arm_pos.items()}
+        head_pos_raw = {k.replace(".pos", ""): v for k, v in head_pos.items()}
+        
+        # Combine left arm and base for bus1 (to avoid multiple writes to same bus)
+        bus1_pos_raw = {**left_arm_pos_raw}
+        bus1_vel_raw = base_wheel_goal_vel if base_wheel_goal_vel else {}
+        
+        # Combine right arm and head for bus2 (to avoid multiple writes to same bus)
+        bus2_pos_raw = {**right_arm_pos_raw, **head_pos_raw}
         
         # Only sync_write if there are motors to write to
-        if left_arm_pos_raw:
-            self.bus1.sync_write("Goal_Position", left_arm_pos_raw)
-        if right_arm_pos_raw:
-            self.bus2.sync_write("Goal_Position", right_arm_pos_raw)
-        if base_wheel_goal_vel:
-            self.bus3.sync_write("Goal_Velocity", base_wheel_goal_vel)
+        if bus1_pos_raw:
+            self.bus1.sync_write("Goal_Position", bus1_pos_raw)
+        if bus1_vel_raw:
+            self.bus1.sync_write("Goal_Velocity", bus1_vel_raw)
+        if bus2_pos_raw:
+            self.bus2.sync_write("Goal_Position", bus2_pos_raw)
         return {
             **left_arm_pos,
             **right_arm_pos,
+            **head_pos,
             **base_goal_vel,
         }
 
     def stop_base(self):
         try:
-            if self.bus3.is_connected:
-                self.bus3.sync_write("Goal_Velocity", dict.fromkeys(self.base_motors, 0), num_retry=5)
+            if self.bus1.is_connected:
+                self.bus1.sync_write("Goal_Velocity", dict.fromkeys(self.base_motors, 0), num_retry=5)
                 logger.info("Base motors stopped")
             else:
                 logger.debug("Base bus not connected; skipping base stop.")
@@ -744,7 +804,6 @@ class XLerobot(Robot):
             
         self.bus1.disconnect(self.config.disable_torque_on_disconnect)
         self.bus2.disconnect(self.config.disable_torque_on_disconnect)
-        self.bus3.disconnect(self.config.disable_torque_on_disconnect)
         for cam in self.cameras.values():
             cam.disconnect()
 
