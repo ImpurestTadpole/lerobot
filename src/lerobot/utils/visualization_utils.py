@@ -73,7 +73,8 @@ def init_rerun(
             rerun --serve-web --web-viewer-port 9090 --connect "rerun+http://JETSON_IP:9876/proxy"
         Then open http://localhost:9090 on your external computer's browser.
     """
-    batch_size = os.getenv("RERUN_FLUSH_NUM_BYTES", "8000")
+    # Increase flush batch size for better throughput (reduces network round trips)
+    batch_size = os.getenv("RERUN_FLUSH_NUM_BYTES", "32000")  # Increased from 8000
     os.environ["RERUN_FLUSH_NUM_BYTES"] = batch_size
     
     rr.init(session_name)
@@ -173,8 +174,9 @@ def log_rerun_data(
         action: An optional dictionary containing action data to log.
         compress_images: Whether to compress images before logging to save bandwidth & memory in exchange for cpu and quality.
     """
-    # Get downsample factor from environment (default: 0.5 for half resolution)
-    downsample_factor = float(os.getenv("RERUN_DOWNSAMPLE_FACTOR", "0.5"))
+    # Get downsample factor from environment (default: 0.33 for lower latency)
+    # 0.33 = ~1/3 resolution = ~1/9 the data = much faster transmission
+    downsample_factor = float(os.getenv("RERUN_DOWNSAMPLE_FACTOR", "0.33"))
     
     if observation:
         for k, v in observation.items():
@@ -200,8 +202,11 @@ def log_rerun_data(
                     for i, vi in enumerate(arr):
                         rr.log(f"{key}_{i}", rr.Scalars(float(vi)))
                 else:
+                    # Always compress images for lower latency (JPEG compression is fast)
+                    # Use compress() which is faster than uncompressed for network transmission
                     img_entity = rr.Image(arr).compress() if compress_images else rr.Image(arr)
-                    rr.log(key, entity=img_entity, static=True)
+                    # Remove static=True for live video streams (causes latency)
+                    rr.log(key, entity=img_entity, static=False)
 
     if action:
         for k, v in action.items():

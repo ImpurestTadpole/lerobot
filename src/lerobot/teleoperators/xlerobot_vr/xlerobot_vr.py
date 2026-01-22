@@ -124,6 +124,11 @@ class SimpleTeleopArm:
         self.degree_step = 2
         self.xy_step = 0.005
         
+        # Gripper smoothing state for variable precision control
+        self.smoothed_gripper_value = self.joint_positions["gripper"]  # Initialize to current gripper position
+        self.gripper_smoothing_alpha = 0.3  # Smoothing factor (0.0 = no smoothing, 1.0 = no smoothing)
+        # Lower alpha = smoother but slower response, higher alpha = faster but less smooth
+        
         # P control target positions, set to zero position
         self.target_positions = {
             "shoulder_pan": 0.0,
@@ -314,12 +319,35 @@ class SimpleTeleopArm:
         self.target_positions["wrist_flex"] = (-self.target_positions["shoulder_lift"] - 
                                                self.target_positions["elbow_flex"] + self.pitch)
    
-        # Handle gripper state directly
+        # Handle gripper state with variable precision control
+        # Extract trigger value as float (range: 0.0 to 1.0)
         # RANGE_0_100: 0 = fully open, 100 = fully closed
-        if vr_goal.metadata.get('trigger', 0) > 0.5:
-            self.target_positions["gripper"] = 100.0  # Fully closed
+        trigger_value = float(vr_goal.metadata.get('trigger', 0.0))
+        
+        # Optional: Apply deadzone to prevent accidental small movements
+        # Adjust deadzone threshold as needed (0.0 = no deadzone, higher = more deadzone)
+        gripper_deadzone = 0.05  # 5% deadzone - adjust this value as needed
+        if trigger_value < gripper_deadzone:
+            trigger_value = 0.0
         else:
-            self.target_positions["gripper"] = 0.0  # Fully open
+            # Normalize after deadzone: map [deadzone, 1.0] to [0.0, 1.0]
+            trigger_value = (trigger_value - gripper_deadzone) / (1.0 - gripper_deadzone)
+            trigger_value = max(0.0, min(1.0, trigger_value))  # Clamp to [0.0, 1.0]
+        
+        # Map trigger value [0.0, 1.0] to gripper range [0.0, 100.0]
+        # 0.0 trigger = fully open (0.0), 1.0 trigger = fully closed (100.0)
+        target_gripper_value = trigger_value * 100.0
+        
+        # Apply exponential smoothing to reduce jitter and provide smoother control
+        # This helps prevent rapid oscillations when the trigger is held at a constant position
+        self.smoothed_gripper_value = (
+            (1.0 - self.gripper_smoothing_alpha) * self.smoothed_gripper_value +
+            self.gripper_smoothing_alpha * target_gripper_value
+        )
+        
+        # Clamp smoothed value to valid range
+        self.smoothed_gripper_value = max(0.0, min(100.0, self.smoothed_gripper_value))
+        self.target_positions["gripper"] = self.smoothed_gripper_value
 
     def p_control_action(self, robot_obs):
         """

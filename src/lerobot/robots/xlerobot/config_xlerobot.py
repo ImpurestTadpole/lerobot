@@ -64,23 +64,25 @@ def xlerobot_cameras_config() -> dict[str, CameraConfig]:
         
         # camera2: Wrist view (was "left_wrist")
         "left_wrist": OpenCVCameraConfig(
-            index_or_path="/dev/video0",
+            index_or_path="/dev/video8",  # Innomaker camera 2 (swapped)
             fps=30,
             width=640,
             height=480,
             fourcc="MJPG",
             rotation=Cv2Rotation.NO_ROTATION,
+            warmup_s=3,  # Increased warmup time for Innomaker cameras
         ),     
-
+        
         # camera3: Additional view (was "right_wrist")
         "right_wrist": OpenCVCameraConfig(
-            index_or_path="/dev/video6",
+            index_or_path="/dev/video6",  # Innomaker camera 1 (swapped)
             fps=30,
             width=640,
             height=480,
             fourcc="MJPG",
             rotation=Cv2Rotation.NO_ROTATION,
-        ),        
+            warmup_s=3,  # Increased warmup time for Innomaker cameras
+        ),
     }
 
 
@@ -91,7 +93,7 @@ class XLerobotConfig(RobotConfig):
     port1: str = "/dev/ttyACM0"  # port to connect to the bus (left arm motors 1-6 + base motors 7-9)
     port2: str = "/dev/ttyACM1"  # port to connect to the bus (right arm motors 1-6 + head motors 7-8)
     camera_start_order: tuple[str, ...] | None = ("head", "left_wrist", "right_wrist")
-    camera_start_delay_s: float = 0.5
+    camera_start_delay_s: float = 1.0  # Increased delay to allow cameras to initialize properly
     disable_torque_on_disconnect: bool = True
 
     # `max_relative_target` limits the magnitude of the relative positional target vector for safety purposes.

@@ -162,9 +162,15 @@ class XLerobot(Robot):
 
     @property
     def _cameras_ft(self) -> dict[str, tuple]:
-        return {
-            cam: (self.config.cameras[cam].height, self.config.cameras[cam].width, 3) for cam in self.cameras
-        }
+        """Camera features including depth images if available."""
+        features = {}
+        for cam_name, cam_config in self.config.cameras.items():
+            # Add color camera
+            features[cam_name] = (cam_config.height, cam_config.width, 3)
+            # Add depth camera if enabled (RealSense cameras)
+            if hasattr(cam_config, 'use_depth') and cam_config.use_depth:
+                features[f"{cam_name}_depth"] = (cam_config.height, cam_config.width, 1)
+        return features
 
     @cached_property
     def observation_features(self) -> dict[str, type | tuple]:
