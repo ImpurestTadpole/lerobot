@@ -79,6 +79,7 @@ from lerobot.robots import (  # noqa: F401
     openarm_follower,
     reachy2,
     so_follower,
+    unitree_g1 as unitree_g1_robot,
     xlerobot,
 )
 from lerobot.teleoperators import (  # noqa: F401
@@ -94,6 +95,7 @@ from lerobot.teleoperators import (  # noqa: F401
     openarm_leader,
     reachy2_teleoperator,
     so_leader,
+    unitree_g1,
     xlerobot_vr,
 )
 from lerobot.utils.import_utils import register_third_party_plugins
