@@ -323,6 +323,12 @@ def record_loop(
     start_episode_t = time.perf_counter()
     last_status_print = 0  # Track when we last printed status
     
+    # Control rate tracking
+    loop_times = []  # Store loop durations for Hz calculation
+    max_loop_samples = 30  # Track last N loops for rolling average
+    last_hz_log_time = start_episode_t
+    hz_log_interval = 1.0  # Log Hz every 1 second
+    
     while timestamp < control_time_s:
         start_loop_t = time.perf_counter()
 
@@ -400,15 +406,44 @@ def record_loop(
             frame = {**observation_frame, **action_frame, "task": single_task}
             dataset.add_frame(frame)
 
+        # Visualization is expensive - only do it if enabled and not blocking control rate
         if display_data:
-            log_rerun_data(
-                observation=obs_processed, action=action_values, compress_images=display_compressed_images
-            )
+            try:
+                log_rerun_data(
+                    observation=obs_processed, action=action_values, compress_images=display_compressed_images
+                )
+            except Exception as e:
+                # Don't let visualization errors crash the recording
+                logging.debug(f"Visualization error (non-critical): {e}")
 
         dt_s = time.perf_counter() - start_loop_t
         precise_sleep(max(1 / fps - dt_s, 0.0))
 
         timestamp = time.perf_counter() - start_episode_t
+        
+        # Track control loop rate (Hz)
+        loop_times.append(dt_s)
+        if len(loop_times) > max_loop_samples:
+            loop_times.pop(0)  # Keep only last N samples
+        
+        # Log control rate periodically
+        current_time = time.perf_counter()
+        if current_time - last_hz_log_time >= hz_log_interval:
+            if len(loop_times) > 0:
+                avg_loop_time = sum(loop_times) / len(loop_times)
+                actual_hz = 1.0 / avg_loop_time if avg_loop_time > 0 else 0.0
+                target_hz = fps
+                hz_error = actual_hz - target_hz
+                hz_percent = (actual_hz / target_hz * 100) if target_hz > 0 else 0.0
+                
+                # Use warning level if significantly below target
+                log_level = logging.WARNING if hz_percent < 80 else logging.INFO
+                logging.log(
+                    log_level,
+                    f"🎯 Control rate: {actual_hz:.2f} Hz (target: {target_hz:.1f} Hz, "
+                    f"{hz_percent:.1f}%, error: {hz_error:+.2f} Hz, avg loop time: {avg_loop_time*1000:.2f} ms)"
+                )
+            last_hz_log_time = current_time
         
         # Print episode progress every 5 seconds
         if dataset is not None and timestamp - last_status_print >= 5.0:
@@ -612,7 +647,18 @@ def record(cfg: RecordConfig) -> LeRobotDataset:
             listener.stop()
 
         if cfg.dataset.push_to_hub and dataset is not None:
-            dataset.push_to_hub(tags=cfg.dataset.tags, private=cfg.dataset.private)
+            # Only push if dataset has episodes saved
+            if dataset.num_episodes > 0:
+                try:
+                    dataset.push_to_hub(tags=cfg.dataset.tags, private=cfg.dataset.private)
+                    logging.info(f"✅ Dataset pushed to hub: {cfg.dataset.repo_id}")
+                except Exception as e:
+                    logging.warning(f"⚠️  Failed to push dataset to hub: {e}")
+            else:
+                logging.info(
+                    f"ℹ️  Skipping push to hub: No episodes saved "
+                    f"(recording was interrupted before saving any episodes)"
+                )
 
         log_say("Exiting", cfg.play_sounds)
     return dataset

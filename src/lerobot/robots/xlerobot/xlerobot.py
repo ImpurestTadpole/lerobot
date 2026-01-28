@@ -676,7 +676,8 @@ class XLerobot(Robot):
             try:
                 if cam.is_connected:
                     color_frame = cam.async_read()
-                    # For RealSense cameras with depth enabled, also read depth
+                    # Only head camera (RealSense) has depth capability
+                    # Wrist cameras (OpenCV) are RGB-only and don't support depth
                     depth_frame = None
                     if hasattr(cam, 'use_depth') and cam.use_depth and hasattr(cam, 'async_read_depth'):
                         try:
@@ -703,7 +704,8 @@ class XLerobot(Robot):
             if color_frame is not None:
                 obs_dict[cam_key] = color_frame
             if depth_frame is not None:
-                # Add depth frame with "_depth" suffix for rerun display
+                # Add depth frame with "_depth" suffix (only for head camera)
+                # Depth images are collected in dataset but skipped in visualization for performance
                 obs_dict[f"{cam_key}_depth"] = depth_frame
                 
         cam_dt_ms = (time.perf_counter() - cam_start) * 1e3

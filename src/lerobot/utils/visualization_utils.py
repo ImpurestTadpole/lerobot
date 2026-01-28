@@ -163,10 +163,13 @@ def log_rerun_data(
     - 1D NumPy arrays are logged as a series of individual scalars, with each element indexed.
     - Other multi-dimensional arrays are flattened and logged as individual scalars.
 
+    **Performance Optimization**: Depth images (keys containing "_depth") are automatically skipped
+    to improve control loop performance. Depth data is still collected in the dataset, just not visualized.
+
     Keys are automatically namespaced with "observation." or "action." if not already present.
     
     Environment Variables:
-        RERUN_DOWNSAMPLE_FACTOR: Image downsampling factor (default: 0.5 for half resolution)
+        RERUN_DOWNSAMPLE_FACTOR: Image downsampling factor (default: 0.33 for lower latency)
                                  Set to 1.0 to disable downsampling.
 
     Args:
@@ -182,6 +185,13 @@ def log_rerun_data(
         for k, v in observation.items():
             if v is None:
                 continue
+            
+            # Skip depth images in visualization to improve performance
+            # Only head camera has depth (RealSense), wrist cameras are RGB-only
+            # Depth images are still collected in the dataset, just not visualized
+            if "_depth" in str(k).lower() or k.endswith("_depth"):
+                continue
+            
             key = k if str(k).startswith(OBS_PREFIX) else f"{OBS_STR}.{k}"
 
             if _is_scalar(v):
