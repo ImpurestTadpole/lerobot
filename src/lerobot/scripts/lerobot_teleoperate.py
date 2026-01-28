@@ -155,14 +155,27 @@ def teleop_loop(
     display_len = max(len(key) for key in robot.action_features)
     start = time.perf_counter()
 
+    # Frame counter for camera reads (read cameras every Nth frame for visualization)
+    frame_counter = 0
+    camera_read_interval = 2  # Read cameras every 2 frames (15 Hz instead of 30 Hz)
+    last_camera_obs = {}
+    
     while True:
         loop_start = time.perf_counter()
 
-        # Get robot observation
-        # Not really needed for now other than for visualization
-        # teleop_action_processor can take None as an observation
-        # given that it is the identity processor as default
-        obs = robot.get_observation()
+        # Get robot observation - skip cameras for control loop (faster)
+        # Only read cameras periodically for visualization
+        read_cameras_this_frame = (frame_counter % camera_read_interval == 0) if display_data else False
+        obs = robot.get_observation(skip_cameras=not read_cameras_this_frame, skip_depth=True)
+        
+        # Merge camera data from last read if we skipped cameras this frame
+        if not read_cameras_this_frame and last_camera_obs:
+            obs.update(last_camera_obs)
+        elif read_cameras_this_frame:
+            # Store camera data for next frames
+            last_camera_obs = {k: v for k, v in obs.items() if k in robot.cameras or k.endswith("_depth")}
+        
+        frame_counter += 1
         
         # Update teleop's observation cache to avoid double reads (for VR teleop)
         if hasattr(teleop, 'update_observation_cache'):
@@ -184,6 +197,7 @@ def teleop_loop(
             # Process robot observation through pipeline
             obs_transition = robot_observation_processor(obs)
 
+            # Log to Rerun (will respect RERUN_LOG_FREQUENCY env var for reduced frequency)
             log_rerun_data(
                 observation=obs_transition,
                 action=teleop_action,

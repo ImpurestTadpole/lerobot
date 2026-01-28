@@ -45,8 +45,8 @@ def xlerobot_cameras_config() -> dict[str, CameraConfig]:
         "head": RealSenseCameraConfig(
             serial_number_or_name="342222071125",  # Replace with your D435i serial number
             fps=30,
-            width=640,
-            height=480,
+            width=1280,
+            height=720,
             color_mode=ColorMode.RGB,  # Request BGR output
             rotation=Cv2Rotation.NO_ROTATION,
             use_depth=True,
@@ -81,7 +81,7 @@ def xlerobot_cameras_config() -> dict[str, CameraConfig]:
             height=480,
             fourcc="MJPG",
             rotation=Cv2Rotation.NO_ROTATION,
-            warmup_s=3,  # Increased warmup time for Innomaker cameras
+            warmup_s=5,  # Increased warmup time for right wrist camera (needs more time after other cameras)
         ),
     }
 
@@ -93,7 +93,7 @@ class XLerobotConfig(RobotConfig):
     port1: str = "/dev/ttyACM0"  # port to connect to the bus (left arm motors 1-6 + base motors 7-9)
     port2: str = "/dev/ttyACM1"  # port to connect to the bus (right arm motors 1-6 + head motors 7-8)
     camera_start_order: tuple[str, ...] | None = ("head", "left_wrist", "right_wrist")
-    camera_start_delay_s: float = 1.0  # Increased delay to allow cameras to initialize properly
+    camera_start_delay_s: float = 2.0  # Increased delay to allow cameras to initialize properly (especially right_wrist)
     disable_torque_on_disconnect: bool = True
 
     # `max_relative_target` limits the magnitude of the relative positional target vector for safety purposes.

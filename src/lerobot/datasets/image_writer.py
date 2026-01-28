@@ -39,9 +39,13 @@ def safe_stop_image_writer(func):
 
 
 def image_array_to_pil_image(image_array: np.ndarray, range_check: bool = True) -> PIL.Image.Image:
-    """Convert numpy array to PIL Image, supporting RGB (3 channels) and grayscale/depth (1 channel) images."""
-    if image_array.ndim != 3:
-        raise ValueError(f"The array has {image_array.ndim} dimensions, but 3 is expected for an image.")
+    """Convert numpy array to PIL Image, supporting RGB (3 channels), grayscale/depth (1 channel), and 2D depth maps."""
+    # Handle 2D arrays (single channel images like depth maps)
+    if image_array.ndim == 2:
+        # Expand to (H, W, 1) for processing
+        image_array = image_array[:, :, np.newaxis]
+    elif image_array.ndim != 3:
+        raise ValueError(f"The array has {image_array.ndim} dimensions, but 2 or 3 is expected for an image.")
 
     # Handle channel-first format (C, H, W) - common in PyTorch
     if image_array.shape[0] in (1, 3, 4):
@@ -51,7 +55,7 @@ def image_array_to_pil_image(image_array: np.ndarray, range_check: bool = True) 
     # Get number of channels after transpose
     num_channels = image_array.shape[-1] if image_array.ndim == 3 else 1
 
-    # Handle single-channel images (grayscale/depth)
+    # Determine PIL mode based on channels
     if num_channels == 1:
         # Squeeze to 2D (H, W) for grayscale PIL Image
         image_array = image_array.squeeze(axis=-1)
@@ -67,24 +71,36 @@ def image_array_to_pil_image(image_array: np.ndarray, range_check: bool = True) 
 
     # Convert dtype if needed
     if image_array.dtype != np.uint8:
-        if range_check and np.issubdtype(image_array.dtype, np.floating):
-            max_ = image_array.max().item()
-            min_ = image_array.min().item()
-            # For depth images, values might be in millimeters (uint16 range)
-            # Check if values are in [0, 1] float range or larger integer range
-            if max_ > 1.0 or min_ < 0.0:
-                # Assume values are in a larger range (e.g., depth in mm)
-                # Normalize to [0, 255] for uint8
-                if max_ > min_:
-                    image_array = ((image_array - min_) / (max_ - min_) * 255).astype(np.uint8)
-                else:
-                    image_array = np.zeros_like(image_array, dtype=np.uint8)
+        max_ = image_array.max().item()
+        min_ = image_array.min().item()
+
+        # Handle depth maps (RealSense returns uint16 [0, 65535] or float with raw values)
+        if image_array.dtype == np.uint16:
+            # RealSense depth maps are uint16 in millimeters (0-65535)
+            # Normalize to [0, 1] for visualization
+            if max_ > 0:
+                image_array = image_array.astype(np.float32) / 65535.0
             else:
-                # Values are in [0, 1] range, scale to [0, 255]
-                image_array = (image_array * 255).astype(np.uint8)
-        else:
-            # For integer types, clamp to uint8 range
-            image_array = np.clip(image_array, 0, 255).astype(np.uint8)
+                image_array = image_array.astype(np.float32)
+        elif image_array.dtype in (np.float32, np.float64):
+            # Float depth maps: normalize if values are > 1.0 (raw depth values)
+            if max_ > 1.0:
+                # Auto-rescale float depth to [0, 1] for visualization only
+                image_array = image_array / max_ if max_ != 0 else image_array
+            elif range_check and (max_ > 1.0 or min_ < 0.0):
+                raise ValueError(
+                    "The image data type is float, which requires values in the range [0.0, 1.0]. "
+                    f"However, the provided range is [{min_}, {max_}]. Please adjust the range or "
+                    "provide a uint8 image with values in the range [0, 255]."
+                )
+        elif range_check and (max_ > 1.0 or min_ < 0.0):
+            raise ValueError(
+                f"Unsupported image dtype: {image_array.dtype}. Expected uint8, uint16, float32, or float64. "
+                f"Got range [{min_}, {max_}]."
+            )
+
+        # Convert normalized [0, 1] float to uint8 [0, 255]
+        image_array = (image_array * 255).astype(np.uint8)
 
     return PIL.Image.fromarray(image_array, mode=mode)
 

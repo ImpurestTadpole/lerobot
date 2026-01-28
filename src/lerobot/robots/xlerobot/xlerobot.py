@@ -613,11 +613,16 @@ class XLerobot(Robot):
             "theta.vel": theta_cmd,
         }
 
-    def get_observation(self) -> dict[str, Any]:
+    def get_observation(self, skip_cameras: bool = False, skip_depth: bool = False) -> dict[str, Any]:
         """
         Get robot observation with parallel bus reads and detailed profiling.
         
         Optimization: Reads from 2 serial buses in parallel using persistent thread pool.
+        
+        Args:
+            skip_cameras: If True, skip camera reads entirely (faster, ~10-20ms vs ~100ms)
+            skip_depth: If True, skip depth image reads (saves ~20-30ms per RealSense camera).
+                Defaults to False so that depth frames are recorded in datasets when available.
         """
         if not self.is_connected:
             raise DeviceNotConnectedError(f"{self} is not connected.")
@@ -669,47 +674,55 @@ class XLerobot(Robot):
         proc_dt_ms = (time.perf_counter() - proc_start) * 1e3
         logger.debug(f"Processing: {proc_dt_ms:.1f}ms")
 
-        # Capture images from cameras in parallel (skip cameras that failed to connect)
-        cam_start = time.perf_counter()
-        
-        def read_camera(cam_key, cam):
-            try:
-                if cam.is_connected:
-                    color_frame = cam.async_read()
-                    # Only head camera (RealSense) has depth capability
-                    # Wrist cameras (OpenCV) are RGB-only and don't support depth
-                    depth_frame = None
-                    if hasattr(cam, 'use_depth') and cam.use_depth and hasattr(cam, 'async_read_depth'):
-                        try:
-                            depth_frame = cam.async_read_depth()
-                        except Exception as e:
-                            logger.debug(f"⚠️  Failed to read depth from camera '{cam_key}': {e}")
-                    return cam_key, color_frame, depth_frame
-                else:
-                    logger.debug(f"⚠️  Camera '{cam_key}' not connected, skipping")
+        # Capture images from cameras in parallel (skip if requested for performance)
+        if not skip_cameras:
+            cam_start = time.perf_counter()
+            
+            def read_camera(cam_key, cam):
+                try:
+                    if cam.is_connected:
+                        color_frame = cam.async_read()
+                        # For RealSense cameras with depth enabled, also read depth (unless skipped)
+                        depth_frame = None
+                        if not skip_depth and hasattr(cam, 'use_depth') and cam.use_depth and hasattr(cam, 'async_read_depth'):
+                            try:
+                                depth_frame = cam.async_read_depth()
+                            except Exception as e:
+                                logger.debug(f"⚠️  Failed to read depth from camera '{cam_key}': {e}")
+                        return cam_key, color_frame, depth_frame
+                    else:
+                        logger.debug(f"⚠️  Camera '{cam_key}' not connected, skipping")
+                        return cam_key, None, None
+                except Exception as e:
+                    logger.warning(f"⚠️  Failed to read from camera '{cam_key}': {e}")
                     return cam_key, None, None
-            except Exception as e:
-                logger.warning(f"⚠️  Failed to read from camera '{cam_key}': {e}")
-                return cam_key, None, None
-        
-        # Submit all camera reads to thread pool
-        camera_futures = [
-            self._executor.submit(read_camera, cam_key, cam)
-            for cam_key, cam in self.cameras.items()
-        ]
-        
-        # Collect results
-        for future in camera_futures:
-            cam_key, color_frame, depth_frame = future.result()
-            if color_frame is not None:
-                obs_dict[cam_key] = color_frame
-            if depth_frame is not None:
-                # Add depth frame with "_depth" suffix (only for head camera)
-                # Depth images are collected in dataset but skipped in visualization for performance
-                obs_dict[f"{cam_key}_depth"] = depth_frame
-                
-        cam_dt_ms = (time.perf_counter() - cam_start) * 1e3
-        logger.debug(f"📷 Camera capture: {cam_dt_ms:.1f}ms")
+            
+            # Submit all camera reads to thread pool
+            camera_futures = [
+                self._executor.submit(read_camera, cam_key, cam)
+                for cam_key, cam in self.cameras.items()
+            ]
+            
+            # Collect results
+            for future in camera_futures:
+                cam_key, color_frame, depth_frame = future.result()
+                if color_frame is not None:
+                    obs_dict[cam_key] = color_frame
+                if depth_frame is not None:
+                    # Ensure depth has a channel dimension to match dataset feature (H, W, 1)
+                    try:
+                        import numpy as np  # Local import to avoid top-level dependency if not needed
+                        if depth_frame.ndim == 2:
+                            depth_frame = np.expand_dims(depth_frame, axis=-1)
+                    except Exception as e:
+                        logger.warning(f"⚠️  Failed to reshape depth frame for camera '{cam_key}': {e}")
+                    # Add depth frame with "_depth" suffix
+                    obs_dict[f"{cam_key}_depth"] = depth_frame
+                    
+            cam_dt_ms = (time.perf_counter() - cam_start) * 1e3
+            logger.debug(f"📷 Camera capture: {cam_dt_ms:.1f}ms")
+        else:
+            logger.debug("📷 Camera reads skipped for performance")
         
         total_dt_ms = (time.perf_counter() - total_start) * 1e3
         logger.debug(f"⏱️  TOTAL get_observation: {total_dt_ms:.1f}ms ({1000/total_dt_ms:.1f} Hz)")

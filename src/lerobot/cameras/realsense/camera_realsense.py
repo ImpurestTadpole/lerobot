@@ -134,6 +134,7 @@ class RealSenseCamera(Camera):
         self.stop_event: Event | None = None
         self.frame_lock: Lock = Lock()
         self.latest_frame: NDArray[Any] | None = None
+        self.latest_depth: NDArray[Any] | None = None  # Store latest depth frame
         self.new_frame_event: Event = Event()
         # Depth frame storage for async reading
         self.latest_depth_frame: NDArray[Any] | None = None
@@ -470,9 +471,10 @@ class RealSenseCamera(Camera):
         Internal loop run by the background thread for asynchronous reading.
 
         On each iteration:
-        1. Reads a color frame (and depth frame if enabled) with 500ms timeout
-        2. Stores results in latest_frame/latest_depth_frame (thread-safe)
-        3. Sets new_frame_event/new_depth_frame_event to notify listeners
+        1. Reads a color frame with 500ms timeout
+        2. If depth is enabled, also reads depth frame
+        3. Stores results in latest_frame, latest_depth, and latest_depth_frame (thread-safe)
+        4. Sets new_frame_event and new_depth_frame_event to notify listeners
 
         Stops on DeviceNotConnectedError, logs other errors and continues.
         """
@@ -483,20 +485,23 @@ class RealSenseCamera(Camera):
             try:
                 # Read color frame
                 color_image = self.read(timeout_ms=500)
+                
+                # Also capture depth if enabled
+                depth_image = None
+                if self.use_depth:
+                    try:
+                        depth_image = self.read_depth(timeout_ms=500)
+                    except Exception as e:
+                        logger.warning(f"Error reading depth frame for {self}: {e}")
 
                 with self.frame_lock:
                     self.latest_frame = color_image
+                    self.latest_depth = depth_image
+                    if depth_image is not None:
+                        self.latest_depth_frame = depth_image
                 self.new_frame_event.set()
-
-                # Read depth frame if enabled
-                if self.use_depth:
-                    try:
-                        depth_map = self.read_depth(timeout_ms=500)
-                        with self.frame_lock:
-                            self.latest_depth_frame = depth_map
-                        self.new_depth_frame_event.set()
-                    except Exception as e:
-                        logger.debug(f"Error reading depth frame in background thread for {self}: {e}")
+                if depth_image is not None:
+                    self.new_depth_frame_event.set()
 
             except DeviceNotConnectedError:
                 break
@@ -530,34 +535,30 @@ class RealSenseCamera(Camera):
             self.latest_depth_frame = None
         self.new_depth_frame_event.clear()
 
-    def async_read_depth(self, timeout_ms: float = 200) -> NDArray[Any]:
+    def async_read_depth(self, timeout_ms: float = 200) -> NDArray[Any] | None:
         """
         Reads the latest available depth frame data asynchronously.
 
         This method retrieves the most recent depth frame captured by the background
-        read thread. It does not block waiting for the camera hardware directly,
-        but may wait up to timeout_ms for the background thread to provide a frame.
+        read thread. Returns None if depth is not enabled for this camera.
 
         Args:
             timeout_ms (float): Maximum time in milliseconds to wait for a frame
                 to become available. Defaults to 200ms (0.2 seconds).
 
         Returns:
-            np.ndarray:
-            The latest captured depth frame data, processed according to configuration.
+            np.ndarray | None:
+            The latest captured depth frame, or None if depth is not enabled.
 
         Raises:
             DeviceNotConnectedError: If the camera is not connected.
-            RuntimeError: If depth is not enabled or if the background thread died unexpectedly.
             TimeoutError: If no frame data becomes available within the specified timeout.
         """
+        if not self.use_depth:
+            return None
+            
         if not self.is_connected:
             raise DeviceNotConnectedError(f"{self} is not connected.")
-        
-        if not self.use_depth:
-            raise RuntimeError(
-                f"Depth stream is not enabled for {self}. Set use_depth=True in config."
-            )
 
         if self.thread is None or not self.thread.is_alive():
             self._start_read_thread()

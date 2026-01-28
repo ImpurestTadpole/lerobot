@@ -5,7 +5,7 @@
 conda activate lerobot
 
 # Set USB permissions (run every time after reboot or USB reconnect)
-sudo chmod 666 /dev/ttyACM0 /dev/ttyACM1 /dev/ttyACM2
+sudo chmod 666 /dev/ttyACM0 /dev/ttyACM1 
 
 # =============================================================================
 # GIT WORKFLOW - SYNC WITH GITHUB REPO
@@ -96,16 +96,18 @@ huggingface-cli login
 # Thumbstick DOWN  → Reset robot position
 
 # RECORDING WITH AUTO-PUSH TO HUB (recommended):
+# NOTE: Remove --resume=true for new datasets or when robot configuration has changed
+# Use --resume=true only when continuing an existing compatible dataset
 lerobot-record \
     --robot.type=xlerobot \
     --teleop.type=xlerobot_vr \
-    --dataset.repo_id=Odog16/ob15_test_1 \
-    --dataset.single_task="place tools on wooden surface" \
-    --dataset.num_episodes=10 \
+    --dataset.repo_id=Odog16/test_transfer_block \
+    --dataset.single_task="transfer the block" \
+    --dataset.num_episodes=5 \
     --dataset.fps=30 \
     --display_data=true \
-    --dataset.push_to_hub=true \
-    --resume=true 
+    --dataset.push_to_hub=true
+    #--resume=true 
 
 # RECORDING LOCAL ONLY (push manually later):
 lerobot-record \
@@ -127,7 +129,7 @@ python -c "from lerobot.datasets.lerobot_dataset import LeRobotDataset; \
 # Videos: videos/chunk-000/observation.images.*/episode_*.mp4
 
 # Delete local dataset (if you want to start fresh):
-rm -rf ~/.cache/huggingface/lerobot/Odog16/ob15_test_1
+rm -rf ~/.cache/huggingface/lerobot/Odog16/Odog16/test_transfer_block
 
 # =============================================================================
 # PERFORMANCE TIPS

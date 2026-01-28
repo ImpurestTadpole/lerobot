@@ -74,8 +74,13 @@ def init_rerun(
         Then open http://localhost:9090 on your external computer's browser.
     """
     # Increase flush batch size for better throughput (reduces network round trips)
-    batch_size = os.getenv("RERUN_FLUSH_NUM_BYTES", "32000")  # Increased from 8000
+    # Larger batch = fewer network calls = lower latency
+    batch_size = os.getenv("RERUN_FLUSH_NUM_BYTES", "64000")  # Increased from 32000 for even better throughput
     os.environ["RERUN_FLUSH_NUM_BYTES"] = batch_size
+    
+    # Set flush frequency to reduce overhead (flush less frequently for better throughput)
+    flush_frequency = os.getenv("RERUN_FLUSH_FREQUENCY", "10")  # Flush every 10 frames
+    os.environ["RERUN_FLUSH_FREQUENCY"] = flush_frequency
     
     rr.init(session_name)
     
@@ -116,7 +121,7 @@ def _downsample_image(image: np.ndarray, scale_factor: float) -> np.ndarray:
     Downsample an image for visualization bandwidth reduction.
     
     Args:
-        image: Input image (HWC or CHW format)
+        image: Input image (HWC, CHW, or 2D format for depth images)
         scale_factor: Scaling factor (e.g., 0.5 for half size)
     
     Returns:
@@ -171,15 +176,29 @@ def log_rerun_data(
     Environment Variables:
         RERUN_DOWNSAMPLE_FACTOR: Image downsampling factor (default: 0.33 for lower latency)
                                  Set to 1.0 to disable downsampling.
+        RERUN_SKIP_DEPTH: If "true", skip depth images to reduce bandwidth (default: "false")
+        RERUN_LOG_FREQUENCY: Log every Nth frame (default: 1, log all frames)
 
     Args:
         observation: An optional dictionary containing observation data to log.
         action: An optional dictionary containing action data to log.
         compress_images: Whether to compress images before logging to save bandwidth & memory in exchange for cpu and quality.
     """
-    # Get downsample factor from environment (default: 0.33 for lower latency)
-    # 0.33 = ~1/3 resolution = ~1/9 the data = much faster transmission
+    # Get configuration from environment
     downsample_factor = float(os.getenv("RERUN_DOWNSAMPLE_FACTOR", "0.33"))
+    skip_depth = os.getenv("RERUN_SKIP_DEPTH", "false").lower() in ("true", "1", "yes")
+    log_frequency = int(os.getenv("RERUN_LOG_FREQUENCY", "1"))
+    
+    # Frame counter for logging frequency (module-level would be better, but this works)
+    if not hasattr(log_rerun_data, "_frame_counter"):
+        log_rerun_data._frame_counter = 0
+    log_rerun_data._frame_counter += 1
+    
+    # Skip this frame if logging frequency > 1
+    if log_frequency > 1 and log_rerun_data._frame_counter % log_frequency != 0:
+        return
+    
+    # Note: Rerun will handle connection status internally, so we don't need to check here
     
     if observation:
         for k, v in observation.items():
@@ -189,7 +208,8 @@ def log_rerun_data(
             # Skip depth images in visualization to improve performance
             # Only head camera has depth (RealSense), wrist cameras are RGB-only
             # Depth images are still collected in the dataset, just not visualized
-            if "_depth" in str(k).lower() or k.endswith("_depth"):
+            # Can be controlled via RERUN_SKIP_DEPTH env var (defaults to skipping for performance)
+            if (skip_depth or True) and ("_depth" in str(k).lower() or k.endswith("_depth")):
                 continue
             
             key = k if str(k).startswith(OBS_PREFIX) else f"{OBS_STR}.{k}"
@@ -198,23 +218,40 @@ def log_rerun_data(
                 rr.log(key, rr.Scalars(float(v)))
             elif isinstance(v, np.ndarray):
                 arr = v
-                # Check if this is an image (3D array with reasonable dimensions)
+                # Check if this is an image (3D array or 2D array with reasonable dimensions)
                 is_image = arr.ndim == 3 or (arr.ndim == 2 and arr.shape[0] > 10 and arr.shape[1] > 10)
                 
-                if is_image and arr.ndim == 3:
-                    # Downsample image before sending to Rerun
-                    arr = _downsample_image(arr, downsample_factor)
+                # Check if this is a depth image (uint16) - JPEG compression doesn't support uint16
+                is_depth = arr.dtype == np.uint16 and ("depth" in str(k).lower() or k.endswith("_depth"))
                 
-                # Convert CHW -> HWC when needed
+                # Log depth image detection for debugging (only once per key)
+                if is_depth and not hasattr(log_rerun_data, f"_depth_logged_{k}"):
+                    import logging
+                    logger = logging.getLogger(__name__)
+                    logger.debug(f"📊 Depth image detected: {k}, shape={arr.shape}, dtype={arr.dtype}")
+                    setattr(log_rerun_data, f"_depth_logged_{k}", True)
+                
+                # Downsample images before sending to Rerun (for both 2D and 3D images)
+                if is_image:
+                    # Use more aggressive downsampling for depth images
+                    depth_factor = downsample_factor * 0.5 if is_depth else downsample_factor
+                    arr = _downsample_image(arr, depth_factor)
+                
+                # Convert CHW -> HWC when needed (only for 3D arrays)
                 if arr.ndim == 3 and arr.shape[0] in (1, 3, 4) and arr.shape[-1] not in (1, 3, 4):
                     arr = np.transpose(arr, (1, 2, 0))
+                
                 if arr.ndim == 1:
                     for i, vi in enumerate(arr):
                         rr.log(f"{key}_{i}", rr.Scalars(float(vi)))
                 else:
-                    # Always compress images for lower latency (JPEG compression is fast)
-                    # Use compress() which is faster than uncompressed for network transmission
-                    img_entity = rr.Image(arr).compress() if compress_images else rr.Image(arr)
+                    # Always compress images for lower latency (JPEG compression reduces bandwidth significantly)
+                    # Compression is faster than sending uncompressed data over network
+                    # BUT: Skip compression for uint16 depth images (JPEG only supports uint8)
+                    if (compress_images or is_image) and not is_depth:
+                        img_entity = rr.Image(arr).compress()
+                    else:
+                        img_entity = rr.Image(arr)
                     # Remove static=True for live video streams (causes latency)
                     rr.log(key, entity=img_entity, static=False)
 

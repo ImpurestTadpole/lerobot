@@ -325,14 +325,27 @@ def record_loop(
     start_episode_t = time.perf_counter()
     last_status_print = 0  # Track when we last printed status
     
-    # Control rate tracking
-    loop_times = []  # Store loop durations for Hz calculation
-    max_loop_samples = 30  # Track last N loops for rolling average
-    last_hz_log_time = start_episode_t
-    hz_log_interval = 1.0  # Log Hz every 1 second
+    # Hz rate tracking
+    loop_times = []
+    last_hz_print = time.perf_counter()
+    hz_print_interval = 1.0  # Print Hz rate every 1 second
+    prev_loop_start = time.perf_counter()  # Track previous loop start time
+    frame_idx = 0  # For throttling visualization
+    
+    # Depth read throttling: read depth every Nth frame to improve control rate
+    # Depth is expensive (~20-30ms per RealSense camera), so reading every 2nd frame
+    # gives us 15 Hz depth data while improving overall control rate
+    depth_read_interval = 2  # Read depth every 2nd frame
+    last_depth_obs = {}  # Store last depth observation for frames where we skip depth
     
     while timestamp < control_time_s:
         start_loop_t = time.perf_counter()
+        
+        # Measure time since last loop (for Hz calculation)
+        if prev_loop_start > 0:
+            loop_period = start_loop_t - prev_loop_start
+            loop_times.append(loop_period)
+        prev_loop_start = start_loop_t
 
         # Update VR events if using VR teleop
         if isinstance(teleop, XLerobotVRTeleop):
@@ -343,8 +356,17 @@ def record_loop(
             events["exit_early"] = False
             break
 
-        # Get robot observation
-        obs = robot.get_observation()
+        # Get robot observation - skip depth reads on some frames for performance
+        # We still read color cameras every frame for the dataset
+        read_depth_this_frame = (frame_idx % depth_read_interval == 0)
+        obs = robot.get_observation(skip_cameras=False, skip_depth=not read_depth_this_frame)
+        
+        # If we skipped depth this frame, merge last depth observation
+        if not read_depth_this_frame and last_depth_obs:
+            obs.update(last_depth_obs)
+        elif read_depth_this_frame:
+            # Store depth data for next frames where we skip depth
+            last_depth_obs = {k: v for k, v in obs.items() if k.endswith("_depth")}
 
         # Applies a pipeline to the raw robot observation, default is IdentityProcessor
         obs_processed = robot_observation_processor(obs)
@@ -368,6 +390,9 @@ def record_loop(
             act_processed_policy: RobotAction = make_robot_action(action_values, dataset.features)
 
         elif policy is None and isinstance(teleop, Teleoperator):
+            # Update teleop's observation cache to avoid double reads (for VR teleop)
+            if hasattr(teleop, 'update_observation_cache'):
+                teleop.update_observation_cache(obs)
             act = teleop.get_action()
 
             # Applies a pipeline to the raw teleop action, default is IdentityProcessor
@@ -410,42 +435,43 @@ def record_loop(
 
         # Visualization is expensive - only do it if enabled and not blocking control rate
         if display_data:
-            try:
-                log_rerun_data(
-                    observation=obs_processed, action=action_values, compress_images=display_compressed_images
-                )
-            except Exception as e:
-                # Don't let visualization errors crash the recording
-                logging.debug(f"Visualization error (non-critical): {e}")
+            # Filter out depth images from rerun visualization to improve performance
+            # Depth images are still recorded to the dataset, just not visualized
+            # Additionally, throttle visualization to every 2nd frame to improve control rate.
+            if frame_idx % 2 == 0:
+                obs_for_rerun = {
+                    k: v for k, v in obs_processed.items()
+                    if not ("depth" in str(k).lower() or k.endswith("_depth"))
+                }
+                try:
+                    log_rerun_data(
+                        observation=obs_for_rerun, action=action_values, compress_images=display_compressed_images
+                    )
+                except Exception as e:
+                    # Don't let visualization errors crash the recording
+                    logging.debug(f"Visualization error (non-critical): {e}")
 
         dt_s = time.perf_counter() - start_loop_t
         precise_sleep(max(1 / fps - dt_s, 0.0))
 
         timestamp = time.perf_counter() - start_episode_t
         
-        # Track control loop rate (Hz)
-        loop_times.append(dt_s)
-        if len(loop_times) > max_loop_samples:
-            loop_times.pop(0)  # Keep only last N samples
-        
-        # Log control rate periodically
+        # Print Hz rate every second
         current_time = time.perf_counter()
-        if current_time - last_hz_log_time >= hz_log_interval:
-            if len(loop_times) > 0:
-                avg_loop_time = sum(loop_times) / len(loop_times)
-                actual_hz = 1.0 / avg_loop_time if avg_loop_time > 0 else 0.0
+        if current_time - last_hz_print >= hz_print_interval:
+            if loop_times:
+                # Calculate actual Hz from measured loop periods (time between loop starts)
+                avg_loop_period = sum(loop_times) / len(loop_times)
+                current_hz = 1.0 / avg_loop_period if avg_loop_period > 0 else 0.0
                 target_hz = fps
-                hz_error = actual_hz - target_hz
-                hz_percent = (actual_hz / target_hz * 100) if target_hz > 0 else 0.0
-                
-                # Use warning level if significantly below target
-                log_level = logging.WARNING if hz_percent < 80 else logging.INFO
-                logging.log(
-                    log_level,
-                    f"🎯 Control rate: {actual_hz:.2f} Hz (target: {target_hz:.1f} Hz, "
-                    f"{hz_percent:.1f}%, error: {hz_error:+.2f} Hz, avg loop time: {avg_loop_time*1000:.2f} ms)"
-                )
-            last_hz_log_time = current_time
+                # Also show the number of loops in this interval
+                num_loops = len(loop_times)
+                logging.info(f"⚡ Control rate: {current_hz:.1f} Hz (target: {target_hz} Hz) | {num_loops} loops in {hz_print_interval:.1f}s")
+                loop_times.clear()  # Reset for next interval
+            last_hz_print = current_time
+
+        # Increment frame index for visualization and depth throttling
+        frame_idx += 1
         
         # Print episode progress every 5 seconds
         if dataset is not None and timestamp - last_status_print >= 5.0:
@@ -557,7 +583,11 @@ def record(cfg: RecordConfig) -> LeRobotDataset:
 
         robot.connect()
         if teleop is not None:
-            teleop.connect()
+            # For XLerobot VR, pass the robot reference so get_action() can compute real commands
+            if isinstance(teleop, XLerobotVRTeleop):
+                teleop.connect(robot=robot)
+            else:
+                teleop.connect()
 
         # Use VR listener if VR teleop, otherwise use keyboard listener
         if isinstance(teleop, XLerobotVRTeleop):
