@@ -683,14 +683,48 @@ def build_dataset_frame(
     Returns:
         dict: A dictionary representing a single frame of data.
     """
+    import logging
+    
+    logger = logging.getLogger(__name__)
     frame = {}
     for key, ft in ds_features.items():
         if key in DEFAULT_FEATURES or not key.startswith(prefix):
             continue
         elif ft["dtype"] == "float32" and len(ft["shape"]) == 1:
-            frame[key] = np.array([values[name] for name in ft["names"]], dtype=np.float32)
+            # Build array from values, using 0.0 as default for missing keys
+            # This handles cases where teleoperator doesn't provide all action keys
+            action_array = []
+            for name in ft["names"]:
+                if name in values:
+                    action_array.append(values[name])
+                else:
+                    # Missing action key - use 0.0 as default (no change/hold position)
+                    action_array.append(0.0)
+                    logger.debug(
+                        f"Action key '{name}' (feature '{key}') not found in action_values. "
+                        "Using 0.0 as default (hold position)."
+                    )
+            frame[key] = np.array(action_array, dtype=np.float32)
         elif ft["dtype"] in ["image", "video"]:
-            frame[key] = values[key.removeprefix(f"{prefix}.images.")]
+            image_key = key.removeprefix(f"{prefix}.images.")
+            if image_key in values:
+                frame[key] = values[image_key]
+            else:
+                # Provide a zeros placeholder for missing images (e.g., depth images that failed to read)
+                # This maintains dataset consistency while allowing recording to continue
+                shape = ft["shape"]
+                if len(shape) == 3:
+                    # Image shape: (height, width, channels)
+                    placeholder = np.zeros(shape, dtype=np.uint8)
+                else:
+                    # Fallback for unexpected shapes
+                    placeholder = np.zeros(shape, dtype=np.uint8)
+                frame[key] = placeholder
+                logger.warning(
+                    f"Image '{image_key}' (feature '{key}') not found in observation. "
+                    "Using zeros placeholder. This may happen if depth images "
+                    "failed to read or if camera is not connected."
+                )
 
     return frame
 

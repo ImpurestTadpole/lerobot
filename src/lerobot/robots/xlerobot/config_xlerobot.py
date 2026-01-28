@@ -45,8 +45,8 @@ def xlerobot_cameras_config() -> dict[str, CameraConfig]:
         "head": RealSenseCameraConfig(
             serial_number_or_name="342222071125",  # Replace with your D435i serial number
             fps=30,
-            width=1280,
-            height=720,
+            width=640,
+            height=480,
             color_mode=ColorMode.RGB,  # Request BGR output
             rotation=Cv2Rotation.NO_ROTATION,
             use_depth=True,

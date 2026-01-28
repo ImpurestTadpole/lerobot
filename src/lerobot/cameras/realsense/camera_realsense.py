@@ -135,6 +135,9 @@ class RealSenseCamera(Camera):
         self.frame_lock: Lock = Lock()
         self.latest_frame: NDArray[Any] | None = None
         self.new_frame_event: Event = Event()
+        # Depth frame storage for async reading
+        self.latest_depth_frame: NDArray[Any] | None = None
+        self.new_depth_frame_event: Event = Event()
 
         self.rotation: int | None = get_cv2_rotation(config.rotation)
 
@@ -428,23 +431,37 @@ class RealSenseCamera(Camera):
 
         if depth_frame:
             h, w = image.shape
+            
+            if h != self.capture_height or w != self.capture_width:
+                raise RuntimeError(
+                    f"{self} depth frame width={w} or height={h} do not match configured width={self.capture_width} or height={self.capture_height}."
+                )
+            
+            processed_image = image
+            # Apply rotation to 2D depth image if needed
+            if self.rotation in [cv2.ROTATE_90_CLOCKWISE, cv2.ROTATE_90_COUNTERCLOCKWISE, cv2.ROTATE_180]:
+                processed_image = cv2.rotate(processed_image, self.rotation)
+            
+            # Add channel dimension for depth images: (H, W) -> (H, W, 1)
+            # This matches the dataset feature shape expectation
+            processed_image = np.expand_dims(processed_image, axis=2)
         else:
             h, w, c = image.shape
 
             if c != 3:
                 raise RuntimeError(f"{self} frame channels={c} do not match expected 3 channels (RGB/BGR).")
 
-        if h != self.capture_height or w != self.capture_width:
-            raise RuntimeError(
-                f"{self} frame width={w} or height={h} do not match configured width={self.capture_width} or height={self.capture_height}."
-            )
+            if h != self.capture_height or w != self.capture_width:
+                raise RuntimeError(
+                    f"{self} frame width={w} or height={h} do not match configured width={self.capture_width} or height={self.capture_height}."
+                )
 
-        processed_image = image
-        if self.color_mode == ColorMode.BGR:
-            processed_image = cv2.cvtColor(image, cv2.COLOR_RGB2BGR)
+            processed_image = image
+            if self.color_mode == ColorMode.BGR:
+                processed_image = cv2.cvtColor(image, cv2.COLOR_RGB2BGR)
 
-        if self.rotation in [cv2.ROTATE_90_CLOCKWISE, cv2.ROTATE_90_COUNTERCLOCKWISE, cv2.ROTATE_180]:
-            processed_image = cv2.rotate(processed_image, self.rotation)
+            if self.rotation in [cv2.ROTATE_90_CLOCKWISE, cv2.ROTATE_90_COUNTERCLOCKWISE, cv2.ROTATE_180]:
+                processed_image = cv2.rotate(processed_image, self.rotation)
 
         return processed_image
 
@@ -453,9 +470,9 @@ class RealSenseCamera(Camera):
         Internal loop run by the background thread for asynchronous reading.
 
         On each iteration:
-        1. Reads a color frame with 500ms timeout
-        2. Stores result in latest_frame (thread-safe)
-        3. Sets new_frame_event to notify listeners
+        1. Reads a color frame (and depth frame if enabled) with 500ms timeout
+        2. Stores results in latest_frame/latest_depth_frame (thread-safe)
+        3. Sets new_frame_event/new_depth_frame_event to notify listeners
 
         Stops on DeviceNotConnectedError, logs other errors and continues.
         """
@@ -464,11 +481,22 @@ class RealSenseCamera(Camera):
 
         while not self.stop_event.is_set():
             try:
+                # Read color frame
                 color_image = self.read(timeout_ms=500)
 
                 with self.frame_lock:
                     self.latest_frame = color_image
                 self.new_frame_event.set()
+
+                # Read depth frame if enabled
+                if self.use_depth:
+                    try:
+                        depth_map = self.read_depth(timeout_ms=500)
+                        with self.frame_lock:
+                            self.latest_depth_frame = depth_map
+                        self.new_depth_frame_event.set()
+                    except Exception as e:
+                        logger.debug(f"Error reading depth frame in background thread for {self}: {e}")
 
             except DeviceNotConnectedError:
                 break
@@ -497,8 +525,59 @@ class RealSenseCamera(Camera):
 
         self.thread = None
         self.stop_event = None
+        # Clear depth frame storage
+        with self.frame_lock:
+            self.latest_depth_frame = None
+        self.new_depth_frame_event.clear()
 
-    # NOTE(Steven): Missing implementation for depth for now
+    def async_read_depth(self, timeout_ms: float = 200) -> NDArray[Any]:
+        """
+        Reads the latest available depth frame data asynchronously.
+
+        This method retrieves the most recent depth frame captured by the background
+        read thread. It does not block waiting for the camera hardware directly,
+        but may wait up to timeout_ms for the background thread to provide a frame.
+
+        Args:
+            timeout_ms (float): Maximum time in milliseconds to wait for a frame
+                to become available. Defaults to 200ms (0.2 seconds).
+
+        Returns:
+            np.ndarray:
+            The latest captured depth frame data, processed according to configuration.
+
+        Raises:
+            DeviceNotConnectedError: If the camera is not connected.
+            RuntimeError: If depth is not enabled or if the background thread died unexpectedly.
+            TimeoutError: If no frame data becomes available within the specified timeout.
+        """
+        if not self.is_connected:
+            raise DeviceNotConnectedError(f"{self} is not connected.")
+        
+        if not self.use_depth:
+            raise RuntimeError(
+                f"Depth stream is not enabled for {self}. Set use_depth=True in config."
+            )
+
+        if self.thread is None or not self.thread.is_alive():
+            self._start_read_thread()
+
+        if not self.new_depth_frame_event.wait(timeout=timeout_ms / 1000.0):
+            thread_alive = self.thread is not None and self.thread.is_alive()
+            raise TimeoutError(
+                f"Timed out waiting for depth frame from camera {self} after {timeout_ms} ms. "
+                f"Read thread alive: {thread_alive}."
+            )
+
+        with self.frame_lock:
+            depth_frame = self.latest_depth_frame
+            self.new_depth_frame_event.clear()
+
+        if depth_frame is None:
+            raise RuntimeError(f"Internal error: Event set but no depth frame available for {self}.")
+
+        return depth_frame
+
     def async_read(self, timeout_ms: float = 200) -> NDArray[Any]:
         """
         Reads the latest available frame data (color) asynchronously.
