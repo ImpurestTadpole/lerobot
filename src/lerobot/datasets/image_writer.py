@@ -39,33 +39,54 @@ def safe_stop_image_writer(func):
 
 
 def image_array_to_pil_image(image_array: np.ndarray, range_check: bool = True) -> PIL.Image.Image:
-    # TODO(aliberts): handle 1 channel and 4 for depth images
+    """Convert numpy array to PIL Image, supporting RGB (3 channels) and grayscale/depth (1 channel) images."""
     if image_array.ndim != 3:
         raise ValueError(f"The array has {image_array.ndim} dimensions, but 3 is expected for an image.")
 
-    if image_array.shape[0] == 3:
+    # Handle channel-first format (C, H, W) - common in PyTorch
+    if image_array.shape[0] in (1, 3, 4):
         # Transpose from pytorch convention (C, H, W) to (H, W, C)
         image_array = image_array.transpose(1, 2, 0)
 
-    elif image_array.shape[-1] != 3:
+    # Get number of channels after transpose
+    num_channels = image_array.shape[-1] if image_array.ndim == 3 else 1
+
+    # Handle single-channel images (grayscale/depth)
+    if num_channels == 1:
+        # Squeeze to 2D (H, W) for grayscale PIL Image
+        image_array = image_array.squeeze(axis=-1)
+        mode = "L"  # Grayscale mode
+    elif num_channels == 3:
+        mode = "RGB"  # RGB mode
+    elif num_channels == 4:
+        mode = "RGBA"  # RGBA mode
+    else:
         raise NotImplementedError(
-            f"The image has {image_array.shape[-1]} channels, but 3 is required for now."
+            f"The image has {num_channels} channels. Supported: 1 (grayscale/depth), 3 (RGB), or 4 (RGBA)."
         )
 
+    # Convert dtype if needed
     if image_array.dtype != np.uint8:
-        if range_check:
+        if range_check and np.issubdtype(image_array.dtype, np.floating):
             max_ = image_array.max().item()
             min_ = image_array.min().item()
+            # For depth images, values might be in millimeters (uint16 range)
+            # Check if values are in [0, 1] float range or larger integer range
             if max_ > 1.0 or min_ < 0.0:
-                raise ValueError(
-                    "The image data type is float, which requires values in the range [0.0, 1.0]. "
-                    f"However, the provided range is [{min_}, {max_}]. Please adjust the range or "
-                    "provide a uint8 image with values in the range [0, 255]."
-                )
+                # Assume values are in a larger range (e.g., depth in mm)
+                # Normalize to [0, 255] for uint8
+                if max_ > min_:
+                    image_array = ((image_array - min_) / (max_ - min_) * 255).astype(np.uint8)
+                else:
+                    image_array = np.zeros_like(image_array, dtype=np.uint8)
+            else:
+                # Values are in [0, 1] range, scale to [0, 255]
+                image_array = (image_array * 255).astype(np.uint8)
+        else:
+            # For integer types, clamp to uint8 range
+            image_array = np.clip(image_array, 0, 255).astype(np.uint8)
 
-        image_array = (image_array * 255).astype(np.uint8)
-
-    return PIL.Image.fromarray(image_array)
+    return PIL.Image.fromarray(image_array, mode=mode)
 
 
 def write_image(image: np.ndarray | PIL.Image.Image, fpath: Path, compress_level: int = 1):
