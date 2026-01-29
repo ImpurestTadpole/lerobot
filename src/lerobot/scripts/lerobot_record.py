@@ -332,10 +332,9 @@ def record_loop(
     prev_loop_start = time.perf_counter()  # Track previous loop start time
     frame_idx = 0  # For throttling visualization
     
-    # Depth read throttling: read depth every Nth frame to improve control rate
-    # Depth is expensive (~20-30ms per RealSense camera), so reading every 2nd frame
-    # gives us 15 Hz depth data while improving overall control rate
-    depth_read_interval = 2  # Read depth every 2nd frame
+    # Depth read throttling: set to 1 to read depth every frame.
+    # For training with depth, it's usually better to keep depth time-aligned to RGB/actions.
+    depth_read_interval = 1  # Read depth every frame
     last_depth_obs = {}  # Store last depth observation for frames where we skip depth
     
     while timestamp < control_time_s:
@@ -466,7 +465,15 @@ def record_loop(
                 target_hz = fps
                 # Also show the number of loops in this interval
                 num_loops = len(loop_times)
-                logging.info(f"⚡ Control rate: {current_hz:.1f} Hz (target: {target_hz} Hz) | {num_loops} loops in {hz_print_interval:.1f}s")
+                ep_str = ""
+                ep_idx = events.get("_episode_idx")
+                ep_total = events.get("_episode_total")
+                if ep_idx is not None and ep_total is not None:
+                    ep_str = f"📹 Ep {ep_idx}/{ep_total} | t={timestamp:05.1f}s | "
+                logging.info(
+                    f"{ep_str}⚡ Control rate: {current_hz:.1f} Hz (target: {target_hz} Hz) | "
+                    f"{num_loops} loops in {hz_print_interval:.1f}s"
+                )
                 loop_times.clear()  # Reset for next interval
             last_hz_print = current_time
 
@@ -598,6 +605,19 @@ def record(cfg: RecordConfig) -> LeRobotDataset:
         with VideoEncodingManager(dataset):
             recorded_episodes = 0
             while recorded_episodes < cfg.dataset.num_episodes and not events["stop_recording"]:
+                # Defensive: ensure stale flags from a previous loop/reset phase don't affect
+                # the semantics of finishing an episode early.
+                # In particular, RIGHT B sets `exit_early` to finish an episode early and save it,
+                # but if `rerecord_episode` was accidentally triggered earlier (and persists),
+                # the episode will be discarded and restarted instead.
+                events["rerecord_episode"] = False
+                events["exit_early"] = False
+                # Also clear the VR teleop's internal (sticky) flag, otherwise it can be
+                # re-introduced on the next `teleop.get_vr_events()` call.
+                if isinstance(teleop, XLerobotVRTeleop) and getattr(teleop, "vr_event_handler", None):
+                    teleop.vr_event_handler.events["rerecord_episode"] = False
+                    teleop.vr_event_handler.events["exit_early"] = False
+
                 log_say(
                     f"Recording episode {dataset.num_episodes + 1} / {dataset.num_episodes + cfg.dataset.num_episodes - recorded_episodes}", 
                     cfg.play_sounds
@@ -606,6 +626,9 @@ def record(cfg: RecordConfig) -> LeRobotDataset:
                     f"🎬 Starting Episode {dataset.num_episodes + 1} "
                     f"(Progress: {recorded_episodes + 1}/{cfg.dataset.num_episodes} episodes)"
                 )
+                # Used only for logging inside record_loop.
+                events["_episode_idx"] = recorded_episodes + 1
+                events["_episode_total"] = cfg.dataset.num_episodes
                 record_loop(
                     robot=robot,
                     events=events,
@@ -623,19 +646,32 @@ def record(cfg: RecordConfig) -> LeRobotDataset:
                     display_data=cfg.display_data,
                     display_compressed_images=display_compressed_images,
                 )
+                events.pop("_episode_idx", None)
+                events.pop("_episode_total", None)
+
+                if events["rerecord_episode"]:
+                    log_say("Re-record episode", cfg.play_sounds)
+                    events["rerecord_episode"] = False
+                    events["exit_early"] = False
+                    if isinstance(teleop, XLerobotVRTeleop) and getattr(teleop, "vr_event_handler", None):
+                        teleop.vr_event_handler.events["rerecord_episode"] = False
+                        teleop.vr_event_handler.events["exit_early"] = False
+                    dataset.clear_episode_buffer()
+                    continue
                 
-                # Episode completed
-                if not events["rerecord_episode"]:
-                    logging.info(
-                        f"✅ Episode {dataset.num_episodes} completed! "
-                        f"({recorded_episodes + 1}/{cfg.dataset.num_episodes} episodes done)"
-                    )
+                # Save episode immediately before reset phase so an interrupt during reset
+                # doesn't lose the episode.
+                dataset.save_episode()
+                recorded_episodes += 1
+
+                logging.info(
+                    f"✅ Episode {dataset.num_episodes} saved! "
+                    f"({recorded_episodes}/{cfg.dataset.num_episodes} episodes done)"
+                )
 
                 # Execute a few seconds without recording to give time to manually reset the environment
                 # Skip reset for the last episode to be recorded
-                if not events["stop_recording"] and (
-                    (recorded_episodes < cfg.dataset.num_episodes - 1) or events["rerecord_episode"]
-                ):
+                if not events["stop_recording"] and recorded_episodes < cfg.dataset.num_episodes:
                     log_say("Reset the environment", cfg.play_sounds)
 
                     # reset g1 robot
@@ -654,16 +690,6 @@ def record(cfg: RecordConfig) -> LeRobotDataset:
                         single_task=cfg.dataset.single_task,
                         display_data=cfg.display_data,
                     )
-
-                if events["rerecord_episode"]:
-                    log_say("Re-record episode", cfg.play_sounds)
-                    events["rerecord_episode"] = False
-                    events["exit_early"] = False
-                    dataset.clear_episode_buffer()
-                    continue
-
-                dataset.save_episode()
-                recorded_episodes += 1
     finally:
         log_say("Stop recording", cfg.play_sounds, blocking=True)
 

@@ -543,11 +543,24 @@ def get_vr_base_action(left_goal, right_goal, robot):
     
     # Dead zone threshold (matching typical VR controller sensitivity)
     DEAD_ZONE = 0.15
+    # Safety: if VR thumbstick metadata is stale, force base to stop.
+    # This prevents the robot from continuing to spin if the recording loop drops updates.
+    STALE_MS = 300
     
     # Right thumbstick controls XY translation (like keyboard i/k/j/l)
     if right_goal is not None and hasattr(right_goal, 'metadata'):
         metadata = right_goal.metadata
         if isinstance(metadata, dict):
+            # If we got an explicit stop, obey it immediately.
+            if metadata.get("base_stop", False):
+                return {"x.vel": 0.0, "y.vel": 0.0, "theta.vel": 0.0}
+
+            packet_ts_ms = metadata.get("packet_ts_ms")
+            if isinstance(packet_ts_ms, (int, float)):
+                now_ms = time.time() * 1000.0
+                if (now_ms - float(packet_ts_ms)) > STALE_MS:
+                    return {"x.vel": 0.0, "y.vel": 0.0, "theta.vel": 0.0}
+
             thumbstick = metadata.get('thumbstick', {})
             if isinstance(thumbstick, dict):
                 thumb_x = thumbstick.get('x', 0)
@@ -555,7 +568,7 @@ def get_vr_base_action(left_goal, right_goal, robot):
                 
                 # Log thumbstick values for debugging (only when above dead zone)
                 if abs(thumb_x) > DEAD_ZONE or abs(thumb_y) > DEAD_ZONE:
-                    logger.info(f"🎮 RIGHT thumbstick: x={thumb_x:.2f}, y={thumb_y:.2f}")
+                    logger.debug(f"🎮 RIGHT thumbstick: x={thumb_x:.2f}, y={thumb_y:.2f}")
                 
                 # Forward/backward (Y-axis)
                 # Positive Y = forward (like 'i' key), negative Y = backward (like 'k' key)
@@ -573,13 +586,23 @@ def get_vr_base_action(left_goal, right_goal, robot):
     if left_goal is not None and hasattr(left_goal, 'metadata'):
         metadata = left_goal.metadata
         if isinstance(metadata, dict):
+            # If we got an explicit stop, obey it immediately.
+            if metadata.get("base_stop", False):
+                return {"x.vel": 0.0, "y.vel": 0.0, "theta.vel": 0.0}
+
+            packet_ts_ms = metadata.get("packet_ts_ms")
+            if isinstance(packet_ts_ms, (int, float)):
+                now_ms = time.time() * 1000.0
+                if (now_ms - float(packet_ts_ms)) > STALE_MS:
+                    return {"x.vel": 0.0, "y.vel": 0.0, "theta.vel": 0.0}
+
             thumbstick = metadata.get('thumbstick', {})
             if isinstance(thumbstick, dict):
                 thumb_x = thumbstick.get('x', 0)
                 
                 # Log thumbstick values for debugging (only when above dead zone)
                 if abs(thumb_x) > DEAD_ZONE:
-                    logger.info(f"🎮 LEFT thumbstick: x={thumb_x:.2f}")
+                    logger.debug(f"🎮 LEFT thumbstick: x={thumb_x:.2f}")
                 
                 # Rotation (X-axis only)
                 # Positive X = rotate right (like 'o' key), negative X = rotate left (like 'u' key)
@@ -1063,9 +1086,28 @@ class XLerobotVRTeleop(Teleoperator):
         return action
     
     def get_vr_events(self):
-        """Get VR event status (high-performance version - use cache to avoid repeated VR data acquisition)"""
+        """Get VR event status.
+
+        IMPORTANT: `lerobot_record.record_loop` checks `events["exit_early"]` *before* calling
+        `teleop.get_action()` in each control-loop iteration.
+
+        If we only update VR button events inside `get_action()` (even at 10Hz), there can be a
+        1-iteration delay where a button press is detected late and can end the *next* episode
+        right after it starts (appearing like episode overlap).
+
+        To prevent cross-episode spillover, we refresh events here using the latest VR packet.
+        """
         if self.vr_event_handler:
-            # Get current event status
+            # Refresh events from the latest VR goals so record_loop sees them immediately.
+            try:
+                if self.vr_monitor is not None:
+                    dual_goals = self.vr_monitor.get_latest_goal_nowait()
+                    if isinstance(dual_goals, dict):
+                        self._update_events_inline(dual_goals.get("left"), dual_goals.get("right"))
+            except Exception as e:
+                logger.debug(f"VR event refresh failed (non-critical): {e}")
+
+            # Get current event status (copy)
             events = self.vr_event_handler.get_events()
             
             # Automatically reset exit_early to prevent infinite loops
@@ -1160,6 +1202,8 @@ class VREventHandler:
             # Left controller buttons
             'button_x': False,
             'button_y': False,
+            'button_thumbstick': False,
+            'button_menu': False,
             # Right controller buttons
             'right_button_b': False,
             # Snapshots for debug
@@ -1191,45 +1235,44 @@ class VREventHandler:
     
     def _process_left_controller(self, metadata):
         """处理左手柄输入"""
-        # 获取摇杆输入
-        thumb = metadata.get('thumbstick', {})
-        thumb_x = thumb.get('x', 0)
-        thumb_y = thumb.get('y', 0)
-        
         # Get button states from left controller
         # Web UI sends for left controller:
         #   x: physical X, y: physical Y
         buttons = metadata.get('buttons', {}) or {}
         button_x = bool(buttons.get('x', False))
         button_y = bool(buttons.get('y', False))
+        button_thumbstick = bool(buttons.get('thumbstick', False))
+        button_menu = bool(buttons.get('menu', False))
 
         # Log raw left button states whenever they change, for mapping debug
         prev_buttons_snapshot = self.prev_states.get('buttons_snapshot', {})
         if buttons != prev_buttons_snapshot:
-            logger.info(f"🎮 LEFT raw buttons: {buttons}")
+            logger.debug(f"🎮 LEFT raw buttons: {buttons}")
 
-        # Requested mapping:
-        #   - LEFT Y button -> Re-record episode (restart current episode)
-        #   - LEFT X is ignored for episode control
-        if button_y and not self.prev_states.get('button_y', False):
-            logger.info("🎮 VR LEFT Y button pressed -> Re-record episode")
+        # Episode control mapping (requested):
+        #   - LEFT X button -> Restart (re-record) current episode
+        #   - LEFT Y button -> Restart (re-record) current episode
+        if (button_x and not self.prev_states.get('button_x', False)) or (
+            button_y and not self.prev_states.get('button_y', False)
+        ):
+            which = "X" if button_x else "Y"
+            logger.info(f"🎮 VR LEFT {which} button pressed -> Re-record current episode")
             self.events["rerecord_episode"] = True
             self.events["exit_early"] = True
-        
-        # Detect thumbstick direction events (only trigger when crossing threshold)
-        if thumb_x > self.threshold and self.prev_states['thumbstick_x'] <= self.threshold:
-            logger.info("🎮 VR left controller right -> Exit loop early")
-            self.events["exit_early"] = True
-            
-        elif thumb_x < -self.threshold:
-            logger.info("🎮 VR left controller left -> Exit loop early")
-            self.events["exit_early"] = True
-            
-        # We no longer map thumbstick up to stop_recording to avoid accidental stops.
-        # Thumbstick directions only affect exit_early/reset/back_position.
 
-        elif thumb_y < -self.threshold and self.prev_states['thumbstick_y'] >= -self.threshold:
-            logger.info("🎮 VR left controller down -> Reset robot")
+        # IMPORTANT: Do NOT map thumbstick *movement* to episode control events.
+        # The left thumbstick X axis is used for base rotation, so mapping it to `exit_early`
+        # causes accidental episode termination when rotating the robot.
+        #
+        # Explicit buttons only:
+        # - LEFT Menu -> Stop recording (sticky)
+        # - LEFT Thumbstick click -> Reset robot (instantaneous)
+        if button_menu and not self.prev_states.get('button_menu', False):
+            logger.info("🎮 VR LEFT menu button pressed -> Stop recording")
+            self.events["stop_recording"] = True
+
+        if button_thumbstick and not self.prev_states.get('button_thumbstick', False):
+            logger.debug("🎮 VR LEFT thumbstick button pressed -> Reset robot")
             self.events["reset_position"] = True
         else:
             self.events["reset_position"] = False  # Reset event is instantaneous
@@ -1240,11 +1283,11 @@ class VREventHandler:
         
         # Update status
         self.prev_states.update({
-            'thumbstick_x': thumb_x,
-            'thumbstick_y': thumb_y,
             'trigger': trigger,
             'button_x': button_x,
             'button_y': button_y,
+            'button_thumbstick': button_thumbstick,
+            'button_menu': button_menu,
             'buttons_snapshot': buttons,
         })
 
@@ -1255,12 +1298,12 @@ class VREventHandler:
 
         prev_right_snapshot = self.prev_states.get('right_buttons_snapshot', {})
         if buttons != prev_right_snapshot:
-            logger.info(f"🎮 RIGHT raw buttons: {buttons}")
+            logger.debug(f"🎮 RIGHT raw buttons: {buttons}")
 
         # Requested mapping:
-        #   - RIGHT B button -> finish episode early (exit_early, no re-record)
+        #   - RIGHT B button -> finish episode early (save and continue to next episode)
         if button_b and not self.prev_states.get('right_button_b', False):
-            logger.info("🎮 VR RIGHT B button pressed -> Exit episode early")
+            logger.info("🎮 VR RIGHT B button pressed -> Finish episode early")
             self.events["exit_early"] = True
 
         self.prev_states['right_button_b'] = button_b
@@ -1292,11 +1335,11 @@ class VREventHandler:
         ║  ├─ RIGHT thumbstick ←→: Left / Right lateral                ║
         ║  └─ LEFT thumbstick ←→: Rotate left / Rotate right           ║
         ╠══════════════════════════════════════════════════════════════╣
-        ║  EPISODE CONTROL:                                             ║
-        ║  ├─ LEFT X button: Re-record current episode                  ║
-        ║  ├─ LEFT Y button: Stop recording                             ║
-        ║  ├─ RIGHT A button: Exit loop early                           ║
-        ║  └─ RIGHT B button: Reset robot position                      ║
+        ║  EPISODE CONTROL (Buttons only):                              ║
+        ║  ├─ LEFT X/Y button: Restart (re-record) current episode      ║
+        ║  ├─ RIGHT B button: Finish episode early (save & next)        ║
+        ║  ├─ LEFT Menu button: Stop recording                          ║
+        ║  └─ LEFT Thumbstick click: Reset robot                        ║
         ╚══════════════════════════════════════════════════════════════╝
         """
         logger.info(guide)

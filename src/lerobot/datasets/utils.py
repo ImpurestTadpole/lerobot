@@ -701,11 +701,25 @@ def hw_to_dataset_features(
         }
 
     for key, shape in cam_fts.items():
-        features[f"{prefix}.images.{key}"] = {
-            "dtype": "video" if use_video else "image",
-            "shape": shape,
-            "names": ["height", "width", "channels"],
-        }
+        # Depth images should be stored as raw mono uint16 PNG (dtype="depth"),
+        # not as RGB video/image. We follow the conventions introduced in
+        # https://github.com/huggingface/lerobot/pull/2604.
+        #
+        # Robot camera features typically expose depth streams as "<camera>_depth".
+        # Example: "head_depth" -> "observation.images.head_depth".
+        is_depth = key.endswith("_depth")
+        if is_depth:
+            features[f"{prefix}.images.{key}"] = {
+                "dtype": "depth",
+                "shape": shape,
+                "names": ["height", "width", "channels"],
+            }
+        else:
+            features[f"{prefix}.images.{key}"] = {
+                "dtype": "video" if use_video else "image",
+                "shape": shape,
+                "names": ["height", "width", "channels"],
+            }
 
     _validate_feature_names(features)
     return features
