@@ -93,10 +93,19 @@ class DiffusionPolicy(PreTrainedPolicy):
     @torch.no_grad()
     def predict_action_chunk(self, batch: dict[str, Tensor], noise: Tensor | None = None) -> Tensor:
         """Predict a chunk of actions given environment observations."""
-        # stack n latest observations from the queue
-        batch = {k: torch.stack(list(self._queues[k]), dim=1) for k in batch if k in self._queues}
-        actions = self.diffusion.generate_actions(batch, noise=noise)
-
+        # Stack n latest observations from the queue
+        # If queues are empty (first frame in async server), use batch values directly
+        stacked_batch = {}
+        for k in batch:
+            if k in self._queues:
+                if len(self._queues[k]) > 0:
+                    stacked_batch[k] = torch.stack(list(self._queues[k]), dim=1)
+                else:
+                    # Queue empty: expand batch value to n_obs_steps
+                    n = self.config.n_obs_steps
+                    stacked_batch[k] = batch[k].unsqueeze(1).expand(-1, n, *batch[k].shape[1:])
+        
+        actions = self.diffusion.generate_actions(stacked_batch, noise=noise)
         return actions
 
     @torch.no_grad()

@@ -59,6 +59,26 @@ lerobot-teleoperate \
     --teleop.type=xlerobot_vr \
     --display_data=true
 
+
+# -----------------------------------------------------------------------------
+# LIFT AXIS (gantry) - activation, calibration, control
+# -----------------------------------------------------------------------------
+# Activation: Set robot.lift_axis.enabled=true (CLI above or in config).
+# Hardware:   Lift motor must be on bus2 (port2) at motor_id=9 (default).
+#
+# Calibration: When enabled, during robot calibrate() you are prompted to home
+#              the lift. Homing drives the axis down until stall, then sets
+#              that position as 0 mm. You can skip with 's' if not ready.
+#              (The lift motor is now registered on the bus at construction
+#              so bus operations like disable_torque and homing work.)
+#
+# Control:     - Target height (mm): action["gantry.height_mm"] = target_mm
+#              - Direct velocity:    action["gantry.vel"] = velocity (raw)
+#              VR: Left controller thumbstick UP/DOWN = lift up/down.
+#
+# Recording:   Observations: gantry.height_mm, gantry.vel
+#              Actions:      gantry.height_mm and/or gantry.vel (same keys)
+
 # =============================================================================
 # REMOTE VISUALIZATION (ON EXTERNAL PC)
 # =============================================================================
@@ -121,7 +141,7 @@ lerobot-record \
 
 # Manually push to hub after recording:
 python -c "from lerobot.datasets.lerobot_dataset import LeRobotDataset; \
-    dataset = LeRobotDataset('Odog16/ob15_test_1'); \
+    dataset = LeRobotDataset('Odog16/test_transfer_block'); \
     dataset.push_to_hub()"
 
 # Local data location: ~/.cache/huggingface/lerobot/Odog16/ob15_test_1/
@@ -149,13 +169,25 @@ rm -rf ~/.cache/huggingface/lerobot/Odog16/Odog16/test_transfer_block
 # TRAINING POLICY (Run on PC with GPU)
 # =============================================================================
 lerobot-train \
-    --dataset.repo_id=Odog16/ob15_test_1 \
+    --dataset.repo_id=Odog16/test_transfer_block \
     --policy.type=act \
-    --output_dir=outputs/train/act_xlerobot \
-    --job_name=act_xlerobot \
+    --output_dir=outputs/train/act_test_transfer_block \
+    --job_name=act_test_transfer_block \
     --policy.device=cuda \
     --wandb.enable=true \
-    --policy.repo_id=Odog16/xlerobot_policy
+    --policy.repo_id=Odog16/test_transfer_block_policy
+
+# Train excluding depth: same ACT inputs as normal (multiple RGB images + robot state;
+# see https://huggingface.co/docs/lerobot/act) but omit observation.images.head_depth:
+lerobot-train \
+    --dataset.repo_id=Odog16/test_transfer_block \
+    --policy.type=act \
+    --policy.input_features='{"observation.images.head": {"type": "VISUAL", "shape": [3, 480, 640]}, "observation.images.left_wrist": {"type": "VISUAL", "shape": [3, 480, 640]}, "observation.images.right_wrist": {"type": "VISUAL", "shape": [3, 480, 640]}, "observation.state": {"type": "STATE", "shape": [17]}}' \
+    --output_dir=outputs/train/act_test_transfer_block_no_depth \
+    --job_name=act_test_transfer_block_no_depth \
+    --policy.device=cuda \
+    --wandb.enable=true \
+    --policy.repo_id=Odog16/test_transfer_block_policy_no_depth
 
 # Resume training from checkpoint:
 lerobot-train \
@@ -163,35 +195,46 @@ lerobot-train \
     --resume=true
 
 # =============================================================================
-# EVALUATE POLICY (Run inference on robot)
+# ASYNC INFERENCE (policy on external GPU, robot on Jetson)
 # =============================================================================
-# Direct evaluation using lerobot-record:
-lerobot-record \
-    --robot.type=xlerobot \
-    --dataset.repo_id=Odog16/eval_xlerobot \
-    --dataset.single_task="place clothes in bin" \
-    --display_data=false \
-    --policy.path=Odog16/xlerobot_policy
-
-# Async inference examples (see ASYNC INFERENCE section below for more details):
+# Use when the policy is too large for Jetson or you want inference on a stronger GPU.
+# Policy runs on the external machine; Jetson runs the robot client over the network.
+#
+# Step 1 — ON EXTERNAL GPU MACHINE (PC with CUDA): start the policy server
+python -m lerobot.async_inference.policy_server \
+    --host=0.0.0.0 \
+    --port=8080 \
+    --fps=30 \
+    --inference_latency=0.033 \
+    --obs_queue_timeout=1
+# If you see "stack expects a non-empty TensorList" (e.g. diffusion on first frame):
+# 1) Sync lerobot code to the GPU machine: the fix is in src/lerobot/policies/diffusion/modeling_diffusion.py
+#    (predict_action_chunk handles empty queues). Copy from Jetson or: git pull / same branch on both.
+# 2) Optionally try: --obs_queue_timeout=5.0
+# Depth: if the policy was not trained with depth, head_depth is already dropped (server uses only policy keys).
+#
+# Step 2 — ON JETSON (robot + cameras): run the robot client
+#          Set server_address to the external GPU machine's IP (same LAN as Jetson).
+# ACT example (use the _policy repo, not the dataset repo):
 python -m lerobot.async_inference.robot_client \
-    --server_address=192.168.0.106:8080 \
+    --server_address=10.249.43.224:8080 \
     --robot.type=xlerobot \
-    --task="packing_box" \
+    --task="transfer the block" \
     --policy_type=act \
-    --pretrained_name_or_path=Odog16/act_200k_ob15_packing_box_policy \
+    --pretrained_name_or_path=Odog16/test_transfer_block_policy \
     --policy_device=cuda \
-    --actions_per_chunk=120 \
-    --chunk_size_threshold=0.5 \
-    --aggregate_fn_name="latest_only" \
+    --actions_per_chunk=100 \
+    --chunk_size_threshold=0.6 \
+    --aggregate_fn_name="weighted_average" \
     --fps=30
 
+# Diffusion example:
 python -m lerobot.async_inference.robot_client \
-    --server_address=192.168.0.106:8080 \
+    --server_address=10.249.43.224:8080 \
     --robot.type=xlerobot \
-    --task="packing_box" \
-    --policy_type=smolvla \
-    --pretrained_name_or_path=Odog16/smolvla_ob15_packing_box_policy_2 \
+    --task="transfer the block" \
+    --policy_type=diffusion \
+    --pretrained_name_or_path=Odog16/test_transfer_block_diffusion \
     --policy_device=cuda \
     --actions_per_chunk=80 \
     --chunk_size_threshold=0.3 \
@@ -199,7 +242,18 @@ python -m lerobot.async_inference.robot_client \
     --fps=30
 
 
-
+# aggregate_fn_name options (when overlapping action chunks are merged):
+#   weighted_average  0.3*old + 0.7*new  (default, favours newer)
+#   latest_only       use new only       (ignore previous at same timestep)
+#   average           0.5*old + 0.5*new  (equal blend)
+#   conservative      0.7*old + 0.3*new (favours older, smoother)
+#
+# PERFORMANCE: Diffusion policies automatically use 10 inference steps (instead of default 100)
+# for ~10x speedup with minimal quality loss (~2000ms → ~200ms). If inference is still slow:
+#   - Check GPU usage: nvidia-smi (should see python process using GPU)
+#   - Reduce image resolution in robot config (e.g., 320x240 instead of 640x480)
+#   - Disable depth cameras if not needed for the task
+#   - Consider using a faster policy type (e.g., ACT is typically faster than diffusion)
 
     --robot.port1=/dev/ttyACM1 \
     --robot.port2=/dev/ttyACM2 \
@@ -292,9 +346,9 @@ lerobot-edit-dataset \
 
 # Or delete episodes and overwrite original (WARNING: permanent deletion):
  lerobot-edit-dataset \
-     --repo_id Odog16/ob15_packing_box \
+     --repo_id Odog16/test_transfer_block \
      --operation.type delete_episodes \
-     --operation.episode_indices "[75, 76, 77, 78, 79, 80, 81, 82, 83, 84, 85, 86, 87, 88, 89, 90, 91, 92, 93, 94, 95, 96, 97, 98, 99, 100, 101, 102, 103, 104, 105, 106, 107, 108, 109, 110, 111, 112, 113, 114]" \
+     --operation.episode_indices "[35, 69]" \
      --push_to_hub true
 
 

@@ -57,6 +57,77 @@ except Exception as e:
     logging.warning(f"Could not import VR Monitor: {e}")
 
 
+# -----------------------------------------------------------------------------
+# VR controller input validation (ensure all reads are type-safe)
+# -----------------------------------------------------------------------------
+
+def _safe_metadata(goal) -> dict:
+    """Return goal.metadata as a dict, or empty dict if missing/invalid."""
+    if goal is None or not hasattr(goal, "metadata"):
+        return {}
+    m = goal.metadata
+    return m if isinstance(m, dict) else {}
+
+
+def _safe_thumbstick(metadata: dict) -> tuple[float, float]:
+    """Return (x, y) thumbstick values in [-1, 1], or (0, 0) if invalid."""
+    if not isinstance(metadata, dict):
+        return (0.0, 0.0)
+    t = metadata.get("thumbstick")
+    if not isinstance(t, dict):
+        return (0.0, 0.0)
+    try:
+        x = float(t.get("x", 0))
+        y = float(t.get("y", 0))
+    except (TypeError, ValueError):
+        return (0.0, 0.0)
+    return (max(-1.0, min(1.0, x)), max(-1.0, min(1.0, y)))
+
+
+def _safe_trigger(metadata: dict) -> float:
+    """Return trigger value in [0, 1], or 0 if invalid."""
+    if not isinstance(metadata, dict):
+        return 0.0
+    try:
+        v = float(metadata.get("trigger", 0))
+    except (TypeError, ValueError):
+        return 0.0
+    return max(0.0, min(1.0, v))
+
+
+def _safe_buttons(metadata: dict) -> dict:
+    """Return buttons dict, or empty dict if invalid."""
+    if not isinstance(metadata, dict):
+        return {}
+    b = metadata.get("buttons")
+    return b if isinstance(b, dict) else {}
+
+
+def _safe_head_angles(metadata: dict) -> tuple[float, float]:
+    """Return (head_pan_deg, head_tilt_deg), or (0, 0) if invalid."""
+    if not isinstance(metadata, dict):
+        return (0.0, 0.0)
+    try:
+        pan = float(metadata.get("head_pan", 0))
+        tilt = float(metadata.get("head_tilt", 0))
+    except (TypeError, ValueError):
+        return (0.0, 0.0)
+    return (pan, tilt)
+
+
+def _safe_packet_ts_ms(metadata: dict):
+    """Return packet_ts_ms if present and numeric, else None."""
+    if not isinstance(metadata, dict):
+        return None
+    v = metadata.get("packet_ts_ms")
+    if v is None:
+        return None
+    try:
+        return float(v)
+    except (TypeError, ValueError):
+        return None
+
+
 # Joint mapping configurations (copied from 8_xlerobot_VR_teleop.py)
 LEFT_JOINT_MAP = {
     "shoulder_pan": "left_arm_shoulder_pan",
@@ -348,7 +419,7 @@ class SimpleTeleopArm:
         # Handle gripper state with variable precision control
         # Extract trigger value as float (range: 0.0 to 1.0)
         # RANGE_0_100: 0 = fully open, 100 = fully closed
-        trigger_value = float(vr_goal.metadata.get('trigger', 0.0))
+        trigger_value = _safe_trigger(_safe_metadata(vr_goal))
         
         # Optional: Apply deadzone to prevent accidental small movements
         # Adjust deadzone threshold as needed (0.0 = no deadzone, higher = more deadzone)
@@ -456,14 +527,12 @@ class SimpleHeadControl:
         Args:
             headset_goal: ControlGoal with headset metadata containing head_pan and head_tilt in degrees
         """
-        if headset_goal is None or not hasattr(headset_goal, 'metadata'):
+        meta = _safe_metadata(headset_goal)
+        if not meta:
             return
-            
-        # Extract head pan and tilt from headset goal metadata
-        # head_pan: yaw angle (left/right), head_tilt: pitch angle (up/down)
-        # Invert both pan and tilt to match robot movement direction
-        head_pan_deg = -headset_goal.metadata.get('head_pan', 0.0)  # Inverted
-        head_tilt_deg = -headset_goal.metadata.get('head_tilt', 0.0)  # Inverted
+        head_pan_deg, head_tilt_deg = _safe_head_angles(meta)
+        head_pan_deg = -head_pan_deg   # Inverted to match robot movement direction
+        head_tilt_deg = -head_tilt_deg
         
         # Clamp to safe ranges
         head_pan_deg = max(-self.max_pan_deg, min(self.max_pan_deg, head_pan_deg))
@@ -544,71 +613,37 @@ def get_vr_base_action(left_goal, right_goal, robot):
     # Dead zone threshold (matching typical VR controller sensitivity)
     DEAD_ZONE = 0.15
     # Safety: if VR thumbstick metadata is stale, force base to stop.
-    # This prevents the robot from continuing to spin if the recording loop drops updates.
     STALE_MS = 300
-    
+
     # Right thumbstick controls XY translation (like keyboard i/k/j/l)
-    if right_goal is not None and hasattr(right_goal, 'metadata'):
-        metadata = right_goal.metadata
-        if isinstance(metadata, dict):
-            # If we got an explicit stop, obey it immediately.
-            if metadata.get("base_stop", False):
-                return {"x.vel": 0.0, "y.vel": 0.0, "theta.vel": 0.0}
+    right_meta = _safe_metadata(right_goal)
+    if right_meta:
+        if right_meta.get("base_stop", False) is True:
+            return {"x.vel": 0.0, "y.vel": 0.0, "theta.vel": 0.0}
+        ts = _safe_packet_ts_ms(right_meta)
+        if ts is not None and (time.time() * 1000.0 - ts) > STALE_MS:
+            return {"x.vel": 0.0, "y.vel": 0.0, "theta.vel": 0.0}
+        thumb_x, thumb_y = _safe_thumbstick(right_meta)
+        if abs(thumb_x) > DEAD_ZONE or abs(thumb_y) > DEAD_ZONE:
+            logger.debug(f"🎮 RIGHT thumbstick: x={thumb_x:.2f}, y={thumb_y:.2f}")
+        if abs(thumb_y) > DEAD_ZONE:
+            x_cmd = -thumb_y * xy_speed
+        if abs(thumb_x) > DEAD_ZONE:
+            y_cmd = -thumb_x * xy_speed
 
-            packet_ts_ms = metadata.get("packet_ts_ms")
-            if isinstance(packet_ts_ms, (int, float)):
-                now_ms = time.time() * 1000.0
-                if (now_ms - float(packet_ts_ms)) > STALE_MS:
-                    return {"x.vel": 0.0, "y.vel": 0.0, "theta.vel": 0.0}
-
-            thumbstick = metadata.get('thumbstick', {})
-            if isinstance(thumbstick, dict):
-                thumb_x = thumbstick.get('x', 0)
-                thumb_y = thumbstick.get('y', 0)
-                
-                # Log thumbstick values for debugging (only when above dead zone)
-                if abs(thumb_x) > DEAD_ZONE or abs(thumb_y) > DEAD_ZONE:
-                    logger.debug(f"🎮 RIGHT thumbstick: x={thumb_x:.2f}, y={thumb_y:.2f}")
-                
-                # Forward/backward (Y-axis)
-                # Positive Y = forward (like 'i' key), negative Y = backward (like 'k' key)
-                # Note: Inverted because VR thumbstick Y-axis is opposite to robot's forward direction
-                if abs(thumb_y) > DEAD_ZONE:
-                    x_cmd = -thumb_y * xy_speed  # Inverted to match robot's forward direction
-                
-                # Left/right lateral (X-axis)
-                # Positive X = right (like 'l' key), negative X = left (like 'j' key)
-                # Note: xlerobot uses opposite signs - positive for left, negative for right
-                if abs(thumb_x) > DEAD_ZONE:
-                    y_cmd = -thumb_x * xy_speed  # Inverted to match xlerobot keyboard
-    
-    # Left thumbstick controls rotation (like keyboard u/o)
-    if left_goal is not None and hasattr(left_goal, 'metadata'):
-        metadata = left_goal.metadata
-        if isinstance(metadata, dict):
-            # If we got an explicit stop, obey it immediately.
-            if metadata.get("base_stop", False):
-                return {"x.vel": 0.0, "y.vel": 0.0, "theta.vel": 0.0}
-
-            packet_ts_ms = metadata.get("packet_ts_ms")
-            if isinstance(packet_ts_ms, (int, float)):
-                now_ms = time.time() * 1000.0
-                if (now_ms - float(packet_ts_ms)) > STALE_MS:
-                    return {"x.vel": 0.0, "y.vel": 0.0, "theta.vel": 0.0}
-
-            thumbstick = metadata.get('thumbstick', {})
-            if isinstance(thumbstick, dict):
-                thumb_x = thumbstick.get('x', 0)
-                
-                # Log thumbstick values for debugging (only when above dead zone)
-                if abs(thumb_x) > DEAD_ZONE:
-                    logger.debug(f"🎮 LEFT thumbstick: x={thumb_x:.2f}")
-                
-                # Rotation (X-axis only)
-                # Positive X = rotate right (like 'o' key), negative X = rotate left (like 'u' key)
-                # Note: xlerobot uses opposite signs - positive for left, negative for right
-                if abs(thumb_x) > DEAD_ZONE:
-                    theta_cmd = -thumb_x * theta_speed  # Inverted to match xlerobot keyboard
+    # Left thumbstick X-axis controls rotation (like keyboard u/o); Y used for lift in get_vr_lift_action
+    left_meta = _safe_metadata(left_goal)
+    if left_meta:
+        if left_meta.get("base_stop", False) is True:
+            return {"x.vel": 0.0, "y.vel": 0.0, "theta.vel": 0.0}
+        ts = _safe_packet_ts_ms(left_meta)
+        if ts is not None and (time.time() * 1000.0 - ts) > STALE_MS:
+            return {"x.vel": 0.0, "y.vel": 0.0, "theta.vel": 0.0}
+        thumb_x, _ = _safe_thumbstick(left_meta)
+        if abs(thumb_x) > DEAD_ZONE:
+            logger.debug(f"🎮 LEFT thumbstick: x={thumb_x:.2f}")
+        if abs(thumb_x) > DEAD_ZONE:
+            theta_cmd = -thumb_x * theta_speed
     
     # Log base commands for debugging (only when non-zero)
     if x_cmd != 0 or y_cmd != 0 or theta_cmd != 0:
@@ -619,6 +654,37 @@ def get_vr_base_action(left_goal, right_goal, robot):
         "y.vel": y_cmd,
         "theta.vel": theta_cmd,
     }
+
+
+def get_vr_lift_action(left_goal, robot) -> dict[str, Any]:
+    """
+    Get lift (gantry) velocity from left controller thumbstick Y-axis.
+    - Left thumbstick UP (positive Y) -> lift up (positive velocity).
+    - Left thumbstick DOWN (negative Y) -> lift down (negative velocity).
+    - Centered or invalid -> zero velocity.
+
+    Returns a dict with a single key "{lift_name}.vel" when the robot has
+    lift_axis enabled, else empty dict. Caller should merge into action.
+    """
+    if robot is None:
+        return {}
+    lift = getattr(robot, "lift_axis", None)
+    if lift is None or not getattr(lift, "enabled", False):
+        return {}
+    name = getattr(getattr(lift, "cfg", None), "name", "gantry")
+    v_max = int(getattr(getattr(lift, "cfg", None), "v_max", 1300))
+    metadata = _safe_metadata(left_goal)
+    thumb_x, thumb_y = _safe_thumbstick(metadata)
+    DEAD_ZONE = 0.15
+    if abs(thumb_y) <= DEAD_ZONE:
+        vel = 0
+    else:
+        # Scale thumbstick Y [-1, 1] to velocity; use fraction of v_max for safety
+        scale = 0.7 * v_max
+        vel = thumb_y * scale
+        vel = max(-v_max, min(v_max, int(round(vel))))
+    return {f"{name}.vel": vel}
+
 
 class XLerobotVRTeleop(Teleoperator):
     """
@@ -814,14 +880,21 @@ class XLerobotVRTeleop(Teleoperator):
         self._cached_obs = obs
         self._obs_cache_time = time.perf_counter()
     
-    def _get_noop_action(self, robot_obs: dict[str, Any]) -> dict[str, Any]:
+    def _get_noop_lift_action(self, robot) -> dict[str, Any]:
+        """When lift axis is enabled, return zero velocity so lift does not keep moving."""
+        return get_vr_lift_action(None, robot) if robot else {}
+
+    def _get_noop_action(self, robot_obs: dict[str, Any], robot: Optional[Any] = None) -> dict[str, Any]:
         """Generate a no-op action (current positions) with all required keys."""
         action = {}
         action.update(self._get_noop_left_arm_action(robot_obs))
         action.update(self._get_noop_right_arm_action(robot_obs))
         action.update(self._get_noop_head_action(robot_obs))
-        # Base velocities default to zero
         action.update({"x.vel": 0.0, "y.vel": 0.0, "theta.vel": 0.0})
+        if robot is not None:
+            lift_noop = self._get_noop_lift_action(robot)
+            if lift_noop:
+                action.update(lift_noop)
         return action
     
     def _get_noop_left_arm_action(self, robot_obs: dict[str, Any]) -> dict[str, Any]:
@@ -856,11 +929,10 @@ class XLerobotVRTeleop(Teleoperator):
         
         # Quick check VR monitoring status and robot reference
         if not self.vr_monitor or self.robot is None:
-            # Return no-op action (current positions) if VR/robot not ready
             try:
                 robot_obs = self.robot.get_observation() if self.robot else {}
-                action = self._get_noop_action(robot_obs)
-            except:
+                action = self._get_noop_action(robot_obs, self.robot)
+            except Exception:
                 action = {}
             self.logs["read_pos_dt_s"] = time.perf_counter() - total_start
             return action
@@ -870,11 +942,10 @@ class XLerobotVRTeleop(Teleoperator):
         try:
             dual_goals = self.vr_monitor.get_latest_goal_nowait()
             if dual_goals is None:
-                # Return no-op action (current positions) if no VR data yet
                 try:
                     robot_obs = self.robot.get_observation()
-                    action = self._get_noop_action(robot_obs)
-                except:
+                    action = self._get_noop_action(robot_obs, self.robot)
+                except Exception:
                     action = {}
                 self.logs["read_pos_dt_s"] = time.perf_counter() - total_start
                 return action
@@ -885,11 +956,10 @@ class XLerobotVRTeleop(Teleoperator):
             
         except Exception as e:
             logger.warning(f"VR data acquisition failed: {e}")
-            # Return no-op action (current positions) on VR data failure
             try:
                 robot_obs = self.robot.get_observation()
-                action = self._get_noop_action(robot_obs)
-            except:
+                action = self._get_noop_action(robot_obs, self.robot)
+            except Exception:
                 action = {}
             self.logs["read_pos_dt_s"] = time.perf_counter() - total_start
             return action
@@ -941,11 +1011,9 @@ class XLerobotVRTeleop(Teleoperator):
                 # Log headset data occasionally for debugging
                 if not hasattr(self, '_last_headset_log'):
                     self._last_headset_log = 0
-                if (current_time - self._last_headset_log) >= 2.0:  # Log every 2 seconds
-                    if hasattr(headset_goal, 'metadata'):
-                        pan = headset_goal.metadata.get('head_pan', 0.0)
-                        tilt = headset_goal.metadata.get('head_tilt', 0.0)
-                        logger.debug(f"🎧 Headset: pan={pan:.1f}°, tilt={tilt:.1f}° -> targets: pan={self.head_control.target_positions['head_pan']:.1f}, tilt={self.head_control.target_positions['head_tilt']:.1f}")
+                if (current_time - self._last_headset_log) >= 2.0:
+                    pan, tilt = _safe_head_angles(_safe_metadata(headset_goal))
+                    logger.debug(f"🎧 Headset: pan={pan:.1f}°, tilt={tilt:.1f}° -> targets: pan={self.head_control.target_positions['head_pan']:.1f}, tilt={self.head_control.target_positions['head_tilt']:.1f}")
                     self._last_headset_log = current_time
             elif headset_goal is None and self.head_control is not None:
                 # Log occasionally if headset data is missing
@@ -955,11 +1023,11 @@ class XLerobotVRTeleop(Teleoperator):
                     logger.warning("⚠️  No headset data received - head control will maintain current position")
                     self._last_headset_warning = current_time
             
-            # Event processing - optimized frequency (10Hz)
-            if (current_time - self.last_event_update_time) >= 0.1:
-                if left_goal is not None or right_goal is not None:
-                    self._update_events_inline(left_goal, right_goal)
-                self.last_event_update_time = current_time
+            # NOTE: Do not process episode-control events here.
+            # `lerobot_record.record_loop` reads VR events via `teleop.get_vr_events()` before
+            # calling `teleop.get_action()`. Updating events in both places can cause flapping
+            # when packets intermittently omit buttons (e.g. {}), leading to false "release"
+            # then "press" edges and making every other episode exit early.
             
             # Generate action dictionary - ensure all required keys are present
             left_action = self.left_arm.p_control_action(robot_obs) if self.left_arm is not None else self._get_noop_left_arm_action(robot_obs)
@@ -968,23 +1036,26 @@ class XLerobotVRTeleop(Teleoperator):
             
             # Base control - ALWAYS try to get base action (even if goals are None)
             base_action = get_vr_base_action(left_goal, right_goal, self.robot)
-            
-            # Log base action for debugging (only if non-zero, and only occasionally to reduce overhead)
+            # Lift axis - left thumbstick Y (up/down)
+            lift_action = get_vr_lift_action(left_goal, self.robot)
+
             if not hasattr(self, '_last_base_log_time'):
                 self._last_base_log_time = 0
             current_time = time.perf_counter()
-            if (current_time - self._last_base_log_time) >= 1.0:  # Log at most once per second
+            if (current_time - self._last_base_log_time) >= 1.0:
                 if base_action.get("x.vel", 0) != 0 or base_action.get("y.vel", 0) != 0 or base_action.get("theta.vel", 0) != 0:
                     logger.debug(f"🕹️  VR Base action: x={base_action['x.vel']:.3f}, y={base_action['y.vel']:.3f}, theta={base_action['theta.vel']:.1f}")
+                if lift_action:
+                    logger.debug(f"🔼 VR Lift action: {lift_action}")
             self._last_base_log_time = current_time
-            
+
             # Merge actions
             action.update(left_action)
             action.update(right_action)
             action.update(head_action)
             action.update(base_action)
-            
-            # Verify base action was merged (debug)
+            action.update(lift_action)
+
             if "x.vel" in action or "y.vel" in action or "theta.vel" in action:
                 logger.debug(f"✓ Base velocities in final action: x={action.get('x.vel', 0):.3f}, y={action.get('y.vel', 0):.3f}, theta={action.get('theta.vel', 0):.1f}")
             
@@ -992,10 +1063,9 @@ class XLerobotVRTeleop(Teleoperator):
             logger.error(f"Action generation failed: {e}")
             import traceback
             logger.error(traceback.format_exc())
-            # Return no-op action (current positions) on exception
             try:
-                action = self._get_noop_action(robot_obs)
-            except:
+                action = self._get_noop_action(robot_obs, self.robot)
+            except Exception:
                 action = {}
         
         ik_dt_ms = (time.perf_counter() - ik_start) * 1e3
@@ -1037,10 +1107,12 @@ class XLerobotVRTeleop(Teleoperator):
         while attempt < max_attempts:
             try:
                 dual_goals = self.vr_monitor.get_latest_goal_nowait()
-                if dual_goals and sum(dual_goals.get('right').metadata['vr_position']):
+                right_goal = dual_goals.get("right") if isinstance(dual_goals, dict) else None
+                meta = _safe_metadata(right_goal) if right_goal else {}
+                vr_pos = meta.get("vr_position")
+                if isinstance(vr_pos, (list, tuple)) and len(vr_pos) >= 3 and sum(vr_pos) != 0:
                     logger.info("VR controller data received")
                     return
-                    
             except Exception as e:
                 logger.warning(f"Error getting VR data: {e}")
             
@@ -1206,6 +1278,7 @@ class VREventHandler:
             'button_menu': False,
             # Right controller buttons
             'right_button_b': False,
+            'right_b_last_press_ts': 0.0,
             # Snapshots for debug
             'buttons_snapshot': {},
             'right_buttons_snapshot': {},
@@ -1234,11 +1307,8 @@ class VREventHandler:
         return self.events
     
     def _process_left_controller(self, metadata):
-        """处理左手柄输入"""
-        # Get button states from left controller
-        # Web UI sends for left controller:
-        #   x: physical X, y: physical Y
-        buttons = metadata.get('buttons', {}) or {}
+        """Process left controller input."""
+        buttons = _safe_buttons(metadata)
         button_x = bool(buttons.get('x', False))
         button_y = bool(buttons.get('y', False))
         button_thumbstick = bool(buttons.get('thumbstick', False))
@@ -1279,7 +1349,7 @@ class VREventHandler:
             self.events["back_position"] = False
         
         # Detect trigger key events
-        trigger = metadata.get('trigger', 0) > 0.5
+        trigger = _safe_trigger(metadata) > 0.5
         
         # Update status
         self.prev_states.update({
@@ -1293,8 +1363,15 @@ class VREventHandler:
 
     def _process_right_controller(self, metadata):
         """Process right-hand controller input for episode control (B button = finish early)."""
-        buttons = metadata.get('buttons', {}) or {}
-        button_b = bool(buttons.get('b', False))  # Right B button
+        buttons = _safe_buttons(metadata)
+        prev_button_b = bool(self.prev_states.get('right_button_b', False))
+
+        # Some packets can omit button fields or send an empty dict {}.
+        # Treat missing 'b' as "unchanged" to avoid false release->press edges.
+        if "b" in buttons:
+            button_b = bool(buttons.get('b', False))  # Right B button
+        else:
+            button_b = prev_button_b
 
         prev_right_snapshot = self.prev_states.get('right_buttons_snapshot', {})
         if buttons != prev_right_snapshot:
@@ -1302,11 +1379,20 @@ class VREventHandler:
 
         # Requested mapping:
         #   - RIGHT B button -> finish episode early (save and continue to next episode)
-        if button_b and not self.prev_states.get('right_button_b', False):
+        # Debounce: ignore repeated edges within a short window to prevent episode spillover.
+        now = time.monotonic()
+        last_ts = float(self.prev_states.get("right_b_last_press_ts", 0.0) or 0.0)
+        cooldown_s = 0.5
+
+        if button_b and (not prev_button_b) and (now - last_ts) > cooldown_s:
             logger.info("🎮 VR RIGHT B button pressed -> Finish episode early")
             self.events["exit_early"] = True
+            self.prev_states["right_b_last_press_ts"] = now
 
-        self.prev_states['right_button_b'] = button_b
+        # Only overwrite the stored state when the packet explicitly contained 'b',
+        # otherwise keep previous to avoid flapping on {} packets.
+        if "b" in buttons:
+            self.prev_states['right_button_b'] = button_b
         self.prev_states['right_buttons_snapshot'] = buttons
     
     def reset_events(self):
@@ -1331,12 +1417,15 @@ class VREventHandler:
         ║  └─ Move controller: Control arm position & wrist rotation   ║
         ╠══════════════════════════════════════════════════════════════╣
         ║  BASE CONTROL (Thumbsticks - works anytime):                 ║
-        ║  ├─ RIGHT thumbstick ↑↓: Forward / Backward                  ║
-        ║  ├─ RIGHT thumbstick ←→: Left / Right lateral                ║
+        ║  ├─ RIGHT thumbstick ↑↓: Forward / Backward                   ║
+        ║  ├─ RIGHT thumbstick ←→: Left / Right lateral                 ║
         ║  └─ LEFT thumbstick ←→: Rotate left / Rotate right           ║
         ╠══════════════════════════════════════════════════════════════╣
-        ║  EPISODE CONTROL (Buttons only):                              ║
-        ║  ├─ LEFT X/Y button: Restart (re-record) current episode      ║
+        ║  LIFT AXIS (if enabled on robot):                            ║
+        ║  └─ LEFT thumbstick ↑↓: Lift up / Lift down                 ║
+        ╠══════════════════════════════════════════════════════════════╣
+        ║  EPISODE CONTROL (Buttons only):                             ║
+        ║  ├─ LEFT X/Y button: Restart (re-record) current episode     ║
         ║  ├─ RIGHT B button: Finish episode early (save & next)        ║
         ║  ├─ LEFT Menu button: Stop recording                          ║
         ║  └─ LEFT Thumbstick click: Reset robot                        ║

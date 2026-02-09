@@ -35,6 +35,7 @@ from lerobot.motors.feetech import (
 from ..robot import Robot
 from ..utils import ensure_safe_goal_position
 from .config_xlerobot import XLerobotConfig
+from .lift_axis import LiftAxis
 
 logger = logging.getLogger(__name__)
 
@@ -109,22 +110,34 @@ class XLerobot(Robot):
             }
         else:
             calibration2 = self.calibration
+
+        # Build bus2 motors: right arm (1-6) + head (7-8) + optional lift (9) when enabled on bus2.
+        # Lift motor must be in the bus at construction so the bus's _id_to_model_dict includes it.
+        bus2_motors = {
+            "right_arm_shoulder_pan": Motor(1, "sts3215", norm_mode_body),
+            "right_arm_shoulder_lift": Motor(2, "sts3215", norm_mode_body),
+            "right_arm_elbow_flex": Motor(3, "sts3215", norm_mode_body),
+            "right_arm_wrist_flex": Motor(4, "sts3215", norm_mode_body),
+            "right_arm_wrist_roll": Motor(5, "sts3215", norm_mode_body),
+            "right_arm_gripper": Motor(6, "sts3215", MotorNormMode.RANGE_0_100),
+            "head_pan": Motor(7, "sts3215", norm_mode_body),
+            "head_tilt": Motor(8, "sts3215", norm_mode_body),
+        }
+        if self.config.lift_axis.enabled and self.config.lift_axis.bus == "bus2":
+            bus2_motors[self.config.lift_axis.name] = Motor(
+                self.config.lift_axis.motor_id,
+                self.config.lift_axis.motor_model,
+                MotorNormMode.DEGREES,
+            )
         self.bus2 = FeetechMotorsBus(
             port=self.config.port2,
-            motors={
-                # Right arm motors (6 motors, position control)
-                "right_arm_shoulder_pan": Motor(1, "sts3215", norm_mode_body),
-                "right_arm_shoulder_lift": Motor(2, "sts3215", norm_mode_body),
-                "right_arm_elbow_flex": Motor(3, "sts3215", norm_mode_body),
-                "right_arm_wrist_flex": Motor(4, "sts3215", norm_mode_body),
-                "right_arm_wrist_roll": Motor(5, "sts3215", norm_mode_body),
-                "right_arm_gripper": Motor(6, "sts3215", MotorNormMode.RANGE_0_100),
-                # Head motors (2 motors, position control)
-                "head_pan": Motor(7, "sts3215", norm_mode_body),
-                "head_tilt": Motor(8, "sts3215", norm_mode_body),
-            },
+            motors=bus2_motors,
             calibration=calibration2,
         )
+
+        # Optional gantry / Z lift axis (already on bus if enabled; attach() is a no-op if motor present).
+        self.lift_axis = LiftAxis(self.config.lift_axis, self.bus1, self.bus2)
+        self.lift_axis.attach()
         
         self.left_arm_motors = [motor for motor in self.bus1.motors if motor.startswith("left_arm")]
         self.right_arm_motors = [motor for motor in self.bus2.motors if motor.startswith("right_arm")]
@@ -137,8 +150,7 @@ class XLerobot(Robot):
 
     @property
     def _state_ft(self) -> dict[str, type]:
-        return dict.fromkeys(
-            (
+        keys: tuple[str, ...] = (
                 "left_arm_shoulder_pan.pos",
                 "left_arm_shoulder_lift.pos",
                 "left_arm_elbow_flex.pos",
@@ -156,9 +168,14 @@ class XLerobot(Robot):
                 "x.vel",
                 "y.vel",
                 "theta.vel",
-            ),
-            float,
         )
+        if self.lift_axis.enabled:
+            keys = (
+                *keys,
+                f"{self.lift_axis.cfg.name}.height_mm",
+                f"{self.lift_axis.cfg.name}.vel",
+            )
+        return dict.fromkeys(keys, float)
 
     @property
     def _cameras_ft(self) -> dict[str, tuple]:
@@ -363,6 +380,24 @@ class XLerobot(Robot):
                     range_max=range_maxes_base[name],
                 )
         
+        # Calibrate lift axis (if enabled) - home to set zero position
+        if self.lift_axis.enabled:
+            print("\n" + "="*60)
+            print("LIFT AXIS CALIBRATION")
+            print("="*60)
+            print(f"The lift axis will home by driving down until it stalls.")
+            print(f"This sets the current position as 0mm.")
+            user_input = input("Press ENTER to start lift axis homing, or 's' to skip: ")
+            if user_input.strip().lower() != 's':
+                try:
+                    self.lift_axis.home(use_current=True)
+                    print(f"✅ Lift axis homed successfully (zero position set)")
+                except Exception as e:
+                    logger.warning(f"⚠️  Lift axis homing failed: {e}")
+                    print(f"⚠️  Lift axis homing failed - you may need to home it manually later")
+            else:
+                print("⏭️  Lift axis homing skipped")
+        
         # Merge calibrations: bus1 = left arm + base, bus2 = right arm + head
         calibration_bus1 = {**calibration_left, **calibration_base}
         calibration_bus2 = {**calibration_right, **calibration_head}
@@ -416,6 +451,10 @@ class XLerobot(Robot):
         # Configure base motors (bus1) - velocity mode
         for name in self.base_motors:
             self.bus1.write("Operating_Mode", name, OperatingMode.VELOCITY.value)
+
+        # Configure gantry / lift axis (velocity mode + wrap tracking)
+        if self.lift_axis.enabled:
+            self.lift_axis.configure()
         
         # Enable torque on both buses
         self.bus1.enable_torque()
@@ -671,6 +710,14 @@ class XLerobot(Robot):
         right_arm_state = {f"{k}.pos": v for k, v in right_arm_pos.items()}
         head_state = {f"{k}.pos": v for k, v in head_pos.items()}
         obs_dict = {**left_arm_state, **right_arm_state, **head_state, **base_vel}
+
+        # Add gantry/lift observation (height in mm + velocity feedback)
+        if self.lift_axis.enabled:
+            try:
+                self.lift_axis.contribute_observation(obs_dict)
+            except Exception as e:
+                logger.debug(f"⚠️  Lift axis observation failed: {e}")
+
         proc_dt_ms = (time.perf_counter() - proc_start) * 1e3
         logger.debug(f"Processing: {proc_dt_ms:.1f}ms")
 
@@ -748,7 +795,8 @@ class XLerobot(Robot):
         left_arm_pos = {k: v for k, v in action.items() if k.startswith("left_arm_") and k.endswith(".pos")}
         right_arm_pos = {k: v for k, v in action.items() if k.startswith("right_arm_") and k.endswith(".pos")}
         head_pos = {k: v for k, v in action.items() if k.startswith("head_") and k.endswith(".pos")}
-        base_goal_vel = {k: v for k, v in action.items() if k.endswith(".vel")}
+        # Base velocity commands are ONLY x/y/theta to avoid accidentally treating other ".vel" keys as base.
+        base_goal_vel = {k: action.get(k, 0.0) for k in ("x.vel", "y.vel", "theta.vel") if k in action}
         base_wheel_goal_vel = self._body_to_wheel_raw(
             base_goal_vel.get("x.vel", 0.0),
             base_goal_vel.get("y.vel", 0.0),
@@ -792,11 +840,25 @@ class XLerobot(Robot):
             self.bus1.sync_write("Goal_Velocity", bus1_vel_raw)
         if bus2_pos_raw:
             self.bus2.sync_write("Goal_Position", bus2_pos_raw)
+
+        # Apply gantry / lift action after bus writes (keeps base logic unchanged).
+        if self.lift_axis.enabled:
+            try:
+                self.lift_axis.apply_action(action)
+            except Exception as e:
+                logger.debug(f"⚠️  Lift axis action failed: {e}")
+
+        lift_keys: dict[str, Any] = {}
+        if self.lift_axis.enabled:
+            prefix = f"{self.lift_axis.cfg.name}."
+            lift_keys = {k: v for k, v in action.items() if isinstance(k, str) and k.startswith(prefix)}
+
         return {
             **left_arm_pos,
             **right_arm_pos,
             **head_pos,
             **base_goal_vel,
+            **lift_keys,
         }
 
     def stop_base(self):
@@ -816,6 +878,13 @@ class XLerobot(Robot):
         # Best-effort base stop; ignore errors on teardown
         try:
             self.stop_base()
+        except Exception:
+            pass
+
+        # Best-effort lift stop; ignore errors on teardown
+        try:
+            if self.lift_axis.enabled:
+                self.lift_axis.stop()
         except Exception:
             pass
         
