@@ -84,7 +84,7 @@ lerobot-teleoperate \
 # =============================================================================
 
 # OPTION 1: Direct connection (recommended - best performance)
-rerun --serve-web --web-viewer-port 9090 --connect "rerun+http://192.168.0.104:9876/proxy"
+rerun --serve-web --web-viewer-port 9090 --connect "rerun+http://192.168.0.203:9876/proxy"
 
 # OPTION 2: Via SSH tunnel
 # Terminal 1:
@@ -128,6 +128,18 @@ lerobot-record \
     --display_data=true \
     --dataset.push_to_hub=true
     #--resume=true 
+
+lerobot-record \
+    --robot.type=xlerobot \
+    --teleop.type=xlerobot_vr \
+    --dataset.repo_id=Odog16/ob15_3.1.0 \
+    --dataset.single_task="place clothes in bin" \
+    --dataset.num_episodes=5 \
+    --dataset.fps=30 \
+    --display_data=true \
+    --dataset.push_to_hub=true
+    #--resume=true 
+
 
 # RECORDING LOCAL ONLY (push manually later):
 lerobot-record \

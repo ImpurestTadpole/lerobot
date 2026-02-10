@@ -65,7 +65,7 @@ def xlerobot_cameras_config() -> dict[str, CameraConfig]:
         
         # camera2: Wrist view (was "left_wrist")
         "left_wrist": OpenCVCameraConfig(
-            index_or_path="/dev/video2",  # Innomaker camera 2 (swapped)
+            index_or_path="/dev/video6",  # Innomaker camera 2 (swapped)
             fps=30,
             width=640,
             height=480,
@@ -76,7 +76,7 @@ def xlerobot_cameras_config() -> dict[str, CameraConfig]:
         
         # camera3: Additional view (was "right_wrist")
         "right_wrist": OpenCVCameraConfig(
-            index_or_path="/dev/video0",  # Innomaker camera 1 (swapped)
+            index_or_path="/dev/video8",  # Innomaker camera 1 (swapped)
             fps=30,
             width=640,
             height=480,

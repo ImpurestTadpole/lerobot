@@ -37,22 +37,27 @@ class LiftAxisConfig:
     motor_id: int = 9
     motor_model: str = "sts3215"
 
-    # Mechanical conversion: 1 rev = 360° = 4096 ticks
-    lead_mm_per_rev: float = 84.0
-    output_gear_ratio: float = 1.0
+    # Distance measurement: servo ticks (0..4095/rev) -> degrees -> mm.
+    # Formula: height_mm = (extended_deg - z0_deg) * mm_per_deg, where
+    #   mm_per_deg = (lead_mm_per_rev * output_gear_ratio) / 360.
+    # Adjust lead_mm_per_rev to match your lead screw (mm of travel per motor revolution).
+    #lead_mm_per_rev: float = 84.0  # mm of linear travel per motor rev (e.g. 8, 12, 20 for common leads)
+    lead_mm_per_rev: float = 100.0 
+    output_gear_ratio: float = 1.0  # If motor has reduction to screw: screw_rev/motor_rev (e.g. 0.5 for 2:1)
 
-    # Height convention: 0 = bottom (homed), 600 = top (mm from home).
+    # Height convention. Set home_at_top=True for: 0 = top (home), soft_max_mm = bottom.
+    home_at_top: bool = False  # True: 0=top, bottom=e.g. 500mm; False: 0=bottom, top=600mm
     soft_min_mm: float = 0.0
-    soft_max_mm: float = 600.0
+    soft_max_mm: float = 525.0  # When home_at_top, set to 500 so bottom = 500mm
 
-    # Homing (drive down to hard stop, detect stall, backoff)
+    # Homing: drive toward home (down if not home_at_top, up if home_at_top) until stall.
     home_down_speed: int = 1300
     home_stall_current_ma: int = 150
     home_backoff_deg: float = 5.0
 
-    # Closed-loop on height -> velocity
+    # Closed-loop on height -> velocity. Increase v_max and/or kp_vel for faster lift.
     kp_vel: float = 300.0
-    v_max: int = 1300
+    v_max: int = 2000  # Max raw velocity to servo; raise (e.g. 1800) for higher speed
     on_target_mm: float = 1.0
 
     # Direction conventions
@@ -113,6 +118,9 @@ class LiftAxis:
         if not self.enabled:
             return 0.0
         self._update_extended_ticks()
+        if self.cfg.home_at_top:
+            # 0 = top (home), positive = down toward bottom
+            return (self._z0_deg - self._extended_deg()) * self._mm_per_deg
         return (self._extended_deg() - self._z0_deg) * self._mm_per_deg
 
     def contribute_observation(self, obs: Dict[str, float]) -> None:
@@ -151,7 +159,9 @@ class LiftAxis:
             if (cur_mm >= self.cfg.soft_max_mm and v_cmd > 0) or (cur_mm <= self.cfg.soft_min_mm and v_cmd < 0):
                 v_cmd = 0.0
 
-            self._bus.write("Goal_Velocity", self.cfg.name, int(self.cfg.dir_sign * v_cmd))
+            # When home_at_top, positive height = down, so motor direction is opposite
+            sign = -1 if self.cfg.home_at_top else 1
+            self._bus.write("Goal_Velocity", self.cfg.name, int(sign * self.cfg.dir_sign * v_cmd))
 
         if key_v in action:
             v = int(action[key_v])
@@ -162,19 +172,23 @@ class LiftAxis:
                     v = 0
             except Exception:
                 pass
-            self._bus.write("Goal_Velocity", self.cfg.name, v * self.cfg.dir_sign)
+            sign = -1 if self.cfg.home_at_top else 1
+            self._bus.write("Goal_Velocity", self.cfg.name, v * sign * self.cfg.dir_sign)
 
     def home(self, use_current: bool = True) -> None:
         """
-        Homes the axis by driving "down" until motion stalls (optionally using current),
-        then sets the current position as 0mm.
+        Homes the axis by driving toward the home position until motion stalls, then sets 0mm there.
+        - If home_at_top=False: drive down to bottom, 0mm = bottom.
+        - If home_at_top=True: drive up to top, 0mm = top, bottom = soft_max_mm (e.g. 500mm).
         """
         if not self.enabled:
             return
         self.configure()
         name = self.cfg.name
 
-        self._bus.write("Goal_Velocity", name, int(self.cfg.home_down_speed))
+        # Drive toward home: down (positive) or up (negative) depending on convention
+        home_vel = self.cfg.home_down_speed if not self.cfg.home_at_top else -self.cfg.home_down_speed
+        self._bus.write("Goal_Velocity", name, int(home_vel))
         stuck = 0
         last_tick = float(self._bus.read("Present_Position", name, normalize=False))
 
