@@ -43,25 +43,25 @@ def xlerobot_cameras_config() -> dict[str, CameraConfig]:
         # MUST be opened FIRST to avoid resource conflicts
         # NOTE: Replace "YOUR_D435i_SERIAL_NUMBER" with your actual D435i serial number
         # You can find it by running: rs-enumerate-devices
-        "head": RealSenseCameraConfig(
-            serial_number_or_name="342222071125",  # Replace with your D435i serial number
-            fps=30,
-            width=640,
-            height=480,
-            color_mode=ColorMode.RGB,  # Request BGR output
-            rotation=Cv2Rotation.NO_ROTATION,
-            use_depth=True,
-        ),
-        
-        # Original RGB camera (commented out, can be re-enabled if needed)
-        # "head": OpenCVCameraConfig(
-        #     index_or_path="/dev/video0", 
-        #     fps=30,
-        #     width=640,
-        #     height=480,
-        #     fourcc="MJPG",
-        #     rotation=Cv2Rotation.NO_ROTATION,
-        # ),
+        #"head": RealSenseCameraConfig(
+        #    serial_number_or_name="342222071125",  # Replace with your D435i serial number
+        #    fps=30,
+        #    width=640,
+        #    height=480,
+        #    color_mode=ColorMode.RGB,  # Request BGR output
+        #    rotation=Cv2Rotation.NO_ROTATION,
+        #    use_depth=False,
+        #),
+    
+         #Original RGB camera (commented out, can be re-enabled if needed)
+        "head": OpenCVCameraConfig(
+             index_or_path="/dev/video4", 
+             fps=30,
+             width=640,
+             height=480,
+             fourcc="MJPG",
+             rotation=Cv2Rotation.NO_ROTATION,
+         ),
         
         # camera2: Wrist view (was "left_wrist")
         "left_wrist": OpenCVCameraConfig(
@@ -92,8 +92,8 @@ def xlerobot_cameras_config() -> dict[str, CameraConfig]:
 class XLerobotConfig(RobotConfig):
     
     # Port 0 = left arm + base. Port 1 = right arm + head + (optional) lift axis.
-    port1: str = "/dev/ttyACM0"  # left arm motors 1-6 + base motors 7-9
-    port2: str = "/dev/ttyACM1"  # right arm motors 1-6 + head motors 7-8 + optional lift (motor 9)
+    port1: str = "/dev/ttyACM1"  # left arm motors 1-6 + base motors 7-9
+    port2: str = "/dev/ttyACM0"  # right arm motors 1-6 + head motors 7-8 + optional lift (motor 9)
     camera_start_order: tuple[str, ...] | None = ("head", "left_wrist", "right_wrist")
     camera_start_delay_s: float = 2.0  # Increased delay to allow cameras to initialize properly (especially right_wrist)
     disable_torque_on_disconnect: bool = True

@@ -132,13 +132,13 @@ lerobot-record \
 lerobot-record \
     --robot.type=xlerobot \
     --teleop.type=xlerobot_vr \
-    --dataset.repo_id=Odog16/place coffee cup in machine  \
-    --dataset.single_task="place coffee cup in machine" \
-    --dataset.num_episodes=5 \
+    --dataset.repo_id=Odog16/making_coffee  \
+    --dataset.single_task="take coffee from blue place it in the machine, then place it on the yellow." \
+    --dataset.num_episodes=15 \
     --dataset.fps=30 \
     --display_data=true \
-    --dataset.push_to_hub=true
-    #--resume=true 
+    --dataset.push_to_hub=true \
+    --resume=true 
 
 
 # RECORDING LOCAL ONLY (push manually later):
@@ -153,7 +153,7 @@ lerobot-record \
 
 # Manually push to hub after recording:
 python -c "from lerobot.datasets.lerobot_dataset import LeRobotDataset; \
-    dataset = LeRobotDataset('Odog16/test_transfer_block'); \
+    dataset = LeRobotDataset('Odog16/making_coffee'); \
     dataset.push_to_hub()"
 
 # Local data location: ~/.cache/huggingface/lerobot/Odog16/ob15_test_1/
@@ -161,7 +161,7 @@ python -c "from lerobot.datasets.lerobot_dataset import LeRobotDataset; \
 # Videos: videos/chunk-000/observation.images.*/episode_*.mp4
 
 # Delete local dataset (if you want to start fresh):
-rm -rf ~/.cache/huggingface/lerobot/Odog16/Odog16/test_transfer_block
+rm -rf ~/.cache/huggingface/lerobot/Odog16/making_coffee
 
 # =============================================================================
 # PERFORMANCE TIPS

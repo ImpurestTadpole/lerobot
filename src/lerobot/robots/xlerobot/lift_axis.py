@@ -81,6 +81,14 @@ class LiftAxis:
         self._extended_ticks: float = 0.0
         self._z0_deg: float = 0.0
         self._configured: bool = False
+        
+        # Cache current state to avoid redundant serial reads in apply_action
+        self._cached_height_mm: float = 0.0
+        self._cached_velocity: float = 0.0
+        
+        # Velocity filtering to reduce sensor noise and improve training data quality
+        self._velocity_alpha: float = 0.3  # EMA smoothing factor (0=no filter, 1=no smoothing)
+        self._filtered_velocity: float = 0.0
 
     def attach(self) -> None:
         """Registers the motor name on the selected bus (safe pre-connect)."""
@@ -123,14 +131,56 @@ class LiftAxis:
             return (self._z0_deg - self._extended_deg()) * self._mm_per_deg
         return (self._extended_deg() - self._z0_deg) * self._mm_per_deg
 
-    def contribute_observation(self, obs: Dict[str, float]) -> None:
+    def contribute_observation(self, obs: Dict[str, float], pre_read_pos: Optional[float] = None, pre_read_vel: Optional[float] = None) -> None:
+        """Add lift axis height (mm) and velocity to observation dict.
+        
+        Args:
+            obs: Observation dictionary to update
+            pre_read_pos: Optional pre-read Present_Position value (avoids redundant serial read)
+            pre_read_vel: Optional pre-read Present_Velocity value (avoids redundant serial read)
+        """
         if not self.enabled:
             return
-        obs[f"{self.cfg.name}.height_mm"] = float(self.get_height_mm())
-        try:
-            obs[f"{self.cfg.name}.vel"] = float(self._bus.read("Present_Velocity", self.cfg.name, normalize=False))
-        except Exception:
-            pass
+        
+        # Update extended ticks tracking and get height
+        if pre_read_pos is not None:
+            # Use pre-read position data (already fetched in parallel)
+            cur = float(pre_read_pos)
+            delta = cur - self._last_tick
+            if delta < -2048:
+                self._extended_ticks += self._raw_per_turn
+            elif delta > 2048:
+                self._extended_ticks -= self._raw_per_turn
+            self._last_tick = cur
+            z_deg = (self._extended_ticks + cur) * self._deg_per_tick - self._z0_deg
+            self._cached_height_mm = float(z_deg * self._mm_per_deg)
+        else:
+            # Fallback to synchronous read if no pre-read data
+            self._cached_height_mm = float(self.get_height_mm())
+        
+        obs[f"{self.cfg.name}.height_mm"] = self._cached_height_mm
+        
+        # Get velocity
+        if pre_read_vel is not None:
+            # Use pre-read velocity data
+            raw_velocity = float(pre_read_vel)
+        else:
+            # Fallback to synchronous read
+            try:
+                raw_velocity = float(self._bus.read("Present_Velocity", self.cfg.name, normalize=False))
+            except Exception:
+                raw_velocity = 0.0
+        
+        # Apply exponential moving average filter to reduce noise for training
+        self._filtered_velocity = (self._velocity_alpha * raw_velocity + 
+                                   (1 - self._velocity_alpha) * self._filtered_velocity)
+        
+        # Normalize velocity to [-100, 100] range to match RANGE_M100_100 motor norm mode
+        # Raw motor units are ±v_max (typically ±2000), normalize to ±100 like other velocity motors
+        normalized_velocity = (self._filtered_velocity / self.cfg.v_max) * 100.0
+        self._cached_velocity = normalized_velocity
+        
+        obs[f"{self.cfg.name}.vel"] = self._cached_velocity
 
     def apply_action(self, action: Dict[str, float]) -> None:
         """
@@ -147,7 +197,7 @@ class LiftAxis:
 
         if key_h in action:
             target_mm = float(action[key_h])
-            cur_mm = self.get_height_mm()
+            cur_mm = self._cached_height_mm  # Use cached value from observation
             err = target_mm - cur_mm
             if abs(err) <= self.cfg.on_target_mm:
                 v_cmd = 0.0
@@ -164,10 +214,13 @@ class LiftAxis:
             self._bus.write("Goal_Velocity", self.cfg.name, int(sign * self.cfg.dir_sign * v_cmd))
 
         if key_v in action:
-            v = int(action[key_v])
+            # Denormalize from [-100, 100] to raw motor units (RANGE_M100_100 normalization)
+            # (send_action normalizes all inputs, both from VR and from policy)
+            normalized_v = float(action[key_v])
+            v = int((normalized_v / 100.0) * self.cfg.v_max)
             v = max(-self.cfg.v_max, min(self.cfg.v_max, v))
             try:
-                cur_mm = self.get_height_mm()
+                cur_mm = self._cached_height_mm  # Use cached value from observation
                 if (cur_mm >= self.cfg.soft_max_mm and v > 0) or (cur_mm <= self.cfg.soft_min_mm and v < 0):
                     v = 0
             except Exception:

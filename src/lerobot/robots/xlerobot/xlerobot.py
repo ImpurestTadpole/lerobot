@@ -124,10 +124,12 @@ class XLerobot(Robot):
             "head_tilt": Motor(8, "sts3215", norm_mode_body),
         }
         if self.config.lift_axis.enabled and self.config.lift_axis.bus == "bus2":
+            # Use RANGE_M100_100 for velocity control (lift axis uses velocity mode)
+            # This normalizes velocity to [-100, 100] range automatically at the bus level
             bus2_motors[self.config.lift_axis.name] = Motor(
                 self.config.lift_axis.motor_id,
                 self.config.lift_axis.motor_model,
-                MotorNormMode.DEGREES,
+                MotorNormMode.RANGE_M100_100,  # Changed from DEGREES for proper velocity normalization
             )
         self.bus2 = FeetechMotorsBus(
             port=self.config.port2,
@@ -676,24 +678,50 @@ class XLerobot(Robot):
             t0 = time.perf_counter()
             left_arm_pos = self.bus1.sync_read("Present_Position", self.left_arm_motors)
             base_wheel_vel = self.bus1.sync_read("Present_Velocity", self.base_motors)
-            logger.debug(f"Bus1 (left arm + base) read: {(time.perf_counter()-t0)*1e3:.1f}ms")
-            return left_arm_pos, base_wheel_vel
+            
+            # Read lift axis if enabled and on bus1
+            lift_pos = None
+            lift_vel = None
+            if self.lift_axis.enabled and self.lift_axis.cfg.bus == "bus1":
+                try:
+                    lift_pos = self.bus1.read("Present_Position", self.lift_axis.cfg.name, normalize=False)
+                    lift_vel = self.bus1.read("Present_Velocity", self.lift_axis.cfg.name, normalize=False)
+                except Exception as e:
+                    logger.debug(f"⚠️  Failed to read lift axis on bus1: {e}")
+            
+            logger.debug(f"Bus1 (left arm + base + lift) read: {(time.perf_counter()-t0)*1e3:.1f}ms")
+            return left_arm_pos, base_wheel_vel, lift_pos, lift_vel
         
         def read_bus2():
             """Read right arm positions and head positions from bus2"""
             t0 = time.perf_counter()
             right_arm_pos = self.bus2.sync_read("Present_Position", self.right_arm_motors)
             head_pos = self.bus2.sync_read("Present_Position", self.head_motors)
-            logger.debug(f"Bus2 (right arm + head) read: {(time.perf_counter()-t0)*1e3:.1f}ms")
-            return right_arm_pos, head_pos
+            
+            # Read lift axis if enabled and on bus2
+            lift_pos = None
+            lift_vel = None
+            if self.lift_axis.enabled and self.lift_axis.cfg.bus == "bus2":
+                try:
+                    lift_pos = self.bus2.read("Present_Position", self.lift_axis.cfg.name, normalize=False)
+                    lift_vel = self.bus2.read("Present_Velocity", self.lift_axis.cfg.name, normalize=False)
+                except Exception as e:
+                    logger.debug(f"⚠️  Failed to read lift axis on bus2: {e}")
+            
+            logger.debug(f"Bus2 (right arm + head + lift) read: {(time.perf_counter()-t0)*1e3:.1f}ms")
+            return right_arm_pos, head_pos, lift_pos, lift_vel
         
         # Submit all reads to persistent thread pool (2 buses = 2 threads max)
         future_bus1 = self._executor.submit(read_bus1)
         future_bus2 = self._executor.submit(read_bus2)
         
         # Wait for all reads to complete
-        left_arm_pos, base_wheel_vel = future_bus1.result()
-        right_arm_pos, head_pos = future_bus2.result()
+        left_arm_pos, base_wheel_vel, lift_pos_bus1, lift_vel_bus1 = future_bus1.result()
+        right_arm_pos, head_pos, lift_pos_bus2, lift_vel_bus2 = future_bus2.result()
+        
+        # Determine which bus had the lift axis data
+        lift_pos = lift_pos_bus1 if lift_pos_bus1 is not None else lift_pos_bus2
+        lift_vel = lift_vel_bus1 if lift_vel_bus1 is not None else lift_vel_bus2
         
         bus_dt_ms = (time.perf_counter() - bus_start) * 1e3
         logger.debug(f"🔧 Parallel bus reads: {bus_dt_ms:.1f}ms")
@@ -714,7 +742,7 @@ class XLerobot(Robot):
         # Add gantry/lift observation (height in mm + velocity feedback)
         if self.lift_axis.enabled:
             try:
-                self.lift_axis.contribute_observation(obs_dict)
+                self.lift_axis.contribute_observation(obs_dict, pre_read_pos=lift_pos, pre_read_vel=lift_vel)
             except Exception as e:
                 logger.debug(f"⚠️  Lift axis observation failed: {e}")
 
@@ -842,16 +870,26 @@ class XLerobot(Robot):
             self.bus2.sync_write("Goal_Position", bus2_pos_raw)
 
         # Apply gantry / lift action after bus writes (keeps base logic unchanged).
+        normalized_lift_action = {}
         if self.lift_axis.enabled:
             try:
-                self.lift_axis.apply_action(action)
+                # Normalize gantry.vel before passing to lift_axis (it expects normalized values)
+                lift_action = {k: v for k, v in action.items() if k.startswith(f"{self.lift_axis.cfg.name}.")}
+                vel_key = f"{self.lift_axis.cfg.name}.vel"
+                if vel_key in lift_action:
+                    # If value is outside [-150, 150], assume it's raw units from VR, normalize to [-100, 100]
+                    # (Policy outputs [-100, 100]; VR outputs ±1400 raw units)
+                    if abs(lift_action[vel_key]) > 150:
+                        lift_action[vel_key] = (lift_action[vel_key] / self.lift_axis.cfg.v_max) * 100.0
+                normalized_lift_action = lift_action  # Store normalized version for logging
+                self.lift_axis.apply_action(lift_action)
             except Exception as e:
                 logger.debug(f"⚠️  Lift axis action failed: {e}")
 
         lift_keys: dict[str, Any] = {}
-        if self.lift_axis.enabled:
-            prefix = f"{self.lift_axis.cfg.name}."
-            lift_keys = {k: v for k, v in action.items() if isinstance(k, str) and k.startswith(prefix)}
+        if self.lift_axis.enabled and normalized_lift_action:
+            # Use the already-normalized lift action for logging (don't double-normalize!)
+            lift_keys = normalized_lift_action
 
         return {
             **left_arm_pos,
