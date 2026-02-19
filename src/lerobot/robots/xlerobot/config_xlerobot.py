@@ -53,12 +53,25 @@ def xlerobot_cameras_config() -> dict[str, CameraConfig]:
         #    use_depth=False,
         #),
     
-         #Original RGB camera (commented out, can be re-enabled if needed)
+        # IMAGE SIZE RECOMMENDATION:
+        # Current 640x480 is 6x more pixels than needed for most manipulation policies.
+        # SmolVLA expects 224x224; ACT/Diffusion Policy typically use 224x224 or 256x256.
+        # Recording at 640x480 wastes ~350 GB of storage for a 130k-frame dataset and slows
+        # every training epoch significantly on the Jetson.
+        #
+        # Recommended sizes:
+        #   head (overview)  : 320x240 — scene context, fine detail not needed
+        #   wrist cameras    : 224x224 — fine manipulation, matches policy input directly
+        #
+        # To apply: change width/height below and re-collect data (or add a resize step in
+        # the training pipeline if you want to keep existing datasets at 640x480).
+        #
+        # Current (640x480) kept as-is; change the values below when re-collecting data.
         "head": OpenCVCameraConfig(
-             index_or_path="/dev/video4", 
+             index_or_path="/dev/video4",
              fps=30,
-             width=640,
-             height=480,
+             width=640,   # Recommended: 320
+             height=480,  # Recommended: 240
              fourcc="MJPG",
              rotation=Cv2Rotation.NO_ROTATION,
          ),
@@ -67,8 +80,8 @@ def xlerobot_cameras_config() -> dict[str, CameraConfig]:
         "left_wrist": OpenCVCameraConfig(
             index_or_path="/dev/video6",  # Innomaker camera 2 (swapped)
             fps=30,
-            width=640,
-            height=480,
+            width=640,   # Recommended: 224
+            height=480,  # Recommended: 224
             fourcc="MJPG",
             rotation=Cv2Rotation.NO_ROTATION,
             warmup_s=3,  # Increased warmup time for Innomaker cameras
@@ -78,8 +91,8 @@ def xlerobot_cameras_config() -> dict[str, CameraConfig]:
         "right_wrist": OpenCVCameraConfig(
             index_or_path="/dev/video8",  # Innomaker camera 1 (swapped)
             fps=30,
-            width=640,
-            height=480,
+            width=640,   # Recommended: 224
+            height=480,  # Recommended: 224
             fourcc="MJPG",
             rotation=Cv2Rotation.NO_ROTATION,
             warmup_s=5,  # Increased warmup time for right wrist camera (needs more time after other cameras)
@@ -93,7 +106,7 @@ class XLerobotConfig(RobotConfig):
     
     # Port 0 = left arm + base. Port 1 = right arm + head + (optional) lift axis.
     port1: str = "/dev/ttyACM1"  # left arm motors 1-6 + base motors 7-9
-    port2: str = "/dev/ttyACM0"  # right arm motors 1-6 + head motors 7-8 + optional lift (motor 9)
+    port2: str = "/dev/ttyACM0"  # right arm motors 1-6 + head motors 7-8 + lift (motor 9)
     camera_start_order: tuple[str, ...] | None = ("head", "left_wrist", "right_wrist")
     camera_start_delay_s: float = 2.0  # Increased delay to allow cameras to initialize properly (especially right_wrist)
     disable_torque_on_disconnect: bool = True

@@ -172,10 +172,12 @@ class XLerobot(Robot):
                 "theta.vel",
         )
         if self.lift_axis.enabled:
+            # Only expose height_mm — not raw velocity — matching every other joint's .pos convention.
+            # The P-controller in lift_axis.apply_action() converts height_mm targets to motor
+            # velocity internally, so the policy never needs to reason in velocity units.
             keys = (
                 *keys,
                 f"{self.lift_axis.cfg.name}.height_mm",
-                f"{self.lift_axis.cfg.name}.vel",
             )
         return dict.fromkeys(keys, float)
 
@@ -873,23 +875,28 @@ class XLerobot(Robot):
         normalized_lift_action = {}
         if self.lift_axis.enabled:
             try:
-                # Normalize gantry.vel before passing to lift_axis (it expects normalized values)
                 lift_action = {k: v for k, v in action.items() if k.startswith(f"{self.lift_axis.cfg.name}.")}
                 vel_key = f"{self.lift_axis.cfg.name}.vel"
                 if vel_key in lift_action:
-                    # If value is outside [-150, 150], assume it's raw units from VR, normalize to [-100, 100]
-                    # (Policy outputs [-100, 100]; VR outputs ±1400 raw units)
-                    if abs(lift_action[vel_key]) > 150:
-                        lift_action[vel_key] = (lift_action[vel_key] / self.lift_axis.cfg.v_max) * 100.0
-                normalized_lift_action = lift_action  # Store normalized version for logging
+                    # Normalize for apply_action: lift_axis expects [-100, 100]
+                    raw_v = lift_action[vel_key]
+                    if abs(raw_v) > 100.0:
+                        lift_action[vel_key] = (float(raw_v) / self.lift_axis.cfg.v_max) * 100.0
+                        lift_action[vel_key] = max(-100.0, min(100.0, lift_action[vel_key]))
                 self.lift_axis.apply_action(lift_action)
+                # Normalized copy for logging/recording (single source of truth in lift_axis)
+                normalized_lift_action = self.lift_axis.action_for_logging(lift_action)
             except Exception as e:
                 logger.debug(f"⚠️  Lift axis action failed: {e}")
 
+        # Record only height_mm as the lift action — matches the position-control convention
+        # used for all arm joints (.pos) and the reference LeKiwi implementation.
+        # The VR teleop may send gantry.vel to drive the motor, but what is saved in the
+        # dataset is the resulting physical position so the policy can replay it via the
+        # P-controller in lift_axis.apply_action().
         lift_keys: dict[str, Any] = {}
-        if self.lift_axis.enabled and normalized_lift_action:
-            # Use the already-normalized lift action for logging (don't double-normalize!)
-            lift_keys = normalized_lift_action
+        if self.lift_axis.enabled:
+            lift_keys[f"{self.lift_axis.cfg.name}.height_mm"] = self.lift_axis._cached_height_mm
 
         return {
             **left_arm_pos,

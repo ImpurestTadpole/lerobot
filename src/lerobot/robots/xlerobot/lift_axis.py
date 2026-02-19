@@ -46,7 +46,7 @@ class LiftAxisConfig:
     output_gear_ratio: float = 1.0  # If motor has reduction to screw: screw_rev/motor_rev (e.g. 0.5 for 2:1)
 
     # Height convention. Set home_at_top=True for: 0 = top (home), soft_max_mm = bottom.
-    home_at_top: bool = False  # True: 0=top, bottom=e.g. 500mm; False: 0=bottom, top=600mm
+    home_at_top: bool = True  # True: 0=top, bottom=e.g. 500mm; False: 0=bottom, top=600mm
     soft_min_mm: float = 0.0
     soft_max_mm: float = 525.0  # When home_at_top, set to 500 so bottom = 500mm
 
@@ -61,7 +61,7 @@ class LiftAxisConfig:
     on_target_mm: float = 1.0
 
     # Direction conventions
-    dir_sign: int = -1  # +1 no inversion; -1 invert direction
+    dir_sign: int = 1  # +1 no inversion; -1 invert direction
 
 
 class LiftAxis:
@@ -144,16 +144,24 @@ class LiftAxis:
         
         # Update extended ticks tracking and get height
         if pre_read_pos is not None:
-            # Use pre-read position data (already fetched in parallel)
+            # Mirror _update_extended_ticks() exactly using the pre-read position value
+            # so we avoid a second serial read while still using the correct wrap-around
+            # logic and height formula from get_height_mm() / _extended_deg().
             cur = float(pre_read_pos)
             delta = cur - self._last_tick
-            if delta < -2048:
-                self._extended_ticks += self._raw_per_turn
-            elif delta > 2048:
-                self._extended_ticks -= self._raw_per_turn
+            half = self._ticks_per_rev * 0.5
+            if delta > +half:
+                delta -= self._ticks_per_rev
+            elif delta < -half:
+                delta += self._ticks_per_rev
+            self._extended_ticks += delta
             self._last_tick = cur
-            z_deg = (self._extended_ticks + cur) * self._deg_per_tick - self._z0_deg
-            self._cached_height_mm = float(z_deg * self._mm_per_deg)
+            # Compute height with the same formula as get_height_mm()
+            ext_deg = self._extended_deg()  # dir_sign * extended_ticks * deg_per_tick
+            if self.cfg.home_at_top:
+                self._cached_height_mm = float((self._z0_deg - ext_deg) * self._mm_per_deg)
+            else:
+                self._cached_height_mm = float((ext_deg - self._z0_deg) * self._mm_per_deg)
         else:
             # Fallback to synchronous read if no pre-read data
             self._cached_height_mm = float(self.get_height_mm())
@@ -181,6 +189,41 @@ class LiftAxis:
         self._cached_velocity = normalized_velocity
         
         obs[f"{self.cfg.name}.vel"] = self._cached_velocity
+
+    def normalize_velocity_for_logging(self, vel: float) -> float:
+        """
+        Normalize velocity to [-100, 100] for logging and recorded data.
+        Accepts raw motor units (e.g. ±v_max) or already-normalized values;
+        ensures output is always in a consistent range so spikes do not distort data.
+        """
+        if not self.enabled or self.cfg.v_max <= 0:
+            return 0.0
+        # If already in normalized range, clamp only
+        if abs(vel) <= 100.0:
+            return max(-100.0, min(100.0, float(vel)))
+        # Raw motor units: normalize by v_max
+        normalized = (vel / float(self.cfg.v_max)) * 100.0
+        return max(-100.0, min(100.0, normalized))
+
+    def action_for_logging(self, action: Dict[str, float]) -> Dict[str, float]:
+        """
+        Return a copy of the lift-related action with velocity normalized to [-100, 100]
+        for logging and recording. Use this when building the action dict that gets
+        stored in the dataset so velocity values are consistent and spikes are removed.
+        """
+        if not self.enabled:
+            return {}
+        prefix = f"{self.cfg.name}."
+        vel_key = f"{self.cfg.name}.vel"
+        out: Dict[str, float] = {}
+        for k, v in action.items():
+            if not k.startswith(prefix):
+                continue
+            if k == vel_key:
+                out[k] = self.normalize_velocity_for_logging(float(v))
+            else:
+                out[k] = float(v)
+        return out
 
     def apply_action(self, action: Dict[str, float]) -> None:
         """

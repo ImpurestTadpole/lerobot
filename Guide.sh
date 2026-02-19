@@ -140,6 +140,18 @@ lerobot-record \
     --dataset.push_to_hub=true \
     --resume=true 
 
+lerobot-record \
+    --robot.type=xlerobot \
+    --teleop.type=xlerobot_vr \
+    --dataset.repo_id=Odog16/test_transfer_block_2  \
+    --dataset.single_task="transfer the block" \
+    --dataset.num_episodes=15 \
+    --dataset.fps=30 \
+    --display_data=true \
+    --dataset.push_to_hub=true 
+ #   --resume=true 
+
+
 
 # RECORDING LOCAL ONLY (push manually later):
 lerobot-record \
@@ -153,7 +165,7 @@ lerobot-record \
 
 # Manually push to hub after recording:
 python -c "from lerobot.datasets.lerobot_dataset import LeRobotDataset; \
-    dataset = LeRobotDataset('Odog16/making_coffee'); \
+    dataset = LeRobotDataset('Odog16/test_transfer_block_2'); \
     dataset.push_to_hub()"
 
 # Local data location: ~/.cache/huggingface/lerobot/Odog16/ob15_test_1/
@@ -162,6 +174,15 @@ python -c "from lerobot.datasets.lerobot_dataset import LeRobotDataset; \
 
 # Delete local dataset (if you want to start fresh):
 rm -rf ~/.cache/huggingface/lerobot/Odog16/making_coffee
+
+# =============================================================================
+# REPLAY EPISODE
+# =============================================================================
+# Replay an episode from a dataset on the robot (change --dataset.episode for other episodes)
+lerobot-replay \
+    --robot.type=xlerobot \
+    --dataset.repo_id=Odog16/test_transfer_block_2 \
+    --dataset.episode=0
 
 # =============================================================================
 # PERFORMANCE TIPS
@@ -229,16 +250,20 @@ python -m lerobot.async_inference.policy_server \
 #          Set server_address to the external GPU machine's IP (same LAN as Jetson).
 # ACT example (use the _policy repo, not the dataset repo):
 python -m lerobot.async_inference.robot_client \
-    --server_address=10.249.43.224:8080 \
+    --server_address=10.249.39.211:8080 \
     --robot.type=xlerobot \
-    --task="transfer the block" \
+    --task="take coffee from blue place it in the machine, then place it on the yellow." \
     --policy_type=act \
-    --pretrained_name_or_path=Odog16/test_transfer_block_policy \
+    --pretrained_name_or_path=Odog16/act_making_coffee_policy_60k\
     --policy_device=cuda \
-    --actions_per_chunk=100 \
-    --chunk_size_threshold=0.6 \
+    --actions_per_chunk=80\
+    --chunk_size_threshold=0.25 \
     --aggregate_fn_name="weighted_average" \
     --fps=30
+
+
+
+
 
 # Diffusion example:
 python -m lerobot.async_inference.robot_client \

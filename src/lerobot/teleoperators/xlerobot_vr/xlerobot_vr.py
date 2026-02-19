@@ -200,14 +200,14 @@ class SimpleTeleopArm:
         self.gripper_smoothing_alpha = 0.3  # Smoothing factor (0.0 = no smoothing, 1.0 = no smoothing)
         # Lower alpha = smoother but slower response, higher alpha = faster but less smooth
         
-        # P control target positions, set to zero position
+        # P control target positions - initialize to current positions to avoid movement on startup
         self.target_positions = {
-            "shoulder_pan": 0.0,
-            "shoulder_lift": 0.0,
-            "elbow_flex": 0.0,
-            "wrist_flex": 0.0,
-            "wrist_roll": 0.0,
-            "gripper": 0.0,
+            "shoulder_pan": initial_obs[f"{prefix}_arm_shoulder_pan.pos"],
+            "shoulder_lift": initial_obs[f"{prefix}_arm_shoulder_lift.pos"],
+            "elbow_flex": initial_obs[f"{prefix}_arm_elbow_flex.pos"],
+            "wrist_flex": initial_obs[f"{prefix}_arm_wrist_flex.pos"],
+            "wrist_roll": initial_obs[f"{prefix}_arm_wrist_roll.pos"],
+            "gripper": initial_obs[f"{prefix}_arm_gripper.pos"],
         }
         
         # Smoothed target positions for P-control (reduces jitter at 60Hz)
@@ -656,12 +656,14 @@ def get_vr_base_action(left_goal, right_goal, robot):
     }
 
 
-def get_vr_lift_action(left_goal, robot) -> dict[str, Any]:
+def get_vr_lift_action(left_goal, robot, state: Optional[dict] = None) -> dict[str, Any]:
     """
     Get lift (gantry) velocity from left controller thumbstick Y-axis.
     - Left thumbstick UP (positive Y) -> lift up (positive velocity).
     - Left thumbstick DOWN (negative Y) -> lift down (negative velocity).
-    - Centered or invalid -> zero velocity.
+    - Only activates when |thumbstick Y| > threshold so lift does not move when stick is still.
+    - Output is normalized to [-100, 100] to avoid spikes distorting recorded data.
+    - Optional state dict enables smoothing so velocity does not spike on noisy input.
 
     Returns a dict with a single key "{lift_name}.vel" when the robot has
     lift_axis enabled, else empty dict. Caller should merge into action.
@@ -672,18 +674,44 @@ def get_vr_lift_action(left_goal, robot) -> dict[str, Any]:
     if lift is None or not getattr(lift, "enabled", False):
         return {}
     name = getattr(getattr(lift, "cfg", None), "name", "gantry")
-    v_max = int(getattr(getattr(lift, "cfg", None), "v_max", 1300))
+
+    # No VR goal -> output zero so lift does not move; reset smoothing state
+    if left_goal is None:
+        if state is not None:
+            state["smoothed_y"] = 0.0
+            state["smoothed_vel"] = 0.0
+        return {f"{name}.vel": 0.0}
+
     metadata = _safe_metadata(left_goal)
     thumb_x, thumb_y = _safe_thumbstick(metadata)
-    DEAD_ZONE = 0.15
-    if abs(thumb_y) <= DEAD_ZONE:
-        vel = 0
+
+    # Deadzone: lift does not move when thumbstick is centered or barely moved
+    LIFT_THRESHOLD = 0.5
+    SMOOTH_ALPHA = 0.55  # Thumbstick smoothing; higher = more responsive
+    VEL_SMOOTH_ALPHA = 0.6  # Velocity response; higher = faster ramp up/down
+
+    if state is None:
+        state = {}
+
+    # Light thumbstick smoothing to reduce jitter while staying responsive
+    prev_y = state.get("smoothed_y", 0.0)
+    state["smoothed_y"] = SMOOTH_ALPHA * thumb_y + (1.0 - SMOOTH_ALPHA) * prev_y
+    y = state["smoothed_y"]
+
+    if abs(y) <= LIFT_THRESHOLD:
+        # In deadzone: zero velocity immediately so lift stops when stick returns to center
+        state["smoothed_vel"] = 0.0
+        vel = 0.0
     else:
-        # Scale thumbstick Y [-1, 1] to velocity; use fraction of v_max for safety
-        scale = 0.7 * v_max
-        vel = thumb_y * scale
-        vel = max(-v_max, min(v_max, int(round(vel))))
-    return {f"{name}.vel": vel}
+        # Normalized velocity in [-100, 100] for consistent recorded data (robot expects this range)
+        target_vel = (y / max(abs(y), 1e-6)) * 100.0 * (abs(y) - LIFT_THRESHOLD) / (1.0 - LIFT_THRESHOLD)
+        target_vel = max(-100.0, min(100.0, target_vel))
+        prev_vel = state.get("smoothed_vel", 0.0)
+        state["smoothed_vel"] = VEL_SMOOTH_ALPHA * target_vel + (1.0 - VEL_SMOOTH_ALPHA) * prev_vel
+        vel = state["smoothed_vel"]
+        if abs(vel) < 2.0:
+            vel = 0.0
+    return {f"{name}.vel": float(vel)}
 
 
 class XLerobotVRTeleop(Teleoperator):
@@ -736,6 +764,8 @@ class XLerobotVRTeleop(Teleoperator):
         self._cached_obs = None
         self._obs_cache_time = 0.0
         self._obs_cache_duration = 0.01  # Cache for 10ms (faster than camera refresh)
+        # Lift velocity smoothing state (smoothed_y, smoothed_vel) for get_vr_lift_action
+        self._lift_state = {}
         
         self.logs = {}
 
@@ -882,7 +912,7 @@ class XLerobotVRTeleop(Teleoperator):
     
     def _get_noop_lift_action(self, robot) -> dict[str, Any]:
         """When lift axis is enabled, return zero velocity so lift does not keep moving."""
-        return get_vr_lift_action(None, robot) if robot else {}
+        return get_vr_lift_action(None, robot, self._lift_state) if robot else {}
 
     def _get_noop_action(self, robot_obs: dict[str, Any], robot: Optional[Any] = None) -> dict[str, Any]:
         """Generate a no-op action (current positions) with all required keys."""
@@ -1036,8 +1066,8 @@ class XLerobotVRTeleop(Teleoperator):
             
             # Base control - ALWAYS try to get base action (even if goals are None)
             base_action = get_vr_base_action(left_goal, right_goal, self.robot)
-            # Lift axis - left thumbstick Y (up/down)
-            lift_action = get_vr_lift_action(left_goal, self.robot)
+            # Lift axis - left thumbstick Y (up/down), normalized and smoothed
+            lift_action = get_vr_lift_action(left_goal, self.robot, self._lift_state)
 
             if not hasattr(self, '_last_base_log_time'):
                 self._last_base_log_time = 0
