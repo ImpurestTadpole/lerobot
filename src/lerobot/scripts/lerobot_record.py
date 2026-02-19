@@ -27,8 +27,11 @@ lerobot-record \
     --dataset.num_episodes=2 \
     --dataset.single_task="Grab the cube" \
     --display_data=true
-    # <- Optional: specify video codec (h264, hevc, libsvtav1). Default is libsvtav1. \
-    # --dataset.vcodec=h264 \
+    # <- Optional: specify video codec. Default is h264 (portable). \
+    # --dataset.vcodec=h264 \          # libx264 software H264 (portable, good performance)
+    # --dataset.vcodec=h264_v4l2m2m \  # Jetson hardware H264 (fastest, near-zero CPU)
+    # --dataset.vcodec=hevc \          # HEVC software (better compression than H264)
+    # --dataset.vcodec=libsvtav1 \     # AV1 software (smallest files, very CPU heavy)
     # <- Teleop optional if you want to teleoperate to record or in between episodes with a policy \
     # --teleop.type=so100_leader \
     # --teleop.port=/dev/tty.usbmodem58760431551 \
@@ -143,7 +146,7 @@ from lerobot.utils.utils import (
     init_logging,
     log_say,
 )
-from lerobot.utils.visualization_utils import init_rerun, log_rerun_data
+from lerobot.utils.visualization_utils import init_rerun, log_rerun_data, start_viz_thread, stop_viz_thread
 
 
 @dataclass
@@ -178,13 +181,16 @@ class DatasetRecordConfig:
     # Number of threads writing the frames as png images on disk, per camera.
     # Too many threads might cause unstable teleoperation fps due to main thread being blocked.
     # Not enough threads might cause low camera fps.
-    num_image_writer_threads_per_camera: int = 4
+    num_image_writer_threads_per_camera: int = 2
     # Number of episodes to record before batch encoding videos
     # Set to 1 for immediate encoding (default behavior), or higher for batched encoding
     video_encoding_batch_size: int = 1
-    # Video codec for encoding videos. Options: 'h264', 'hevc', 'libsvtav1'.
-    # Use 'h264' for faster encoding on systems where AV1 encoding is CPU-heavy.
-    vcodec: str = "libsvtav1"
+    # Video codec for encoding videos.
+    # Options: 'h264' (libx264 software, portable), 'h264_v4l2m2m' (Jetson hardware, fastest),
+    #          'h264_omx' (Jetson OpenMAX hardware), 'hevc', 'libsvtav1'.
+    # For Jetson: use 'h264_v4l2m2m' for hardware encoding (near-zero CPU cost).
+    # For other systems: use 'h264' for software encoding (portable).
+    vcodec: str = "h264"
     # Rename map for the observation to override the image and state keys
     rename_map: dict[str, str] = field(default_factory=dict)
 
@@ -435,31 +441,20 @@ def record_loop(
             frame = {**observation_frame, **action_frame, "task": single_task}
             dataset.add_frame(frame)
 
-        # Visualization is expensive - only do it if enabled and not blocking control rate
+        # Visualization runs in a background thread - this call is non-blocking.
+        # Frames are dropped if the worker is still busy (queue size = 1).
         if display_data:
-            # Filter out depth images from rerun visualization to improve performance
-            # Depth images are still recorded to the dataset, just not visualized
-            # Additionally, throttle visualization to every 2nd frame to improve control rate.
-            if frame_idx % 2 == 0:
-                obs_for_rerun = {
-                    k: v for k, v in obs_processed.items()
-                    if not ("depth" in str(k).lower() or k.endswith("_depth"))
-                }
-                try:
-                    log_rerun_data(
-                        observation=obs_for_rerun, action=action_values, compress_images=display_compressed_images
-                    )
-                except Exception as e:
-                    # Don't let visualization errors crash the recording
-                    logging.debug(f"Visualization error (non-critical): {e}")
+            obs_for_rerun = {
+                k: v for k, v in obs_processed.items()
+                if not ("depth" in str(k).lower() or k.endswith("_depth"))
+            }
+            log_rerun_data(
+                observation=obs_for_rerun, action=action_values, compress_images=display_compressed_images
+            )
 
         dt_s = time.perf_counter() - start_loop_t
 
         sleep_time_s: float = 1 / fps - dt_s
-        if sleep_time_s < 0:
-            logging.warning(
-                f"Record loop is running slower ({1 / dt_s:.1f} Hz) than the target FPS ({fps} Hz). Dataset frames might be dropped and robot control might be unstable. Common causes are: 1) Camera FPS not keeping up 2) Policy inference taking too long 3) CPU starvation"
-            )
 
         precise_sleep(max(sleep_time_s, 0.0))
 
@@ -513,6 +508,7 @@ def record(cfg: RecordConfig) -> LeRobotDataset:
     logging.info(pformat(asdict(cfg)))
     if cfg.display_data:
         init_rerun(session_name="recording", ip=cfg.display_ip, port=cfg.display_port)
+        start_viz_thread()
     display_compressed_images = (
         True
         if (cfg.display_data and cfg.display_ip is not None and cfg.display_port is not None)
@@ -702,6 +698,9 @@ def record(cfg: RecordConfig) -> LeRobotDataset:
                     )
     finally:
         log_say("Stop recording", cfg.play_sounds, blocking=True)
+
+        if cfg.display_data:
+            stop_viz_thread()
 
         if dataset:
             dataset.finalize()

@@ -5,7 +5,33 @@
 conda activate lerobot
 
 # Set USB permissions (run every time after reboot or USB reconnect)
-sudo chmod 666 /dev/ttyACM0 /dev/ttyACM1 
+sudo chmod 666 /dev/ttyACM0 /dev/ttyACM1
+
+# =============================================================================
+# CAMERA SETUP (ONE-TIME SETUP + RUN AFTER REBOOT)
+# =============================================================================
+# CRITICAL: Fix camera bandwidth issue by configuring MJPG format
+# Without this, cameras default to YUYV (uncompressed) which causes:
+#   - Control rate drops from 30 Hz to 12-25 Hz
+#   - Severe USB bandwidth saturation
+#   - Unstable robot control
+#
+# RUN THIS ONCE TO INSTALL UDEV RULE (persists across reboots):
+./setup_camera_formats.sh
+#
+# OR MANUAL SETUP (run after every reboot if you don't install udev rule):
+# v4l2-ctl -d /dev/video6 --set-fmt-video=width=640,height=480,pixelformat=MJPG
+# v4l2-ctl -d /dev/video8 --set-fmt-video=width=640,height=480,pixelformat=MJPG
+#
+# Verify camera formats:
+# v4l2-ctl -d /dev/video6 --get-fmt-video | grep "Pixel Format"
+# v4l2-ctl -d /dev/video8 --get-fmt-video | grep "Pixel Format"
+# v4l2-ctl -d /dev/video4 --get-fmt-video | grep "Pixel Format"
+#
+# Expected output:
+#   video6: MJPG (Motion-JPEG)
+#   video8: MJPG (Motion-JPEG)
+#   video4: YUYV (RealSense uses native SDK, not V4L2) 
 
 # =============================================================================
 # GIT WORKFLOW - SYNC WITH GITHUB REPO
@@ -18,42 +44,32 @@ cd /home/jetson/lerobot
 # git config --global user.email "your-email@example.com"
 # git remote add origin https://github.com/ImpurestTadpole/lerobot.git
 
-# COMPLETE SYNC WORKFLOW (pull remote changes + push local changes):
-# Step 1: Check current status
+# UPDATE FROM GITHUB (pull latest changes):
+# First, check if you have uncommitted changes:
 git status
 
-# Step 2: Pull remote changes first (to get latest from GitHub)
-git config pull.rebase false  # Set merge strategy (one-time, if not already set)
-git pull origin main
-
-# Step 3: If merge conflicts occur, resolve them:
-#   - Edit files with conflicts (look for <<<<<<< markers)
-#   - git add .
-#   - git commit -m "Resolve merge conflicts"
-
-# Step 4: Stage and commit your local changes
-git add .                     # Stage all changes
-git commit -m "Your commit message here"
-
-# Step 5: Push your local changes to GitHub
-git push origin main
-
-# -----------------------------------------------------------------------------
-# ALTERNATIVE: If you have uncommitted changes when pulling:
-# -----------------------------------------------------------------------------
 # OPTION A: Commit your local changes first, then pull:
 git add .
 git commit -m "Save local changes before pulling"
-git pull origin main
+git config pull.rebase false  # Set merge strategy (one-time)
+git pull origin main          # Merge remote changes into local
 
 # OPTION B: Stash your changes, pull, then reapply:
 git stash                      # Temporarily save your changes
-git pull origin main          # Get remote changes
+git config pull.rebase false  # Set merge strategy (one-time)
+git pull origin main          # Merge remote changes into local
 git stash pop                 # Reapply your stashed changes
-# Then commit and push:
-git add .
+
+# If merge conflicts occur after pull:
+# 1. Resolve conflicts in the files git lists (look for <<<<<<< markers)
+# 2. git add .
+# 3. git commit -m "Resolve merge conflicts"
+# 4. git push origin main
+
+# PUSH LOCAL CHANGES TO GITHUB:
+git add .                     # Stage all changes
 git commit -m "Your commit message here"
-git push origin main
+git push origin main          # Push to GitHub
 
 # CHECK STATUS:
 git status                    # See what files have changed
@@ -153,13 +169,13 @@ lerobot-record \
 lerobot-record \
     --robot.type=xlerobot \
     --teleop.type=xlerobot_vr \
-    --dataset.repo_id=Odog16/test_transfer_block_2  \
+    --dataset.repo_id=Odog16/test_transfer_block_3  \
     --dataset.single_task="transfer the block" \
     --dataset.num_episodes=15 \
     --dataset.fps=30 \
     --display_data=true \
     --dataset.push_to_hub=true 
- #   --resume=true 
+    #--resume=true 
 
 
 
@@ -183,16 +199,7 @@ python -c "from lerobot.datasets.lerobot_dataset import LeRobotDataset; \
 # Videos: videos/chunk-000/observation.images.*/episode_*.mp4
 
 # Delete local dataset (if you want to start fresh):
-rm -rf ~/.cache/huggingface/lerobot/Odog16/making_coffee
-
-# =============================================================================
-# REPLAY EPISODE
-# =============================================================================
-# Replay an episode from a dataset on the robot (change --dataset.episode for other episodes)
-lerobot-replay \
-    --robot.type=xlerobot \
-    --dataset.repo_id=Odog16/test_transfer_block_2 \
-    --dataset.episode=0
+rm -rf ~/.cache/huggingface/lerobot/Odog16/test_transfer_block_2
 
 # =============================================================================
 # PERFORMANCE TIPS

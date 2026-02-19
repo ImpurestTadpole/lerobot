@@ -41,17 +41,16 @@ def xlerobot_cameras_config() -> dict[str, CameraConfig]:
     return {
         # camera1: Top/overhead view (head) - Intel RealSense D435i
         # MUST be opened FIRST to avoid resource conflicts
-        # NOTE: Replace "YOUR_D435i_SERIAL_NUMBER" with your actual D435i serial number
-        # You can find it by running: rs-enumerate-devices
-        #"head": RealSenseCameraConfig(
-        #    serial_number_or_name="342222071125",  # Replace with your D435i serial number
-        #    fps=30,
-        #    width=640,
-        #    height=480,
-        #    color_mode=ColorMode.RGB,  # Request BGR output
-        #    rotation=Cv2Rotation.NO_ROTATION,
-        #    use_depth=False,
-        #),
+        # Using RealSense SDK for efficient native compression (better than OpenCV/V4L2)
+        "head": RealSenseCameraConfig(
+            serial_number_or_name="342222071125",
+            fps=30,
+            width=640,
+            height=360,
+            color_mode=ColorMode.RGB,
+            rotation=Cv2Rotation.NO_ROTATION,
+            use_depth=False,
+        ),
     
         # IMAGE SIZE RECOMMENDATION:
         # Current 640x480 is 6x more pixels than needed for most manipulation policies.
@@ -66,33 +65,37 @@ def xlerobot_cameras_config() -> dict[str, CameraConfig]:
         # To apply: change width/height below and re-collect data (or add a resize step in
         # the training pipeline if you want to keep existing datasets at 640x480).
         #
-        # Current (640x480) kept as-is; change the values below when re-collecting data.
-        "head": OpenCVCameraConfig(
-             index_or_path="/dev/video4",
-             fps=30,
-             width=640,   # Recommended: 320
-             height=480,  # Recommended: 240
-             fourcc="MJPG",
-             rotation=Cv2Rotation.NO_ROTATION,
-         ),
+        # OpenCV fallback (if RealSense SDK issues occur, uncomment below and comment above):
+        #"head": OpenCVCameraConfig(
+        #     index_or_path="/dev/video4",
+        #     fps=30,
+        #     width=320,   # Reduced from 640 to handle YUYV bandwidth
+        #     height=240,  # Reduced from 480 to handle YUYV bandwidth
+        #     fourcc="YUYV",  # Changed from MJPG (not supported by RealSense via V4L2)
+        #     rotation=Cv2Rotation.NO_ROTATION,
+        # ),
         
         # camera2: Wrist view (was "left_wrist")
+        # PERFORMANCE: MJPG format is critical for 30 Hz control rate
+        # If MJPG fails (camera defaults to YUYV), run: ./setup_camera_formats.sh
         "left_wrist": OpenCVCameraConfig(
             index_or_path="/dev/video6",  # Innomaker camera 2 (swapped)
             fps=30,
-            width=640,   # Recommended: 224
-            height=480,  # Recommended: 224
+            width=640,   # For 30 Hz with MJPG. If using YUYV, reduce to 320x240
+            height=360,  # For 30 Hz with MJPG. If using YUYV, reduce to 320x240
             fourcc="MJPG",
             rotation=Cv2Rotation.NO_ROTATION,
             warmup_s=3,  # Increased warmup time for Innomaker cameras
         ),     
         
         # camera3: Additional view (was "right_wrist")
+        # PERFORMANCE: MJPG format is critical for 30 Hz control rate
+        # If MJPG fails (camera defaults to YUYV), run: ./setup_camera_formats.sh
         "right_wrist": OpenCVCameraConfig(
-            index_or_path="/dev/video8",  # Innomaker camera 1 (swapped)
+            index_or_path="/dev/video4",  # Innomaker camera 1 (swapped)
             fps=30,
-            width=640,   # Recommended: 224
-            height=480,  # Recommended: 224
+            width=640,   # For 30 Hz with MJPG. If using YUYV, reduce to 320x240
+            height=360,  # For 30 Hz with MJPG. If using YUYV, reduce to 320x240
             fourcc="MJPG",
             rotation=Cv2Rotation.NO_ROTATION,
             warmup_s=5,  # Increased warmup time for right wrist camera (needs more time after other cameras)

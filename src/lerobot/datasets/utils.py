@@ -17,6 +17,7 @@ import contextlib
 import importlib.resources
 import json
 import logging
+import time
 from collections import deque
 from collections.abc import Iterable, Iterator
 from pathlib import Path
@@ -724,6 +725,11 @@ def hw_to_dataset_features(
     return features
 
 
+# Throttle missing image warnings to avoid spam
+_missing_image_warnings: dict[str, float] = {}
+_missing_image_warning_interval = 1.0  # Warn at most once per second per image key
+
+
 def build_dataset_frame(
     ds_features: dict[str, dict], values: dict[str, Any], prefix: str
 ) -> dict[str, np.ndarray]:
@@ -778,11 +784,16 @@ def build_dataset_frame(
                     # Fallback for unexpected shapes
                     placeholder = np.zeros(shape, dtype=np.uint8)
                 frame[key] = placeholder
-                logger.warning(
-                    f"Image '{image_key}' (feature '{key}') not found in observation. "
-                    "Using zeros placeholder. This may happen if depth images "
-                    "failed to read or if camera is not connected."
-                )
+                # Throttle warnings: only warn at most once per second per image key
+                current_time = time.perf_counter()
+                last_warning_time = _missing_image_warnings.get(image_key, 0.0)
+                if current_time - last_warning_time >= _missing_image_warning_interval:
+                    logger.warning(
+                        f"Image '{image_key}' (feature '{key}') not found in observation. "
+                        "Using zeros placeholder. This may happen if depth images "
+                        "failed to read or if camera is not connected."
+                    )
+                    _missing_image_warnings[image_key] = current_time
 
     return frame
 

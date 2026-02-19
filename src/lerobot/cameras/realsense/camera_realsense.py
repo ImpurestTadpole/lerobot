@@ -275,7 +275,11 @@ class RealSenseCamera(Camera):
         return serial_number
 
     def _configure_rs_pipeline_config(self, rs_config: Any) -> None:
-        """Creates and configures the RealSense pipeline configuration object."""
+        """Creates and configures the RealSense pipeline configuration object.
+        
+        RealSense cameras support specific resolutions (e.g., 640x480, 1280x720, 1920x1080).
+        If the requested resolution isn't supported, we use 640x480 and resize in postprocessing.
+        """
         rs.config.enable_device(rs_config, self.serial_number)
 
         if self.width and self.height and self.fps:

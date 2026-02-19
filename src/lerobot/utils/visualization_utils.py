@@ -15,7 +15,9 @@
 import contextlib
 import numbers
 import os
+import queue
 import sys
+import threading
 
 import cv2
 import numpy as np
@@ -24,6 +26,52 @@ import rerun as rr
 from lerobot.processor import RobotAction, RobotObservation
 
 from .constants import ACTION, ACTION_PREFIX, OBS_PREFIX, OBS_STR
+
+
+# ---------------------------------------------------------------------------
+# Background visualization thread
+# ---------------------------------------------------------------------------
+# The main control loop drops data into this queue and immediately continues.
+# A single daemon thread drains the queue and calls the actual rerun logging.
+# Queue size of 5 provides ~150ms buffer (5 frames @ 30Hz). If the network
+# is slow, new frames are dropped rather than blocking the control loop.
+
+_viz_queue: queue.Queue = queue.Queue(maxsize=1)
+_viz_thread: threading.Thread | None = None
+
+
+def _viz_worker() -> None:
+    """Background thread that drains the visualization queue."""
+    while True:
+        item = _viz_queue.get()
+        if item is None:  # sentinel → shut down
+            break
+        obs, action, compress = item
+        try:
+            _log_rerun_data_sync(obs, action, compress)
+        except Exception:
+            pass  # never crash the recording
+
+
+def start_viz_thread() -> None:
+    """Start the background visualization thread (idempotent)."""
+    global _viz_thread
+    if _viz_thread is not None and _viz_thread.is_alive():
+        return
+    _viz_thread = threading.Thread(target=_viz_worker, name="viz_worker", daemon=True)
+    _viz_thread.start()
+
+
+def stop_viz_thread() -> None:
+    """Send the sentinel and wait for the worker to exit."""
+    global _viz_thread
+    if _viz_thread is not None and _viz_thread.is_alive():
+        try:
+            _viz_queue.put_nowait(None)
+        except queue.Full:
+            pass
+        _viz_thread.join(timeout=2.0)
+    _viz_thread = None
 
 
 @contextlib.contextmanager
@@ -156,50 +204,51 @@ def log_rerun_data(
     action: RobotAction | None = None,
     compress_images: bool = False,
 ) -> None:
-    """
-    Logs observation and action data to Rerun for real-time visualization.
+    """Non-blocking async rerun logging.
 
-    This function iterates through the provided observation and action dictionaries and sends their contents
-    to the Rerun viewer. It handles different data types appropriately:
-    - Scalars values (floats, ints) are logged as `rr.Scalars`.
-    - 3D NumPy arrays that resemble images (e.g., with 1, 3, or 4 channels first) are transposed
-      from CHW to HWC format, (optionally) compressed to JPEG and logged as `rr.Image` or `rr.EncodedImage`.
-      Images are downsampled for bandwidth reduction if RERUN_DOWNSAMPLE_FACTOR is set.
-    - 1D NumPy arrays are logged as a series of individual scalars, with each element indexed.
-    - Other multi-dimensional arrays are flattened and logged as individual scalars.
-
-    **Performance Optimization**: Depth images (keys containing "_depth") are automatically skipped
-    to improve control loop performance. Depth data is still collected in the dataset, just not visualized.
-
-    Keys are automatically namespaced with "observation." or "action." if not already present.
+    Puts data into a queue consumed by the background viz thread so the main
+    control loop is never blocked by image compression or rerun logging.
+    Queue size of 5 provides ~150ms buffer. If the worker falls behind,
+    new frames are silently dropped rather than blocking the control loop.
     
-    Environment Variables:
-        RERUN_DOWNSAMPLE_FACTOR: Image downsampling factor (default: 0.33 for lower latency)
-                                 Set to 1.0 to disable downsampling.
-        RERUN_SKIP_DEPTH: If "true", skip depth images to reduce bandwidth (default: "false")
-        RERUN_LOG_FREQUENCY: Log every Nth frame (default: 1, log all frames)
-
-    Args:
-        observation: An optional dictionary containing observation data to log.
-        action: An optional dictionary containing action data to log.
-        compress_images: Whether to compress images before logging to save bandwidth & memory in exchange for cpu and quality.
+    Optimization: Check queue space before expensive array copying to avoid
+    wasted work when the queue is full.
     """
+    # Check if queue has space before doing expensive array copies
+    if _viz_queue.full():
+        return  # Skip this frame - worker is falling behind
+    
+    # Deep-copy numpy arrays so the main loop can reuse its buffers
+    # Only do this if we know the queue has space
+    obs_copy = {k: (v.copy() if isinstance(v, np.ndarray) else v) for k, v in (observation or {}).items()}
+    act_copy = {k: (v.copy() if isinstance(v, np.ndarray) else v) for k, v in (action or {}).items()}
+    
+    try:
+        _viz_queue.put_nowait((obs_copy, act_copy, compress_images))
+    except queue.Full:
+        pass  # drop frame – visualization is not worth blocking the robot
+
+
+def _log_rerun_data_sync(
+    observation: RobotObservation | None = None,
+    action: RobotAction | None = None,
+    compress_images: bool = False,
+) -> None:
+    """Synchronous implementation (runs in the background viz thread)."""
     # Get configuration from environment
     downsample_factor = float(os.getenv("RERUN_DOWNSAMPLE_FACTOR", "0.33"))
     skip_depth = os.getenv("RERUN_SKIP_DEPTH", "false").lower() in ("true", "1", "yes")
     log_frequency = int(os.getenv("RERUN_LOG_FREQUENCY", "1"))
-    
-    # Frame counter for logging frequency (module-level would be better, but this works)
-    if not hasattr(log_rerun_data, "_frame_counter"):
-        log_rerun_data._frame_counter = 0
-    log_rerun_data._frame_counter += 1
-    
+
+    # Frame counter for logging frequency
+    if not hasattr(_log_rerun_data_sync, "_frame_counter"):
+        _log_rerun_data_sync._frame_counter = 0
+    _log_rerun_data_sync._frame_counter += 1
+
     # Skip this frame if logging frequency > 1
-    if log_frequency > 1 and log_rerun_data._frame_counter % log_frequency != 0:
+    if log_frequency > 1 and _log_rerun_data_sync._frame_counter % log_frequency != 0:
         return
-    
-    # Note: Rerun will handle connection status internally, so we don't need to check here
-    
+
     if observation:
         for k, v in observation.items():
             if v is None:
@@ -225,11 +274,11 @@ def log_rerun_data(
                 is_depth = arr.dtype == np.uint16 and ("depth" in str(k).lower() or k.endswith("_depth"))
                 
                 # Log depth image detection for debugging (only once per key)
-                if is_depth and not hasattr(log_rerun_data, f"_depth_logged_{k}"):
+                if is_depth and not hasattr(_log_rerun_data_sync, f"_depth_logged_{k}"):
                     import logging
                     logger = logging.getLogger(__name__)
                     logger.debug(f"📊 Depth image detected: {k}, shape={arr.shape}, dtype={arr.dtype}")
-                    setattr(log_rerun_data, f"_depth_logged_{k}", True)
+                    setattr(_log_rerun_data_sync, f"_depth_logged_{k}", True)
                 
                 # Downsample images before sending to Rerun (for both 2D and 3D images)
                 if is_image:

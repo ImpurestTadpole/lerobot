@@ -80,7 +80,14 @@ from lerobot.datasets.video_utils import (
 from lerobot.utils.constants import HF_LEROBOT_HOME
 
 CODEBASE_VERSION = "v3.0"
-VALID_VIDEO_CODECS = {"h264", "hevc", "libsvtav1"}
+VALID_VIDEO_CODECS = {
+    "h264",  # libx264 software encoder
+    "h264_v4l2m2m",  # Jetson V4L2 hardware H264 encoder (fastest, near-zero CPU)
+    "h264_omx",  # Jetson OpenMAX hardware H264 encoder
+    "hevc",  # software HEVC encoder
+    "hevc_v4l2m2m",  # Jetson V4L2 hardware HEVC encoder
+    "libsvtav1",  # AV1 software encoder (CPU intensive)
+}
 
 
 class LeRobotDatasetMetadata:

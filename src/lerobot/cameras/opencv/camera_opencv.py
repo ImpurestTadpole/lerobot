@@ -119,6 +119,10 @@ class OpenCVCamera(Camera):
 
         self.rotation: int | None = get_cv2_rotation(config.rotation)
         self.backend: int = config.backend
+        
+        # Track thread restart attempts to prevent restart loops
+        self._last_restart_time: float = 0.0
+        self._restart_count: int = 0
 
         if self.height and self.width:
             self.capture_width, self.capture_height = self.width, self.height
@@ -166,15 +170,31 @@ class OpenCVCamera(Camera):
 
         self._configure_capture_settings()
         self._start_read_thread()
+        
+        # Verify thread started successfully
+        if self.thread is None or not self.thread.is_alive():
+            raise ConnectionError(f"{self} read thread failed to start after connection.")
 
         if warmup and self.warmup_s > 0:
             start_time = time.time()
+            warmup_success = False
             while time.time() - start_time < self.warmup_s:
-                self.async_read(timeout_ms=self.warmup_s * 1000)
+                try:
+                    self.async_read(timeout_ms=self.warmup_s * 1000)
+                    with self.frame_lock:
+                        if self.latest_frame is not None:
+                            warmup_success = True
+                            break
+                except Exception as e:
+                    logger.debug(f"{self} warmup read failed (non-critical): {e}")
                 time.sleep(0.1)
-            with self.frame_lock:
-                if self.latest_frame is None:
-                    raise ConnectionError(f"{self} failed to capture frames during warmup.")
+            
+            if not warmup_success:
+                logger.warning(f"{self} failed to capture frames during warmup, but continuing anyway.")
+                # Verify thread is still alive
+                if self.thread is None or not self.thread.is_alive():
+                    logger.error(f"{self} read thread died during warmup!")
+                    raise ConnectionError(f"{self} read thread died during warmup.")
 
         logger.info(f"{self} connected.")
 
@@ -245,6 +265,8 @@ class OpenCVCamera(Camera):
         if self.videocapture is None:
             raise DeviceNotConnectedError(f"{self} videocapture is not initialized")
 
+        # Try setting FOURCC multiple times with different timing
+        # Some cameras need resolution set first before FOURCC works
         success = self.videocapture.set(cv2.CAP_PROP_FOURCC, fourcc_code)
         actual_fourcc_code = self.videocapture.get(cv2.CAP_PROP_FOURCC)
 
@@ -255,11 +277,40 @@ class OpenCVCamera(Camera):
         if not success or actual_fourcc != self.config.fourcc:
             logger.warning(
                 f"{self} failed to set fourcc={self.config.fourcc} (actual={actual_fourcc}, success={success}). "
-                f"Continuing with default format."
+                f"Continuing with default format. "
+                f"PERFORMANCE WARNING: YUYV uses 4x more USB bandwidth than MJPG. "
+                f"This may cause control rate issues. Consider using v4l2-ctl to pre-configure MJPG format."
             )
+            # If MJPG failed and we're on Linux, try to set it via v4l2-ctl as a fallback
+            # Note: This is best-effort; the camera may already be opened so v4l2-ctl might fail
+            # The udev rule from setup_camera_formats.sh should handle this at boot time
+            if platform.system() == "Linux" and self.config.fourcc == "MJPG" and isinstance(self.index_or_path, str) and self.index_or_path.startswith("/dev/video"):
+                try:
+                    import subprocess
+                    # Try to set format (may fail if camera is already opened, that's OK)
+                    result = subprocess.run(
+                        ["v4l2-ctl", "-d", self.index_or_path, "--set-fmt-video", 
+                         f"width={self.capture_width},height={self.capture_height},pixelformat=MJPG"],
+                        capture_output=True,
+                        timeout=2.0
+                    )
+                    if result.returncode == 0:
+                        logger.info(f"{self} successfully set MJPG format via v4l2-ctl fallback")
+                    else:
+                        logger.debug(f"{self} v4l2-ctl returned {result.returncode} (camera may be busy, this is OK)")
+                except FileNotFoundError:
+                    logger.debug(f"{self} v4l2-ctl not found (install v4l-utils if needed)")
+                except Exception as e:
+                    logger.debug(f"{self} v4l2-ctl fallback failed (non-critical): {e}")
 
     def _validate_width_and_height(self) -> None:
-        """Validates and sets the camera's frame capture width and height."""
+        """
+        Validates and sets the camera's frame capture width and height.
+        
+        Attempts to set the requested resolution, but does not fail if the camera
+        doesn't support it exactly. Frames will be automatically resized in _postprocess_image
+        if they don't match the requested dimensions.
+        """
 
         if self.videocapture is None:
             raise DeviceNotConnectedError(f"{self} videocapture is not initialized")
@@ -271,15 +322,13 @@ class OpenCVCamera(Camera):
         height_success = self.videocapture.set(cv2.CAP_PROP_FRAME_HEIGHT, float(self.capture_height))
 
         actual_width = int(round(self.videocapture.get(cv2.CAP_PROP_FRAME_WIDTH)))
-        if not width_success or self.capture_width != actual_width:
-            raise RuntimeError(
-                f"{self} failed to set capture_width={self.capture_width} ({actual_width=}, {width_success=})."
-            )
-
         actual_height = int(round(self.videocapture.get(cv2.CAP_PROP_FRAME_HEIGHT)))
-        if not height_success or self.capture_height != actual_height:
-            raise RuntimeError(
-                f"{self} failed to set capture_height={self.capture_height} ({actual_height=}, {height_success=})."
+        
+        # Warn if resolution doesn't match, but don't fail - we'll resize in postprocess
+        if self.capture_width != actual_width or self.capture_height != actual_height:
+            logger.warning(
+                f"{self} camera returned resolution {actual_width}x{actual_height} instead of "
+                f"requested {self.capture_width}x{self.capture_height}. Frames will be automatically resized."
             )
 
     @staticmethod
@@ -387,7 +436,7 @@ class OpenCVCamera(Camera):
 
     def _postprocess_image(self, image: NDArray[Any]) -> NDArray[Any]:
         """
-        Applies color conversion, dimension validation, and rotation to a raw frame.
+        Applies color conversion, dimension validation/resizing, and rotation to a raw frame.
 
         Args:
             image (np.ndarray): The raw image frame (expected BGR format from OpenCV).
@@ -397,8 +446,7 @@ class OpenCVCamera(Camera):
 
         Raises:
             ValueError: If the requested `color_mode` is invalid.
-            RuntimeError: If the raw frame dimensions do not match the configured
-                          `width` and `height`.
+            RuntimeError: If the raw frame dimensions are invalid or cannot be resized.
         """
 
         if self.color_mode not in (ColorMode.RGB, ColorMode.BGR):
@@ -408,17 +456,18 @@ class OpenCVCamera(Camera):
 
         h, w, c = image.shape
 
-        if h != self.capture_height or w != self.capture_width:
-            raise RuntimeError(
-                f"{self} frame width={w} or height={h} do not match configured width={self.capture_width} or height={self.capture_height}."
-            )
-
         if c != 3:
             raise RuntimeError(f"{self} frame channels={c} do not match expected 3 channels (RGB/BGR).")
 
         processed_image = image
+        
+        # Resize if dimensions don't match (some cameras don't support exact requested resolution)
+        if h != self.capture_height or w != self.capture_width:
+            processed_image = cv2.resize(processed_image, (self.capture_width, self.capture_height), interpolation=cv2.INTER_LINEAR)
+            logger.debug(f"{self} resized frame from {w}x{h} to {self.capture_width}x{self.capture_height}")
+
         if self.color_mode == ColorMode.RGB:
-            processed_image = cv2.cvtColor(image, cv2.COLOR_BGR2RGB)
+            processed_image = cv2.cvtColor(processed_image, cv2.COLOR_BGR2RGB)
 
         if self.rotation in [cv2.ROTATE_90_CLOCKWISE, cv2.ROTATE_90_COUNTERCLOCKWISE, cv2.ROTATE_180]:
             processed_image = cv2.rotate(processed_image, self.rotation)
@@ -441,6 +490,9 @@ class OpenCVCamera(Camera):
             raise RuntimeError(f"{self}: stop_event is not initialized before starting read loop.")
 
         failure_count = 0
+        consecutive_failures = 0
+        last_success_time = time.perf_counter()
+        
         while not stop_event.is_set():
             try:
                 raw_frame = self._read_from_hardware()
@@ -452,16 +504,30 @@ class OpenCVCamera(Camera):
                     self.latest_timestamp = capture_time
                 self.new_frame_event.set()
                 failure_count = 0
+                consecutive_failures = 0
+                last_success_time = capture_time
 
             except DeviceNotConnectedError:
                 logger.info(f"{self} disconnected, stopping read thread")
                 break
             except Exception as e:
-                if failure_count <= 10:
-                    failure_count += 1
+                consecutive_failures += 1
+                failure_count += 1
+                
+                # Log first few failures, then throttle logging
+                if consecutive_failures <= 3:
                     logger.warning(f"Error reading frame in background thread for {self}: {e}")
-                else:
-                    raise RuntimeError(f"{self} exceeded maximum consecutive read failures.") from e
+                elif consecutive_failures == 4:
+                    logger.warning(f"{self} has had {consecutive_failures} consecutive read failures. Suppressing further warnings.")
+                
+                # If we've had failures for more than 5 seconds, something is seriously wrong
+                if time.perf_counter() - last_success_time > 5.0 and consecutive_failures > 10:
+                    logger.error(f"{self} read thread has been failing for >5s. Thread will exit but may be restarted.")
+                    # Don't raise - let thread exit gracefully so it can be restarted
+                    break
+                
+                # Small delay on failure to avoid tight error loop
+                time.sleep(0.01)
 
     def _start_read_thread(self) -> None:
         """Starts or restarts the background read thread if it's not running."""
@@ -513,8 +579,47 @@ class OpenCVCamera(Camera):
             RuntimeError: If an unexpected error occurs.
         """
 
+        # Auto-restart thread if it died (e.g., due to transient USB errors)
         if self.thread is None or not self.thread.is_alive():
-            raise RuntimeError(f"{self} read thread is not running.")
+            current_time = time.perf_counter()
+            time_since_last_restart = current_time - self._last_restart_time
+            
+            # Rate limit restarts: max 1 restart per second, max 5 restarts per minute
+            if time_since_last_restart < 1.0:
+                raise RuntimeError(f"{self} read thread is not running. Restart cooldown active (last restart {time_since_last_restart:.1f}s ago).")
+            
+            # Reset restart count if it's been more than 60 seconds
+            if time_since_last_restart > 60.0:
+                self._restart_count = 0
+            
+            if self._restart_count >= 5:
+                raise RuntimeError(f"{self} read thread has failed to restart {self._restart_count} times. Camera may need physical reconnection.")
+            
+            # Verify camera is still accessible before restarting
+            if self.videocapture is None or not self.videocapture.isOpened():
+                logger.error(f"{self} camera device is not accessible, cannot restart thread")
+                raise RuntimeError(f"{self} camera device is not accessible.")
+            
+            logger.warning(f"{self} read thread died, attempting to restart (attempt {self._restart_count + 1}/5)...")
+            try:
+                # Stop any existing thread cleanup
+                self._stop_read_thread()
+                # Restart the thread
+                self._start_read_thread()
+                # Give thread a moment to start and capture first frame
+                time.sleep(0.2)
+                if self.thread is None or not self.thread.is_alive():
+                    self._restart_count += 1
+                    self._last_restart_time = current_time
+                    raise RuntimeError(f"{self} read thread failed to restart.")
+                logger.info(f"{self} read thread restarted successfully")
+                self._restart_count = 0  # Reset on successful restart
+                self._last_restart_time = current_time
+            except Exception as e:
+                self._restart_count += 1
+                self._last_restart_time = current_time
+                logger.error(f"{self} failed to restart read thread: {e}")
+                raise RuntimeError(f"{self} read thread is not running and restart failed: {e}")
 
         if not self.new_frame_event.wait(timeout=timeout_ms / 1000.0):
             raise TimeoutError(

@@ -314,9 +314,16 @@ def encode_video_frames(
     preset: int | None = None,
 ) -> None:
     """More info on ffmpeg arguments tuning on `benchmark/video/README.md`"""
-    # Check encoder availability
-    if vcodec not in ["h264", "hevc", "libsvtav1"]:
-        raise ValueError(f"Unsupported video codec: {vcodec}. Supported codecs are: h264, hevc, libsvtav1.")
+    # Supported codecs: software and Jetson hardware encoders
+    _SOFTWARE_CODECS = {"h264", "hevc", "libsvtav1"}
+    _HARDWARE_CODECS = {"h264_v4l2m2m", "h264_omx", "hevc_v4l2m2m"}
+    _SUPPORTED_CODECS = _SOFTWARE_CODECS | _HARDWARE_CODECS
+    if vcodec not in _SUPPORTED_CODECS:
+        raise ValueError(
+            f"Unsupported video codec: {vcodec}. Supported codecs are: {sorted(_SUPPORTED_CODECS)}."
+        )
+
+    is_hardware = vcodec in _HARDWARE_CODECS
 
     video_path = Path(video_path)
     imgs_dir = Path(imgs_dir)
@@ -327,8 +334,12 @@ def encode_video_frames(
 
     video_path.parent.mkdir(parents=True, exist_ok=True)
 
-    # Encoders/pixel formats incompatibility check
-    if (vcodec == "libsvtav1" or vcodec == "hevc") and pix_fmt == "yuv444p":
+    # Hardware encoders require yuv420p; force it silently
+    if is_hardware and pix_fmt != "yuv420p":
+        pix_fmt = "yuv420p"
+
+    # Encoders/pixel formats incompatibility check (software codecs)
+    if not is_hardware and (vcodec == "libsvtav1" or vcodec == "hevc") and pix_fmt == "yuv444p":
         logging.warning(
             f"Incompatible pixel format 'yuv444p' for codec {vcodec}, auto-selecting format 'yuv420p'"
         )
@@ -349,19 +360,26 @@ def encode_video_frames(
     # Define video codec options
     video_options = {}
 
-    if g is not None:
-        video_options["g"] = str(g)
+    if is_hardware:
+        # Hardware encoders use bitrate instead of CRF; use a sensible default
+        if g is not None:
+            video_options["g"] = str(g)
+        # h264_v4l2m2m / h264_omx: b controls quality; ~2-4 Mbps is fine for 640x480 @ 30fps
+        video_options["b"] = "2M"
+    else:
+        if g is not None:
+            video_options["g"] = str(g)
 
-    if crf is not None:
-        video_options["crf"] = str(crf)
+        if crf is not None:
+            video_options["crf"] = str(crf)
 
-    if fast_decode:
-        key = "svtav1-params" if vcodec == "libsvtav1" else "tune"
-        value = f"fast-decode={fast_decode}" if vcodec == "libsvtav1" else "fastdecode"
-        video_options[key] = value
+        if fast_decode:
+            key = "svtav1-params" if vcodec == "libsvtav1" else "tune"
+            value = f"fast-decode={fast_decode}" if vcodec == "libsvtav1" else "fastdecode"
+            video_options[key] = value
 
-    if vcodec == "libsvtav1":
-        video_options["preset"] = str(preset) if preset is not None else "12"
+        if vcodec == "libsvtav1":
+            video_options["preset"] = str(preset) if preset is not None else "12"
 
     # Set logging level
     if log_level is not None:
