@@ -18,32 +18,42 @@ cd /home/jetson/lerobot
 # git config --global user.email "your-email@example.com"
 # git remote add origin https://github.com/ImpurestTadpole/lerobot.git
 
-# UPDATE FROM GITHUB (pull latest changes):
-# First, check if you have uncommitted changes:
+# COMPLETE SYNC WORKFLOW (pull remote changes + push local changes):
+# Step 1: Check current status
 git status
 
+# Step 2: Pull remote changes first (to get latest from GitHub)
+git config pull.rebase false  # Set merge strategy (one-time, if not already set)
+git pull origin main
+
+# Step 3: If merge conflicts occur, resolve them:
+#   - Edit files with conflicts (look for <<<<<<< markers)
+#   - git add .
+#   - git commit -m "Resolve merge conflicts"
+
+# Step 4: Stage and commit your local changes
+git add .                     # Stage all changes
+git commit -m "Your commit message here"
+
+# Step 5: Push your local changes to GitHub
+git push origin main
+
+# -----------------------------------------------------------------------------
+# ALTERNATIVE: If you have uncommitted changes when pulling:
+# -----------------------------------------------------------------------------
 # OPTION A: Commit your local changes first, then pull:
 git add .
 git commit -m "Save local changes before pulling"
-git config pull.rebase false  # Set merge strategy (one-time)
-git pull origin main          # Merge remote changes into local
+git pull origin main
 
 # OPTION B: Stash your changes, pull, then reapply:
 git stash                      # Temporarily save your changes
-git config pull.rebase false  # Set merge strategy (one-time)
-git pull origin main          # Merge remote changes into local
+git pull origin main          # Get remote changes
 git stash pop                 # Reapply your stashed changes
-
-# If merge conflicts occur after pull:
-# 1. Resolve conflicts in the files git lists (look for <<<<<<< markers)
-# 2. git add .
-# 3. git commit -m "Resolve merge conflicts"
-# 4. git push origin main
-
-# PUSH LOCAL CHANGES TO GITHUB:
-git add .                     # Stage all changes
+# Then commit and push:
+git add .
 git commit -m "Your commit message here"
-git push origin main          # Push to GitHub
+git push origin main
 
 # CHECK STATUS:
 git status                    # See what files have changed
