@@ -92,7 +92,7 @@ def xlerobot_cameras_config() -> dict[str, CameraConfig]:
         # PERFORMANCE: MJPG format is critical for 30 Hz control rate
         # If MJPG fails (camera defaults to YUYV), run: ./setup_camera_formats.sh
         "right_wrist": OpenCVCameraConfig(
-            index_or_path="/dev/video4",  # Innomaker camera 1 (swapped)
+            index_or_path="/dev/video8",  # Innomaker camera 1 (swapped)
             fps=30,
             width=640,   # For 30 Hz with MJPG. If using YUYV, reduce to 320x240
             height=360,  # For 30 Hz with MJPG. If using YUYV, reduce to 320x240

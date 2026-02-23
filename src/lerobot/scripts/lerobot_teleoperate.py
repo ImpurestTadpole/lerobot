@@ -103,7 +103,7 @@ from lerobot.teleoperators import (  # noqa: F401
 from lerobot.utils.import_utils import register_third_party_plugins
 from lerobot.utils.robot_utils import precise_sleep
 from lerobot.utils.utils import init_logging, move_cursor_up
-from lerobot.utils.visualization_utils import init_rerun, log_rerun_data
+from lerobot.utils.visualization_utils import init_rerun, log_rerun_data, start_viz_thread, stop_viz_thread
 
 
 @dataclass
@@ -227,6 +227,7 @@ def teleoperate(cfg: TeleoperateConfig):
     logging.info(pformat(asdict(cfg)))
     if cfg.display_data:
         init_rerun(session_name="teleoperation", ip=cfg.display_ip, port=cfg.display_port)
+        start_viz_thread()
     display_compressed_images = (
         True
         if (cfg.display_data and cfg.display_ip is not None and cfg.display_port is not None)
@@ -256,6 +257,7 @@ def teleoperate(cfg: TeleoperateConfig):
         pass
     finally:
         if cfg.display_data:
+            stop_viz_thread()
             rr.rerun_shutdown()
         teleop.disconnect()
         robot.disconnect()

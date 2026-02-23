@@ -110,7 +110,7 @@ lerobot-teleoperate \
 # =============================================================================
 
 # OPTION 1: Direct connection (recommended - best performance)
-rerun --serve-web --web-viewer-port 9090 --connect "rerun+http://172.20.10.13:9876/proxy"
+rerun --serve-web --web-viewer-port 9090 --connect "rerun+http://192.168.0.205:9876/proxy"
 
 # OPTION 2: Via SSH tunnel
 # Terminal 1:
