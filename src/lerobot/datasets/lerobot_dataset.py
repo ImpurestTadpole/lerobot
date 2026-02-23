@@ -1677,6 +1677,7 @@ class LeRobotDataset(torch.utils.data.Dataset):
         video_backend: str | None = None,
         batch_encoding_size: int = 1,
         vcodec: str = "libsvtav1",
+        metadata_buffer_size: int = 10,
         streaming_encoding: bool = False,
         encoder_queue_maxsize: int = 30,
         encoder_threads: int | None = None,
@@ -1691,6 +1692,7 @@ class LeRobotDataset(torch.utils.data.Dataset):
             features=features,
             root=root,
             use_videos=use_videos,
+            metadata_buffer_size=metadata_buffer_size,
         )
         obj.repo_id = obj.meta.repo_id
         obj.root = obj.meta.root
