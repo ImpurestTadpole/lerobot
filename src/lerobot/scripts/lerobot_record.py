@@ -26,6 +26,8 @@ lerobot-record \
     --dataset.repo_id=<my_username>/<my_dataset_name> \
     --dataset.num_episodes=2 \
     --dataset.single_task="Grab the cube" \
+    --dataset.streaming_encoding=true \
+    --dataset.encoder_threads=2 \
     --display_data=true
     # <- Optional: specify video codec. Default is h264 (portable). \
     # --dataset.vcodec=h264 \          # libx264 software H264 (portable, good performance)
@@ -61,7 +63,10 @@ lerobot-record \
   --display_data=true \
   --dataset.repo_id=${HF_USER}/bimanual-so-handover-cube \
   --dataset.num_episodes=25 \
-  --dataset.single_task="Grab and handover the red cube to the other arm"
+  --dataset.single_task="Grab and handover the red cube to the other arm" \
+  --dataset.streaming_encoding=true \
+  # --dataset.vcodec=auto \
+  --dataset.encoder_threads=2
 ```
 """
 
@@ -191,6 +196,15 @@ class DatasetRecordConfig:
     # For Jetson: use 'h264_v4l2m2m' for hardware encoding (near-zero CPU cost).
     # For other systems: use 'h264' for software encoding (portable).
     vcodec: str = "h264"
+    # Enable streaming video encoding: encode frames in real-time during capture instead
+    # of writing PNG images first. Makes save_episode() near-instant. More info in the documentation: https://huggingface.co/docs/lerobot/streaming_video_encoding
+    streaming_encoding: bool = False
+    # Maximum number of frames to buffer per camera when using streaming encoding.
+    # ~1s buffer at 30fps. Provides backpressure if the encoder can't keep up.
+    encoder_queue_maxsize: int = 30
+    # Number of threads per encoder instance. None = auto (codec default).
+    # Lower values reduce CPU usage, maps to 'lp' (via svtav1-params) for libsvtav1 and 'threads' for h264/hevc.
+    encoder_threads: int | None = None
     # Rename map for the observation to override the image and state keys
     rename_map: dict[str, str] = field(default_factory=dict)
 
@@ -546,6 +560,9 @@ def record(cfg: RecordConfig) -> LeRobotDataset:
                     root=cfg.dataset.root,
                     batch_encoding_size=cfg.dataset.video_encoding_batch_size,
                     vcodec=cfg.dataset.vcodec,
+                    streaming_encoding=cfg.dataset.streaming_encoding,
+                    encoder_queue_maxsize=cfg.dataset.encoder_queue_maxsize,
+                    encoder_threads=cfg.dataset.encoder_threads,
                 )
 
                 if hasattr(robot, "cameras") and len(robot.cameras) > 0:
@@ -577,6 +594,9 @@ def record(cfg: RecordConfig) -> LeRobotDataset:
                 image_writer_threads=cfg.dataset.num_image_writer_threads_per_camera * len(robot.cameras),
                 batch_encoding_size=cfg.dataset.video_encoding_batch_size,
                 vcodec=cfg.dataset.vcodec,
+                streaming_encoding=cfg.dataset.streaming_encoding,
+                encoder_queue_maxsize=cfg.dataset.encoder_queue_maxsize,
+                encoder_threads=cfg.dataset.encoder_threads,
             )
 
         # Load pretrained policy
@@ -607,6 +627,11 @@ def record(cfg: RecordConfig) -> LeRobotDataset:
             listener, events = init_vr_listener(teleop)
         else:
             listener, events = init_keyboard_listener()
+
+        if not cfg.dataset.streaming_encoding:
+            logging.info(
+                "Streaming encoding is disabled. If you have capable hardware, consider enabling it for way faster episode saving. --dataset.streaming_encoding=true --dataset.encoder_threads=2 # --dataset.vcodec=auto. More info in the documentation: https://huggingface.co/docs/lerobot/streaming_video_encoding"
+            )
 
         with VideoEncodingManager(dataset):
             recorded_episodes = 0
