@@ -40,7 +40,9 @@ import torch
 
 from lerobot.policies.factory import get_policy_class, make_pre_post_processors
 from lerobot.policies.rtc.configuration_rtc import RTCConfig
+from lerobot.policies.utils import populate_queues
 from lerobot.configs.types import RTCAttentionSchedule
+from lerobot.utils.constants import OBS_IMAGES, OBS_STATE, OBS_ENV_STATE
 from lerobot.processor import (
     PolicyAction,
     PolicyProcessorPipeline,
@@ -179,8 +181,51 @@ class PolicyServer(services_pb2_grpc.AsyncInferenceServicer):
         else:
             # For other policy types, load normally
             self.policy = policy_class.from_pretrained(policy_specs.pretrained_name_or_path)
+            
+            # Optimize diffusion policies for real-time inference
+            if policy_specs.policy_type == "diffusion":
+                from diffusers.schedulers.scheduling_ddim import DDIMScheduler
+                
+                # Step 1: Replace DDPM with DDIM scheduler for faster convergence
+                original_scheduler = self.policy.diffusion.noise_scheduler
+                self.policy.diffusion.noise_scheduler = DDIMScheduler(
+                    num_train_timesteps=original_scheduler.config.num_train_timesteps,
+                    beta_start=original_scheduler.config.beta_start,
+                    beta_end=original_scheduler.config.beta_end,
+                    beta_schedule=original_scheduler.config.beta_schedule,
+                    clip_sample=original_scheduler.config.clip_sample,
+                    clip_sample_range=getattr(original_scheduler.config, 'clip_sample_range', 1.0),
+                    prediction_type=original_scheduler.config.prediction_type,
+                )
+                
+                # Step 2: Set inference steps to 12 (better balance of speed vs quality)
+                self.policy.diffusion.num_inference_steps = 12
+                
+                self.logger.info(
+                    f"Diffusion optimization: DDIM scheduler with "
+                    f"{self.policy.diffusion.num_inference_steps} steps "
+                    f"(target: 60-100ms inference for better quality)"
+                )
         
         self.policy.to(self.device)
+        
+        # Additional optimizations for diffusion
+        if policy_specs.policy_type == "diffusion" and "cuda" in self.device:
+            # Enable mixed precision
+            self.use_amp = True
+            
+            # Compile UNet for additional speedup (PyTorch 2.0+)
+            try:
+                self.policy.diffusion.unet = torch.compile(
+                    self.policy.diffusion.unet,
+                    mode="reduce-overhead",
+                    fullgraph=False
+                )
+                self.logger.info("UNet compiled with torch.compile for additional speedup")
+            except Exception as e:
+                self.logger.warning(f"Could not compile UNet: {e}")
+        else:
+            self.use_amp = False
 
         # Load preprocessor and postprocessor, overriding device to match requested device
         device_override = {"device": self.device}
@@ -291,7 +336,7 @@ class PolicyServer(services_pb2_grpc.AsyncInferenceServicer):
             return services_pb2.Empty()
 
         except Exception as e:
-            self.logger.error(f"Error in StreamActions: {e}")
+            self.logger.error(f"Error in StreamActions: {e}", exc_info=True)
 
             return services_pb2.Empty()
 
@@ -350,8 +395,10 @@ class PolicyServer(services_pb2_grpc.AsyncInferenceServicer):
         ]
 
     def _get_action_chunk(self, observation: dict[str, torch.Tensor]) -> torch.Tensor:
-        """Get an action chunk from the policy. The chunk contains only"""
-        chunk = self.policy.predict_action_chunk(observation)
+        """Get an action chunk from the policy with optional mixed precision."""
+        with torch.amp.autocast('cuda', enabled=getattr(self, 'use_amp', False)):
+            chunk = self.policy.predict_action_chunk(observation)
+        
         if chunk.ndim != 3:
             chunk = chunk.unsqueeze(0)  # adding batch dimension, now shape is (B, chunk_size, action_dim)
 
@@ -363,9 +410,10 @@ class PolicyServer(services_pb2_grpc.AsyncInferenceServicer):
         Pipeline:
         1. Convert raw observation to LeRobot format
         2. Apply preprocessor (tokenization, normalization, batching, device placement)
-        3. Run policy inference to get action chunk
-        4. Apply postprocessor (unnormalization, device movement)
-        5. Convert to TimedAction list
+        3. Populate queues for queue-based policies (e.g., Diffusion)
+        4. Run policy inference to get action chunk
+        5. Apply postprocessor (unnormalization, device movement)
+        6. Convert to TimedAction list
         """
         """1. Prepare observation"""
         start_prepare = time.perf_counter()
@@ -373,7 +421,6 @@ class PolicyServer(services_pb2_grpc.AsyncInferenceServicer):
             observation_t.get_observation(),
             self.lerobot_features,
             self.policy_image_features,
-            rename_map=self.rename_map,
         )
         prepare_time = time.perf_counter() - start_prepare
 
@@ -383,7 +430,61 @@ class PolicyServer(services_pb2_grpc.AsyncInferenceServicer):
         self.last_processed_obs: TimedObservation = observation_t
         preprocessing_time = time.perf_counter() - start_preprocess
 
-        """3. Get action chunk"""
+        """3. Populate queues for queue-based policies (e.g., Diffusion)"""
+        if getattr(self.policy, "_queues", None) is not None:
+            # Build obs_for_queues with only the keys the policy expects
+            obs_for_queues = {}
+            device = next(self.policy.parameters()).device
+            
+            # Add OBS_STATE (required for robot control)
+            if OBS_STATE in observation and observation[OBS_STATE] is not None:
+                obs_for_queues[OBS_STATE] = observation[OBS_STATE]
+            elif getattr(self.policy.config, "robot_state_feature", None):
+                # Fallback: create zeros if missing
+                cfg = self.policy.config.robot_state_feature
+                obs_for_queues[OBS_STATE] = torch.zeros(
+                    (1,) + tuple(cfg.shape), device=device, dtype=torch.float32
+                )
+            
+            # Add OBS_IMAGES
+            if self.policy.config.image_features:
+                if OBS_IMAGES in observation and observation[OBS_IMAGES] is not None:
+                    # Preprocessor already created OBS_IMAGES
+                    obs_for_queues[OBS_IMAGES] = observation[OBS_IMAGES]
+                else:
+                    # Stack individual image keys
+                    img_tensors = []
+                    for img_key in self.policy.config.image_features:
+                        if img_key in observation and observation[img_key] is not None:
+                            img_tensors.append(observation[img_key])
+                        else:
+                            # Create zero tensor for missing image
+                            cfg = self.policy.config.image_features[img_key]
+                            img_tensors.append(torch.zeros(
+                                (1,) + tuple(cfg.shape), device=device, dtype=torch.float32
+                            ))
+                    
+                    if img_tensors:
+                        obs_for_queues[OBS_IMAGES] = torch.stack(img_tensors, dim=-4)
+            
+            # Add OBS_ENV_STATE if policy expects it
+            if getattr(self.policy.config, "env_state_feature", None):
+                if OBS_ENV_STATE in observation and observation[OBS_ENV_STATE] is not None:
+                    obs_for_queues[OBS_ENV_STATE] = observation[OBS_ENV_STATE]
+                else:
+                    # Fallback: create zeros
+                    cfg = self.policy.config.env_state_feature
+                    obs_for_queues[OBS_ENV_STATE] = torch.zeros(
+                        (1,) + tuple(cfg.shape), device=device, dtype=torch.float32
+                    )
+            
+            # Populate the policy's queues
+            populate_queues(self.policy._queues, obs_for_queues)
+            
+            # Use obs_for_queues for inference
+            observation = obs_for_queues
+
+        """4. Get action chunk"""
         start_inference = time.perf_counter()
         action_tensor = self._get_action_chunk(observation)
         inference_time = time.perf_counter() - start_inference
@@ -391,7 +492,7 @@ class PolicyServer(services_pb2_grpc.AsyncInferenceServicer):
             f"Preprocessing and inference took {inference_time:.4f}s, action shape: {action_tensor.shape}"
         )
 
-        """4. Apply postprocessor"""
+        """5. Apply postprocessor"""
         # Apply postprocessor (handles unnormalization and device movement)
         # Postprocessor expects (B, action_dim) per action, but we have (B, chunk_size, action_dim)
         # So we process each action in the chunk individually
@@ -412,7 +513,7 @@ class PolicyServer(services_pb2_grpc.AsyncInferenceServicer):
 
         action_tensor = action_tensor.detach().cpu()
 
-        """5. Convert to TimedAction list"""
+        """6. Convert to TimedAction list"""
         action_chunk = self._time_action_chunk(
             observation_t.get_timestamp(), list(action_tensor), observation_t.get_timestep()
         )
