@@ -459,7 +459,12 @@ class XLerobot(Robot):
         # Configure gantry / lift axis (velocity mode + wrap tracking)
         if self.lift_axis.enabled:
             self.lift_axis.configure()
-        
+            # Brief pause so any residual bus packets from homing (torque-disable writes,
+            # velocity commands) are fully flushed before we broadcast enable_torque to all
+            # motors.  Without this, a delayed response from the lift motor can collide with
+            # the next write and produce "Incorrect status packet!" on an unrelated motor.
+            time.sleep(0.2)
+
         # Enable torque on both buses
         self.bus1.enable_torque()
         self.bus2.enable_torque()

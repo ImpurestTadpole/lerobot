@@ -110,7 +110,10 @@ lerobot-teleoperate \
 # =============================================================================
 
 # OPTION 1: Direct connection (recommended - best performance)
+rerun --serve-web --web-viewer-port 9090 --connect "rerun+http://172.20.10.13:9876/proxy"
+
 rerun --serve-web --web-viewer-port 9090 --connect "rerun+http://192.168.0.205:9876/proxy"
+
 
 # OPTION 2: Via SSH tunnel
 # Terminal 1:
@@ -122,6 +125,13 @@ rerun --serve-web --web-viewer-port 9090 --connect "rerun+http://localhost:9876/
 
 # NOTE: Install rerun via pip (not snap):
 pip3 install rerun-sdk
+
+# Make Rerun streaming low-latency / live (optional; defaults are already tuned):
+#   export RERUN_FLUSH_TICK_SECS=0.008   # 8ms flush (default). Use 0.002 for minimal latency.
+#   export RERUN_LOG_FREQUENCY=1        # Log every frame (default). Do not increase if you want live view.
+#   export RERUN_DOWNSAMPLE_FACTOR=0.33 # Faster encode on motion-heavy frames (320x180 -> 213x120). Optional.
+# Rerun compression is now always on in code; for record/teleop you can still pass:
+#   --display_compressed_images=true   # Redundant but explicit; avoids raw frames if logic ever changes.
 
 
 
@@ -166,32 +176,93 @@ lerobot-record \
     --dataset.push_to_hub=true \
     --resume=true 
 
+# Rerun live-view tuning — set before ANY lerobot-record call.
+# server_memory_limit is now 200MB in code (was 55% = ~4.4GB on 8GB Jetson).
+# A large buffer causes the viewer to replay gigabytes of old data when it
+# (re)connects, appearing frozen/laggy. 200MB ≈ last ~1 min of compressed frames.
+# RERUN_LOG_FREQUENCY=2  → log every other frame (halves viz CPU load)
+# RERUN_DOWNSAMPLE_FACTOR=0.2 → 72×128px images sent over WiFi instead of 360×640
+# RERUN_JPEG_QUALITY=55  → faster encode, smaller network payload
+export RERUN_LOG_FREQUENCY=2
+export RERUN_DOWNSAMPLE_FACTOR=0.2
+export RERUN_JPEG_QUALITY=55
+
 lerobot-record \
     --robot.type=xlerobot \
     --teleop.type=xlerobot_vr \
-    --dataset.repo_id=Odog16/test_transfer_block_3  \
-    --dataset.single_task="transfer the block" \
-    --dataset.num_episodes=15 \
+    --dataset.repo_id=Odog16/block_sorting  \
+    --dataset.single_task="sort the blocks by color" \
+    --dataset.num_episodes=20 \
     --dataset.fps=30 \
     --display_data=true \
-    --dataset.push_to_hub=true 
-    #--resume=true 
+    --dataset.push_to_hub=false \
+    --resume=true 
 
+# Session 1: Red block (62 episodes) X4 sessions
+lerobot-record \
+    --robot.type=xlerobot \
+    --teleop.type=xlerobot_vr \
+    --dataset.repo_id=Odog16/block_sorting_single \
+    --dataset.single_task="Pick up the red block and place it in the red bowl" \
+    --dataset.num_episodes=14 \
+    --display_data=true \
+    --dataset.fps=30 \
+    --dataset.push_to_hub=false \
+    --resume=true 
+
+# Session 2: Blue block (62 episodes) X4 sessions
+lerobot-record \
+    --robot.type=xlerobot \
+    --teleop.type=xlerobot_vr \
+    --dataset.repo_id=Odog16/block_sorting_single \
+    --dataset.single_task="Pick up the blue block and place it in the blue bowl" \
+    --dataset.num_episodes=16 \
+    --display_data=true \
+    --dataset.fps=30 \
+    --dataset.push_to_hub=false \
+    --resume=true 
+
+
+# Session 3: Green block (62 episodes) X4 sessions
+lerobot-record \
+    --robot.type=xlerobot \
+    --teleop.type=xlerobot_vr \
+    --dataset.repo_id=Odog16/block_sorting_single \
+    --dataset.single_task="Pick up the green block and place it in the green bowl" \
+    --dataset.num_episodes=16 \
+    --display_data=true \
+    --dataset.fps=30 \
+    --dataset.push_to_hub=false \
+    --resume=true 
+# Session 4: Yellow block (62 episodes) X4 sessions
+lerobot-record \
+    --robot.type=xlerobot \
+    --teleop.type=xlerobot_vr \
+    --dataset.repo_id=Odog16/block_sorting_single \
+    --dataset.single_task="Pick up the yellow block and place it in the yellow bowl" \
+    --dataset.num_episodes=16 \
+    --display_data=true \
+    --dataset.fps=30 \
+    --dataset.push_to_hub=false \
+    --resume=true 
 
 
 # RECORDING LOCAL ONLY (push manually later):
 lerobot-record \
     --robot.type=xlerobot \
     --teleop.type=xlerobot_vr \
-    --dataset.repo_id=Odog16/ob15_test_1 \
-    --dataset.single_task="place clothes in bin" \
-    --dataset.num_episodes=10 \
+    --dataset.repo_id=Odog16/tool_pickup \
+    --dataset.single_task="pick up the tools from the table and place it in the red bin" \
+    --dataset.num_episodes=5 \
     --dataset.fps=30 \
-    --display_data=true
+    --display_data=true \
+    --dataset.push_to_hub=false \
+    --resume=true
 
 # Manually push to hub after recording:
-python -c "from lerobot.datasets.lerobot_dataset import LeRobotDataset; \
-    dataset = LeRobotDataset('Odog16/test_transfer_block_2'); \
+# HF_DATASETS_CACHE=/tmp bypasses any corrupt Arrow cache from a previous interrupted load
+HF_DATASETS_CACHE=/tmp/hf_datasets_tmp python -c "from lerobot.datasets.lerobot_dataset import LeRobotDataset; \
+    dataset = LeRobotDataset('Odog16/block_sorting_single'); \
     dataset.push_to_hub()"
 
 # Local data location: ~/.cache/huggingface/lerobot/Odog16/ob15_test_1/
@@ -199,7 +270,7 @@ python -c "from lerobot.datasets.lerobot_dataset import LeRobotDataset; \
 # Videos: videos/chunk-000/observation.images.*/episode_*.mp4
 
 # Delete local dataset (if you want to start fresh):
-rm -rf ~/.cache/huggingface/lerobot/Odog16/test_transfer_block_2
+rm -rf ~/.cache/huggingface/lerobot/Odog16/tool_pickup
 
 # =============================================================================
 # PERFORMANCE TIPS
@@ -267,32 +338,42 @@ python -m lerobot.async_inference.policy_server \
 #          Set server_address to the external GPU machine's IP (same LAN as Jetson).
 # ACT example (use the _policy repo, not the dataset repo):
 python -m lerobot.async_inference.robot_client \
-    --server_address=10.249.39.211:8080 \
+    --server_address=10.249.40.91:8080 \
     --robot.type=xlerobot \
-    --task="take coffee from blue place it in the machine, then place it on the yellow." \
+    --task="sort the blocks by color" \
     --policy_type=act \
-    --pretrained_name_or_path=Odog16/act_making_coffee_policy_60k\
+    --pretrained_name_or_path=Odog16/100k_4_block_sorting\
     --policy_device=cuda \
-    --actions_per_chunk=80\
-    --chunk_size_threshold=0.25 \
-    --aggregate_fn_name="weighted_average" \
+    --actions_per_chunk=60\
+    --chunk_size_threshold=0.5 \
+    --aggregate_fn_name="latest_only" \
     --fps=30
 
-
+python -m lerobot.async_inference.robot_client \
+    --server_address=10.249.36.224:8080 \
+    --robot.type=xlerobot \
+    --task="pick up the tools from the table and place it in the red bin" \
+    --policy_type=act \
+    --pretrained_name_or_path=Odog16/tool_pickup_ACT_policy_B\
+    --policy_device=cuda \
+    --actions_per_chunk=40\
+    --chunk_size_threshold=0.5 \
+    --aggregate_fn_name="average" \
+    --fps=30
 
 
 
 # Diffusion example:
 python -m lerobot.async_inference.robot_client \
-    --server_address=10.249.43.224:8080 \
+    --server_address=10.249.36.224:8080 \
     --robot.type=xlerobot \
-    --task="transfer the block" \
+    --task="pick up the tools from the table and place it in the red bin" \
     --policy_type=diffusion \
-    --pretrained_name_or_path=Odog16/test_transfer_block_diffusion \
+    --pretrained_name_or_path=Odog16/tool_pickup_diffusion_1obs_policy \
     --policy_device=cuda \
-    --actions_per_chunk=80 \
-    --chunk_size_threshold=0.3 \
-    --aggregate_fn_name="weighted_average" \
+    --actions_per_chunk=10 \
+    --chunk_size_threshold=0.5 \
+    --aggregate_fn_name="average" \
     --fps=30
 
 

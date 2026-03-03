@@ -33,10 +33,16 @@ from .constants import ACTION, ACTION_PREFIX, OBS_PREFIX, OBS_STR
 # ---------------------------------------------------------------------------
 # The main control loop drops data into this queue and immediately continues.
 # A single daemon thread drains the queue and calls the actual rerun logging.
-# Queue size of 5 provides ~150ms buffer (5 frames @ 30Hz). If the network
-# is slow, new frames are dropped rather than blocking the control loop.
+# Queue maxsize=3: buffers a few frames so the viewer looks smoother when the
+# worker briefly falls behind (JPEG encoding 3 cams on Jetson can take >33ms).
+# Frames are dropped when full — visualization never blocks the control loop.
+#
+# Why Rerun FPS can be slow:
+# - This worker runs per frame: downsample, JPEG encode (3 cams), rr.log. On Jetson that can be >33ms.
+# - Tune with: RERUN_DOWNSAMPLE_FACTOR=0.2, RERUN_JPEG_QUALITY=55, RERUN_LOG_FREQUENCY=2
+# - RERUN_LOG_FREQUENCY=2 logs every other frame, halving viz CPU load while keeping it smooth.
 
-_viz_queue: queue.Queue = queue.Queue(maxsize=1)
+_viz_queue: queue.Queue = queue.Queue(maxsize=3)
 _viz_thread: threading.Thread | None = None
 
 
@@ -97,7 +103,7 @@ def init_rerun(
     grpc_port: int = 9876,
     web_port: int = 9090,
     open_browser: bool = False,
-    server_memory_limit: str = "25%",
+    server_memory_limit: str = "200MB",
 ) -> None:
     """Initializes the Rerun SDK for visualizing the control loop.
     
@@ -120,16 +126,22 @@ def init_rerun(
         To view data, run the web viewer on your external computer (with GPU):
             rerun --serve-web --web-viewer-port 9090 --connect "rerun+http://JETSON_IP:9876/proxy"
         Then open http://localhost:9090 on your external computer's browser.
+
+        Live / low-latency streaming:
+        - RERUN_FLUSH_TICK_SECS (default 0.008): flush interval in seconds. 0.008 = 8ms (~1 frame at 120Hz).
+          Set to 0.002 for minimal latency, or 0.033 for one frame at 30Hz.
+        - RERUN_FLUSH_NUM_BYTES (default 64000): flush when this many bytes are buffered. Lower = more
+          frequent flushes and lower latency, higher = fewer network round-trips.
+        - RERUN_LOG_FREQUENCY=1 (default): log every frame; >1 skips frames and increases latency.
     """
-    # Increase flush batch size for better throughput (reduces network round trips)
-    # Larger batch = fewer network calls = lower latency
-    batch_size = os.getenv("RERUN_FLUSH_NUM_BYTES", "64000")  # Increased from 32000 for even better throughput
+    # Low-latency flush: send data to the viewer frequently so streaming feels live.
+    # Must be set before rr.init(). Rerun's default is 200ms; we use 8ms for streaming.
+    flush_tick = os.getenv("RERUN_FLUSH_TICK_SECS", "0.008")
+    os.environ["RERUN_FLUSH_TICK_SECS"] = flush_tick
+
+    batch_size = os.getenv("RERUN_FLUSH_NUM_BYTES", "16000")
     os.environ["RERUN_FLUSH_NUM_BYTES"] = batch_size
-    
-    # Set flush frequency to reduce overhead (flush less frequently for better throughput)
-    flush_frequency = os.getenv("RERUN_FLUSH_FREQUENCY", "10")  # Flush every 10 frames
-    os.environ["RERUN_FLUSH_FREQUENCY"] = flush_frequency
-    
+
     rr.init(session_name)
     
     # Upstream compatibility: if ip and port are provided, use upstream's logic
@@ -236,9 +248,11 @@ def _log_rerun_data_sync(
 ) -> None:
     """Synchronous implementation (runs in the background viz thread)."""
     # Get configuration from environment
-    downsample_factor = float(os.getenv("RERUN_DOWNSAMPLE_FACTOR", "0.33"))
-    skip_depth = os.getenv("RERUN_SKIP_DEPTH", "false").lower() in ("true", "1", "yes")
-    log_frequency = int(os.getenv("RERUN_LOG_FREQUENCY", "1"))
+    # Default 0.5: readable for teleop, lightweight. Use downsample OR cv2 JPEG, not both heavy steps.
+    downsample_factor = float(os.getenv("RERUN_DOWNSAMPLE_FACTOR", "0.3"))
+    skip_depth = os.getenv("RERUN_SKIP_DEPTH", "true").lower() in ("true", "1", "yes")
+    # int(float(...)) avoids ValueError if user sets e.g. RERUN_LOG_FREQUENCY=0.25. Default 1 = every frame.
+    log_frequency = int(float(os.getenv("RERUN_LOG_FREQUENCY", "1")))
 
     # Frame counter for logging frequency
     if not hasattr(_log_rerun_data_sync, "_frame_counter"):
@@ -254,13 +268,9 @@ def _log_rerun_data_sync(
             if v is None:
                 continue
             
-            # Skip depth images in visualization to improve performance
-            # Only head camera has depth (RealSense), wrist cameras are RGB-only
-            # Depth images are still collected in the dataset, just not visualized
-            # Can be controlled via RERUN_SKIP_DEPTH env var (defaults to skipping for performance)
-            if (skip_depth or True) and ("_depth" in str(k).lower() or k.endswith("_depth")):
+            # Skip depth in viz when RERUN_SKIP_DEPTH=true (default). No (skip_depth or True) so env is respected.
+            if ("_depth" in str(k).lower() or k.endswith("_depth")) and skip_depth:
                 continue
-            
             key = k if str(k).startswith(OBS_PREFIX) else f"{OBS_STR}.{k}"
 
             if _is_scalar(v):
@@ -280,29 +290,42 @@ def _log_rerun_data_sync(
                     logger.debug(f"📊 Depth image detected: {k}, shape={arr.shape}, dtype={arr.dtype}")
                     setattr(_log_rerun_data_sync, f"_depth_logged_{k}", True)
                 
-                # Downsample images before sending to Rerun (for both 2D and 3D images)
-                if is_image:
-                    # Use more aggressive downsampling for depth images
+                # Downsample only when factor < 1 (avoid double-encoding: downsample then one encode step)
+                if is_image and downsample_factor < 1.0:
                     depth_factor = downsample_factor * 0.5 if is_depth else downsample_factor
                     arr = _downsample_image(arr, depth_factor)
-                
+
                 # Convert CHW -> HWC when needed (only for 3D arrays)
                 if arr.ndim == 3 and arr.shape[0] in (1, 3, 4) and arr.shape[-1] not in (1, 3, 4):
                     arr = np.transpose(arr, (1, 2, 0))
-                
+
                 if arr.ndim == 1:
                     for i, vi in enumerate(arr):
                         rr.log(f"{key}_{i}", rr.Scalars(float(vi)))
-                else:
-                    # Always compress images for lower latency (JPEG compression reduces bandwidth significantly)
-                    # Compression is faster than sending uncompressed data over network
-                    # BUT: Skip compression for uint16 depth images (JPEG only supports uint8)
-                    if (compress_images or is_image) and not is_depth:
-                        img_entity = rr.Image(arr).compress()
+                elif is_image and not is_depth:
+                    # Always compress with cv2 JPEG — raw frames (~691KB each) saturate WiFi during
+                    # fast motion. Unconditional so it works even without --display_ip/--display_port.
+                    if arr.shape[-1] == 3:
+                        bgr = cv2.cvtColor(arr, cv2.COLOR_RGB2BGR)
                     else:
-                        img_entity = rr.Image(arr)
-                    # Remove static=True for live video streams (causes latency)
-                    rr.log(key, entity=img_entity, static=False)
+                        bgr = arr
+                    quality = int(os.getenv("RERUN_JPEG_QUALITY", "60"))
+                    success, encoded = cv2.imencode(
+                        ".jpg", bgr, [cv2.IMWRITE_JPEG_QUALITY, quality]
+                    )
+                    if success:
+                        rr.log(
+                            key,
+                            rr.ImageEncoded(
+                                contents=bytes(encoded),
+                                format=rr.ImageFormat.JPEG,
+                            ),
+                            static=False,
+                        )
+                    else:
+                        rr.log(key, rr.Image(arr), static=False)
+                else:
+                    rr.log(key, rr.Image(arr), static=False)
 
     if action:
         for k, v in action.items():

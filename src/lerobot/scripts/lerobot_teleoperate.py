@@ -158,14 +158,15 @@ def teleop_loop(
 
     # Frame counter for camera reads (read cameras every Nth frame for visualization)
     frame_counter = 0
-    camera_read_interval = 2  # Read cameras every 2 frames (15 Hz instead of 30 Hz)
+    # When display_data=True, read cameras every frame so Rerun gets full FPS (30 Hz).
+    # When display_data=False, no need to read cameras for control.
+    camera_read_interval = 1 if display_data else 2
     last_camera_obs = {}
-    
+
     while True:
         loop_start = time.perf_counter()
 
-        # Get robot observation - skip cameras for control loop (faster)
-        # Only read cameras periodically for visualization
+        # Get robot observation - skip cameras for control loop (faster) unless displaying
         read_cameras_this_frame = (frame_counter % camera_read_interval == 0) if display_data else False
         obs = robot.get_observation(skip_cameras=not read_cameras_this_frame, skip_depth=True)
         
