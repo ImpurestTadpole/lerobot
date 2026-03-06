@@ -42,7 +42,7 @@ from lerobot.policies.factory import get_policy_class, make_pre_post_processors
 from lerobot.policies.rtc.configuration_rtc import RTCConfig
 from lerobot.policies.utils import populate_queues
 from lerobot.configs.types import RTCAttentionSchedule
-from lerobot.utils.constants import OBS_IMAGES, OBS_STATE, OBS_ENV_STATE
+from lerobot.utils.constants import OBS_IMAGES, OBS_LANGUAGE_ATTENTION_MASK, OBS_LANGUAGE_TOKENS, OBS_STATE, OBS_ENV_STATE
 from lerobot.processor import (
     PolicyAction,
     PolicyProcessorPipeline,
@@ -228,6 +228,13 @@ class PolicyServer(services_pb2_grpc.AsyncInferenceServicer):
             self.use_amp = False
 
         # Load preprocessor and postprocessor, overriding device to match requested device
+        # NOTE: some processors (e.g. SmolVLA-specific ones) are registered on import only.
+        # Make sure their module is imported before loading the processor pipeline.
+        if self.policy_type == "smolvla":
+            import importlib
+
+            importlib.import_module("lerobot.policies.smolvla.processor_smolvla")
+
         device_override = {"device": self.device}
         self.preprocessor, self.postprocessor = make_pre_post_processors(
             self.policy.config,
@@ -426,9 +433,33 @@ class PolicyServer(services_pb2_grpc.AsyncInferenceServicer):
 
         """2. Apply preprocessor"""
         start_preprocess = time.perf_counter()
+        task_str = observation_t.get_observation().get("task", "")
+        if task_str:
+            observation["task"] = task_str
         observation = self.preprocessor(observation)
         self.last_processed_obs: TimedObservation = observation_t
         preprocessing_time = time.perf_counter() - start_preprocess
+
+        # Defensive fallback: if the preprocessor pipeline loaded from Hub didn't include
+        # a TokenizerProcessorStep (e.g. older saved pipeline), tokenize the task directly
+        # using the SmolVLA model's own built-in tokenizer so inference can proceed.
+        if self.policy_type == "smolvla" and OBS_LANGUAGE_TOKENS not in observation:
+            raw_obs = observation_t.get_observation()
+            task = raw_obs.get("task", "")
+            if isinstance(task, str):
+                task = [task]
+            vlm_tokenizer = self.policy.model.vlm_with_expert.processor.tokenizer
+            tokenized = vlm_tokenizer(
+                task,
+                max_length=512,
+                truncation=True,
+                padding="max_length",
+                padding_side="right",
+                return_tensors="pt",
+            )
+            device = next(self.policy.parameters()).device
+            observation[OBS_LANGUAGE_TOKENS] = tokenized["input_ids"].to(device)
+            observation[OBS_LANGUAGE_ATTENTION_MASK] = tokenized["attention_mask"].bool().to(device)
 
         """3. Populate queues for queue-based policies (e.g., Diffusion)"""
         if getattr(self.policy, "_queues", None) is not None:
@@ -449,23 +480,24 @@ class PolicyServer(services_pb2_grpc.AsyncInferenceServicer):
             # Add OBS_IMAGES
             if self.policy.config.image_features:
                 if OBS_IMAGES in observation and observation[OBS_IMAGES] is not None:
-                    # Preprocessor already created OBS_IMAGES
+                    # Preprocessor already created a stacked OBS_IMAGES (e.g. ACT/Diffusion)
                     obs_for_queues[OBS_IMAGES] = observation[OBS_IMAGES]
                 else:
-                    # Stack individual image keys
-                    img_tensors = []
+                    # Keep individual camera keys so per-camera policies (e.g. SmolVLA) can
+                    # look up each key by name. Stacking into a single OBS_IMAGES tensor here
+                    # would cause "All image features are missing" for SmolVLA.
+                    any_image_added = False
                     for img_key in self.policy.config.image_features:
                         if img_key in observation and observation[img_key] is not None:
-                            img_tensors.append(observation[img_key])
+                            obs_for_queues[img_key] = observation[img_key]
+                            any_image_added = True
                         else:
-                            # Create zero tensor for missing image
                             cfg = self.policy.config.image_features[img_key]
-                            img_tensors.append(torch.zeros(
+                            obs_for_queues[img_key] = torch.zeros(
                                 (1,) + tuple(cfg.shape), device=device, dtype=torch.float32
-                            ))
-                    
-                    if img_tensors:
-                        obs_for_queues[OBS_IMAGES] = torch.stack(img_tensors, dim=-4)
+                            )
+                            any_image_added = True
+                    _ = any_image_added  # used implicitly via obs_for_queues
             
             # Add OBS_ENV_STATE if policy expects it
             if getattr(self.policy.config, "env_state_feature", None):
@@ -478,9 +510,17 @@ class PolicyServer(services_pb2_grpc.AsyncInferenceServicer):
                         (1,) + tuple(cfg.shape), device=device, dtype=torch.float32
                     )
             
+            # Pass through any other preprocessed keys not explicitly handled above
+            # (e.g. observation.language.tokens / observation.language.attention_mask for
+            # VLA models like SmolVLA). populate_queues ignores keys absent from _queues,
+            # so this is safe to do before the populate call.
+            for key, val in observation.items():
+                if key not in obs_for_queues:
+                    obs_for_queues[key] = val
+
             # Populate the policy's queues
             populate_queues(self.policy._queues, obs_for_queues)
-            
+
             # Use obs_for_queues for inference
             observation = obs_for_queues
 

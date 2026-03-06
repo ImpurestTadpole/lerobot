@@ -322,12 +322,7 @@ lerobot-train \
 # Policy runs on the external machine; Jetson runs the robot client over the network.
 #
 # Step 1 — ON EXTERNAL GPU MACHINE (PC with CUDA): start the policy server
-python -m lerobot.async_inference.policy_server \
-    --host=0.0.0.0 \
-    --port=8080 \
-    --fps=30 \
-    --inference_latency=0.033 \
-    --obs_queue_timeout=1
+
 # If you see "stack expects a non-empty TensorList" (e.g. diffusion on first frame):
 # 1) Sync lerobot code to the GPU machine: the fix is in src/lerobot/policies/diffusion/modeling_diffusion.py
 #    (predict_action_chunk handles empty queues). Copy from Jetson or: git pull / same branch on both.
