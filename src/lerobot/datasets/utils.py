@@ -22,7 +22,7 @@ from collections import deque
 from collections.abc import Iterable, Iterator
 from pathlib import Path
 from pprint import pformat
-from typing import Any, Generic, TypeVar
+from typing import Any
 
 import datasets
 import numpy as np
@@ -78,8 +78,6 @@ DEFAULT_FEATURES = {
     "index": {"dtype": "int64", "shape": (1,), "names": None},
     "task_index": {"dtype": "int64", "shape": (1,), "names": None},
 }
-
-T = TypeVar("T")
 
 
 def get_parquet_file_size_in_mb(parquet_path: str | Path) -> float:
@@ -1338,7 +1336,7 @@ class LookAheadError(Exception):
     pass
 
 
-class Backtrackable(Generic[T]):
+class Backtrackable[T]:
     """
     Wrap any iterator/iterable so you can step back up to `history` items
     and look ahead up to `lookahead` items.
