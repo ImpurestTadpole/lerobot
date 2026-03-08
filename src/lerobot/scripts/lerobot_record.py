@@ -414,6 +414,8 @@ def record_loop(
             # Update teleop's observation cache to avoid double reads (for VR teleop)
             if hasattr(teleop, 'update_observation_cache'):
                 teleop.update_observation_cache(obs)
+            if robot.name == "unitree_g1":
+                teleop.send_feedback(obs)
             act = teleop.get_action()
 
             # Applies a pipeline to the raw teleop action, default is IdentityProcessor
@@ -708,10 +710,6 @@ def record(cfg: RecordConfig) -> LeRobotDataset:
                 # Skip reset for the last episode to be recorded
                 if not events["stop_recording"] and recorded_episodes < cfg.dataset.num_episodes:
                     log_say("Reset the environment", cfg.play_sounds)
-
-                    # reset g1 robot
-                    if robot.name == "unitree_g1":
-                        robot.reset()
 
                     record_loop(
                         robot=robot,

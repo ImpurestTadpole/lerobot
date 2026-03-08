@@ -60,6 +60,7 @@ import rerun as rr
 
 from lerobot.cameras.opencv.configuration_opencv import OpenCVCameraConfig  # noqa: F401
 from lerobot.cameras.realsense.configuration_realsense import RealSenseCameraConfig  # noqa: F401
+from lerobot.cameras.zmq.configuration_zmq import ZMQCameraConfig  # noqa: F401
 from lerobot.configs import parser
 from lerobot.processor import (
     RobotAction,
@@ -181,7 +182,9 @@ def teleop_loop(
         
         # Update teleop's observation cache to avoid double reads (for VR teleop)
         if hasattr(teleop, 'update_observation_cache'):
-            teleop.update_observation_cache(obs) ##Changes made here
+            teleop.update_observation_cache(obs)
+        if robot.name == "unitree_g1":
+            teleop.send_feedback(obs)
 
         # Get teleop action (will use cached observation if available)
         raw_action = teleop.get_action()
