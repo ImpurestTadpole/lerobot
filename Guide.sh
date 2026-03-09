@@ -1,8 +1,23 @@
 # =============================================================================
 # SETUP
 # =============================================================================
-# Activate conda environment
+# LeRobot requires Python >=3.12. Use a single conda environment (no venv).
+
+# ONE-TIME: Create conda env with Python 3.12 and install lerobot
+# conda create -n lerobot python=3.12 -y
+# conda activate lerobot
+# cd /home/owen/lerobot   # or your path
+# pip install -e ".[dev]"
+
+# Every session: activate conda only (do not activate .venv)
 conda activate lerobot
+
+# GPU required for inference on this device (training is done elsewhere).
+# If lerobot-info shows "CUDA support?: False" but nvidia-smi works, run once (with lerobot active):
+#   bash scripts/setup_cuda_env.sh
+# Then open a NEW terminal (or run conda deactivate, then conda activate lerobot) so the hook runs.
+# Verify: conda activate lerobot && lerobot-info  → should show CUDA True and GPU model.
+# See also: docs/source/torch_accelerators.mdx (CUDA troubleshooting).
 
 # Set USB permissions (run every time after reboot or USB reconnect)
 sudo chmod 666 /dev/ttyACM0 /dev/ttyACM1

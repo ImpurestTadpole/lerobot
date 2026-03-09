@@ -25,6 +25,22 @@ import torch
 print(torch.<backend_name>.is_available())  # <backend_name> is cuda, mps, or xpu
 ```
 
+### CUDA: PyTorch built with CUDA but `torch.cuda.is_available()` is False
+
+If `nvidia-smi` works but `torch.cuda.is_available()` returns `False`, the CUDA runtime libraries may not be visible to Python. Try:
+
+1. **Set `LD_LIBRARY_PATH`** so the driver and PyTorch’s CUDA libs are found (adjust paths to your install):
+   ```bash
+   export LD_LIBRARY_PATH="/usr/lib/x86_64-linux-gnu:$CONDA_PREFIX/lib/python3.12/site-packages/torch/lib:$LD_LIBRARY_PATH"
+   ```
+   Add this after `conda activate lerobot` in your shell config (e.g. `~/.bashrc`) to make it permanent, or use a [conda activate hook](https://docs.conda.io/projects/conda/en/latest/user-guide/tasks/manage-environments.html#saving-environment-variables).
+
+2. **Install PyTorch via conda** so the environment is self-contained (use a CUDA version offered by conda, e.g. 12.4 or 12.1):
+   ```bash
+   conda install pytorch torchvision pytorch-cuda=12.4 -c pytorch -c nvidia
+   ```
+   If that fails, search [anaconda.org](https://anaconda.org) for `pytorch-cuda` to see available versions.
+
 ## How to run training or evaluation
 
 To select the desired accelerator, use the `--policy.device` flag when running `lerobot-train` or `lerobot-eval`. For example, to use MPS on Apple Silicon, run:
