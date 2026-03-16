@@ -39,10 +39,6 @@ import grpc
 import torch
 
 from lerobot.policies.factory import get_policy_class, make_pre_post_processors
-from lerobot.policies.rtc.configuration_rtc import RTCConfig
-from lerobot.policies.utils import populate_queues
-from lerobot.configs.types import RTCAttentionSchedule
-from lerobot.utils.constants import OBS_IMAGES, OBS_LANGUAGE_ATTENTION_MASK, OBS_LANGUAGE_TOKENS, OBS_STATE, OBS_ENV_STATE
 from lerobot.processor import (
     PolicyAction,
     PolicyProcessorPipeline,
@@ -52,6 +48,7 @@ from lerobot.transport import (
     services_pb2_grpc,  # type: ignore
 )
 from lerobot.transport.utils import receive_bytes_in_chunks
+from lerobot.types import PolicyAction
 
 from .configs import PolicyServerConfig
 from .constants import SUPPORTED_POLICIES
