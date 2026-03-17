@@ -24,17 +24,24 @@ from pathlib import Path
 
 import datasets
 import numpy as np
+import packaging.version
 import pandas as pd
 import PIL.Image
+import pyarrow as pa
 import pyarrow.parquet as pq
 import torch
 import torch.utils
 from huggingface_hub import HfApi, snapshot_download
 from huggingface_hub.errors import RevisionNotFoundError
 
-from lerobot.datasets.compute_stats import compute_episode_stats
-from lerobot.datasets.dataset_metadata import CODEBASE_VERSION, LeRobotDatasetMetadata
+from lerobot.datasets.compute_stats import aggregate_stats, compute_episode_stats
+from lerobot.datasets.dataset_metadata import (
+    CODEBASE_VERSION,
+    LeRobotDatasetMetadata,
+    create_empty_dataset_info,
+)
 from lerobot.datasets.feature_utils import (
+    _validate_feature_names,
     check_delta_timestamps,
     get_delta_indices,
     get_hf_features_from_features,
@@ -47,13 +54,24 @@ from lerobot.datasets.io_utils import (
     get_file_size_in_mb,
     hf_transform_to_torch,
     load_episodes,
+    load_info,
     load_nested_dataset,
+    load_stats,
+    load_subtasks,
+    load_tasks,
     write_info,
+    write_json,
+    write_stats,
+    write_tasks,
 )
 from lerobot.datasets.utils import (
     DEFAULT_EPISODES_PATH,
+    DEFAULT_FEATURES,
     DEFAULT_IMAGE_PATH,
+    INFO_PATH,
+    check_version_compatibility,
     create_lerobot_dataset_card,
+    flatten_dict,
     get_safe_version,
     is_valid_version,
     update_chunk_file_indices,
@@ -65,9 +83,12 @@ from lerobot.datasets.video_utils import (
     encode_video_frames,
     get_safe_default_codec,
     get_video_duration_in_s,
+    get_video_info,
     resolve_vcodec,
 )
 from lerobot.utils.constants import HF_LEROBOT_HOME
+
+logger = logging.getLogger(__name__)
 
 CODEBASE_VERSION = "v3.0"
 
@@ -235,6 +256,11 @@ class LeRobotDatasetMetadata:
     def image_keys(self) -> list[str]:
         """Keys to access visual modalities stored as images."""
         return [key for key, ft in self.features.items() if ft["dtype"] == "image"]
+
+    @property
+    def depth_keys(self) -> list[str]:
+        """Keys to access depth modalities stored as depth images."""
+        return [key for key, ft in self.features.items() if ft["dtype"] == "depth"]
 
     @property
     def video_keys(self) -> list[str]:

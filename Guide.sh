@@ -191,6 +191,21 @@ lerobot-record \
     --dataset.push_to_hub=true \
     --resume=true 
 
+
+
+
+lerobot-record \
+    --robot.type=xlerobot \
+    --teleop.type=xlerobot_vr \
+    --dataset.repo_id=Odog16/trash_pickup  \
+    --dataset.single_task="pick up the plastic bottle and place it in the trash bin" \
+    --dataset.num_episodes=10 \
+    --dataset.fps=30 \
+    --display_data=true \
+    --dataset.push_to_hub=false \
+    --resume=true 
+
+
 # Rerun live-view tuning — set before ANY lerobot-record call.
 # server_memory_limit is now 200MB in code (was 55% = ~4.4GB on 8GB Jetson).
 # A large buffer causes the viewer to replay gigabytes of old data when it
@@ -348,16 +363,39 @@ lerobot-train \
 #          Set server_address to the external GPU machine's IP (same LAN as Jetson).
 # ACT example (use the _policy repo, not the dataset repo):
 python -m lerobot.async_inference.robot_client \
-    --server_address=10.249.40.91:8080 \
+    --server_address=10.249.34.90:8080 \
     --robot.type=xlerobot \
-    --task="sort the blocks by color" \
-    --policy_type=act \
-    --pretrained_name_or_path=Odog16/100k_4_block_sorting\
+    --task="pick up the yellow block and place it in the yellow bowl" \
+    --policy_type=smolvla \
+    --pretrained_name_or_path=Odog16/block_sorting_SmolVLA_v5_15k\
     --policy_device=cuda \
-    --actions_per_chunk=60\
+    --actions_per_chunk=35 \
     --chunk_size_threshold=0.5 \
-    --aggregate_fn_name="latest_only" \
+    --aggregate_fn_name="average" \
     --fps=30
+
+###
+
+python -m lerobot.async_inference.robot_client \
+    --server_address=10.249.34.90:8080 \
+    --robot.type=xlerobot \
+    --task="pick up the red block and place it in the blue bowl" \
+    --policy_type=smolvla \
+    --pretrained_name_or_path=Odog16/block_sorting_SmolVLA_8k \
+    --policy_device=cuda \
+    --actions_per_chunk=30 \
+    --chunk_size_threshold=0.5 \
+    --aggregate_fn_name=average \
+    --fps=30
+
+python -m lerobot.async_inference.policy_server \
+  --host=0.0.0.0 \
+  --port=8080 \
+  --fps=30 \
+  --inference_latency=0.033 \
+  --obs_queue_timeout=1.0
+
+
 
 python -m lerobot.async_inference.robot_client \
     --server_address=10.249.36.224:8080 \
