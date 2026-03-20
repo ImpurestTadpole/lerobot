@@ -108,8 +108,8 @@ def xlerobot_cameras_config() -> dict[str, CameraConfig]:
 class XLerobotConfig(RobotConfig):
     
     # Port 0 = left arm + base. Port 1 = right arm + head + (optional) lift axis.
-    port1: str = "/dev/ttyACM1"  # left arm motors 1-6 + base motors 7-9
-    port2: str = "/dev/ttyACM0"  # right arm motors 1-6 + head motors 7-8 + lift (motor 9)
+    port1: str = "/dev/ttyACM0"  # left arm motors 1-6 + base motors 7-9
+    port2: str = "/dev/ttyACM1"  # right arm motors 1-6 + head motors 7-8 + lift (motor 9)
     camera_start_order: tuple[str, ...] | None = ("head", "left_wrist", "right_wrist")
     camera_start_delay_s: float = 2.0  # Increased delay to allow cameras to initialize properly (especially right_wrist)
     disable_torque_on_disconnect: bool = True

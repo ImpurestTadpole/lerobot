@@ -37,7 +37,7 @@ class LiftAxisConfig:
     output_gear_ratio: float = 1.0
     home_at_top: bool = True  # Home at top; after backoff, disabling torque lets gravity pull to safe position
     soft_min_mm: float = 5.0
-    soft_max_mm: float = 555.0
+    soft_max_mm: float = 575.0
 
     # Homing
     home_down_speed: int = 1300
