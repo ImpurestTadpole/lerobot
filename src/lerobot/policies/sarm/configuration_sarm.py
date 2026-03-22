@@ -34,23 +34,27 @@ from lerobot.utils.constants import OBS_IMAGES, OBS_STATE
 class SARMConfig(PreTrainedConfig):
     """Configuration class for SARM (Stage-Aware Reward Modeling).
 
-    Supports three annotation modes:
+    Supports four annotation modes:
 
     1. single_stage (default): No annotations needed. Uses the episode's task description
        as a single stage covering the entire episode.
 
-    2. dense_only: Uses dense (fine-grained) annotations from VLM, with an auto-generated
+    2. sparse_only: Sparse (high-level) VLM annotations only. Loads
+       ``meta/temporal_proportions_sparse.json`` and episode ``sparse_*`` columns; no dense
+       head and no ``temporal_proportions_dense.json`` required.
+
+    3. dense_only: Uses dense (fine-grained) annotations from VLM, with an auto-generated
        single sparse "task" stage covering the full episode. The dense head learns detailed
        subtask progression while sparse provides overall task completion.
 
-    3. dual: Full dual-head mode with both sparse (high-level) and dense (fine-grained)
+    4. dual: Full dual-head mode with both sparse (high-level) and dense (fine-grained)
        annotations from VLM. Both heads are trained on their respective annotations.
 
     The annotation_mode determines how sparse_temporal_proportions and dense_temporal_proportions
     are loaded/generated during model initialization.
     """
 
-    annotation_mode: str = "single_stage"  # "single_stage", "dense_only", or "dual"
+    annotation_mode: str = "single_stage"  # "single_stage", "sparse_only", "dense_only", or "dual"
     n_obs_steps: int = 8  # Number of observation history steps
     frame_gap: int = 30  # Frame gap between frames (at 30 fps = 1 second)
     max_rewind_steps: int = 4  # Maximum rewind steps for temporal augmentation
@@ -113,9 +117,10 @@ class SARMConfig(PreTrainedConfig):
     def __post_init__(self):
         super().__post_init__()
 
-        if self.annotation_mode not in ["single_stage", "dense_only", "dual"]:
+        if self.annotation_mode not in ["single_stage", "sparse_only", "dense_only", "dual"]:
             raise ValueError(
-                f"annotation_mode must be 'single_stage', 'dense_only', or 'dual', got {self.annotation_mode}"
+                f"annotation_mode must be 'single_stage', 'sparse_only', 'dense_only', or 'dual', "
+                f"got {self.annotation_mode}"
             )
 
         if self.annotation_mode == "single_stage":
@@ -123,6 +128,11 @@ class SARMConfig(PreTrainedConfig):
             self.num_sparse_stages = 1
             self.sparse_subtask_names = ["task"]
             self.sparse_temporal_proportions = [1.0]
+            self.num_dense_stages = None
+            self.dense_subtask_names = None
+            self.dense_temporal_proportions = None
+
+        elif self.annotation_mode == "sparse_only":
             self.num_dense_stages = None
             self.dense_subtask_names = None
             self.dense_temporal_proportions = None

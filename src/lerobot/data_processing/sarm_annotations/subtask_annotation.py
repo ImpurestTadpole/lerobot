@@ -15,49 +15,18 @@
 # limitations under the License.
 
 """
-SARM Subtask Annotation using local GPU (Qwen3-VL).
+SARM subtask annotation (VLM). On-disk format: https://huggingface.co/docs/lerobot/en/sarm
 
-This script implements the annotation approach from the SARM paper using local GPU inference:
-"SARM: Stage-Aware Reward Modeling for Long Horizon Robot Manipulation"
+**Important:** Qwen2-VL checkpoints (2B/7B/…) must load with Qwen2VLForConditionalGeneration.
+Loading them with Qwen3VLMoeForConditionalGeneration corrupts init, uses ~22GB VRAM, and OOMs.
+
 Paper: https://arxiv.org/pdf/2509.25358
-
-What it does:
-1. Takes videos from a LeRobot dataset
-2. Uses Qwen3-VL running locally on GPU to identify when subtasks occur
-3. Saves subtask timestamps to the dataset metadata
-4. Optionally pushes the annotated dataset to HuggingFace Hub
-
-SARM trains reward models that predict:
-  - Stage: Which subtask is currently being executed (discrete classification)
-  - Progress: How far along the subtask we are (continuous 0-1)
-
-Supports three annotation modes:
-  1. No annotations (no args): Auto-creates single sparse "task" stage covering full episode.
-     Use with SARM config annotation_mode="single_stage" for simple tasks.
-
-  2. Dense-only (--dense-only --dense-subtasks): Dense annotations from VLM, auto-generated
-     single sparse "task" stage. Use with annotation_mode="dense_only".
-
-  3. Dual mode (--sparse-subtasks + --dense-subtasks): Both sparse and dense annotations
-     from VLM. Use with annotation_mode="dual".
-
-Requirements:
-  - GPU with sufficient VRAM (16GB+ recommended for 30B model)
-  - `pip install transformers, torch, qwen-vl-utils`
-
-Run with:
-```bash
-python examples/dataset_annotation/subtask_annotation.py \
-  --repo-id your-username/your-dataset \
-  --sparse-subtasks "Do ..." \
-  --dense-subtasks "Do task 1, Do task 2, Do task 3" \
-  --video-key observation.images.base \
-  --push-to-hub
-```
 """
 
 import argparse
+import difflib
 import json
+import os
 import multiprocessing as mp
 import random
 import re
@@ -74,9 +43,61 @@ import numpy as np
 import pandas as pd
 import torch
 from pydantic import BaseModel, Field
-from transformers import AutoProcessor, Qwen3VLMoeForConditionalGeneration
+from transformers import AutoConfig, AutoProcessor
 
 from lerobot.datasets.lerobot_dataset import LeRobotDataset
+
+
+def _device_map_arg(device: str) -> str | dict[str, int] | None:
+    if device == "cpu":
+        return None
+    if device == "cuda":
+        return {"": 0}
+    if device.startswith("cuda:"):
+        return {"": int(device.split(":", 1)[1])}
+    return "auto"
+
+
+def load_qwen_vl_model_and_processor(
+    model_name: str,
+    device: str,
+    torch_dtype: torch.dtype,
+) -> tuple[Any, Any]:
+    """Load the HF class that matches the checkpoint (qwen2_vl vs qwen3_vl_moe, etc.)."""
+    config = AutoConfig.from_pretrained(model_name, trust_remote_code=True)
+    model_type = getattr(config, "model_type", "")
+    processor = AutoProcessor.from_pretrained(model_name, trust_remote_code=True)
+    device_map = _device_map_arg(device)
+    common_kw: dict[str, Any] = {
+        "torch_dtype": torch_dtype,
+        "trust_remote_code": True,
+        "low_cpu_mem_usage": True,
+    }
+    if device_map is not None:
+        common_kw["device_map"] = device_map
+
+    if model_type == "qwen2_vl":
+        from transformers import Qwen2VLForConditionalGeneration
+
+        model = Qwen2VLForConditionalGeneration.from_pretrained(model_name, **common_kw)
+    elif model_type == "qwen2_5_vl":
+        from transformers import Qwen2_5_VLForConditionalGeneration
+
+        model = Qwen2_5_VLForConditionalGeneration.from_pretrained(model_name, **common_kw)
+    elif model_type == "qwen3_vl":
+        from transformers import Qwen3VLForConditionalGeneration
+
+        model = Qwen3VLForConditionalGeneration.from_pretrained(model_name, **common_kw)
+    elif model_type == "qwen3_vl_moe":
+        from transformers import Qwen3VLMoeForConditionalGeneration
+
+        model = Qwen3VLMoeForConditionalGeneration.from_pretrained(model_name, **common_kw)
+    else:
+        raise ValueError(f"Unsupported VLM model_type={model_type!r} for {model_name!r}")
+
+    if device_map is None:
+        model = model.to(device)
+    return model, processor
 
 
 # Pydantic Models for SARM Subtask Annotation
@@ -98,6 +119,454 @@ class SubtaskAnnotation(BaseModel):
     """Complete annotation for a robot manipulation episode"""
 
     subtasks: list[Subtask] = Field(description="List of all subtasks in temporal order")
+
+
+_START_PHRASES = frozenset(
+    {
+        "start",
+        "start of video",
+        "start of the video",
+        "video start",
+        "beginning",
+        "begin",
+    }
+)
+_END_PHRASES = frozenset(
+    {
+        "end",
+        "end of video",
+        "end of the video",
+        "video end",
+        "end of clip",
+        "clip end",
+        "final frame",
+        "last frame",
+        "video ends",
+        "until end",
+        "until the end",
+        "eof",
+    }
+)
+
+# Model sometimes invents a fake subtask whose *name* is a phrase meant for timestamps.
+_JUNK_SUBTASK_NAME_NORMALIZED = frozenset(
+    {
+        "end of video",
+        "end of the video",
+        "end of clip",
+        "video end",
+        "clip end",
+        "final frame",
+        "last frame",
+        "completion",
+        "complete",
+        "finished",
+        "done",
+        "eof",
+    }
+)
+
+
+def parse_timestamp_to_seconds(
+    timestamp: str,
+    *,
+    video_duration_sec: float | None = None,
+    role: str = "either",
+) -> float:
+    """Parse MM:SS, M:SS, SS, or HH:MM:SS. Resolve natural-language end/start if duration known."""
+    raw = str(timestamp).strip().strip('"').strip("'")
+    if not raw:
+        raise ValueError("Empty timestamp")
+    low = raw.lower()
+
+    if role in ("start", "either"):
+        if low in _START_PHRASES:
+            return 0.0
+
+    if role in ("end", "either"):
+        for phrase in _END_PHRASES:
+            if low == phrase or low.endswith(" " + phrase) or low.startswith(phrase + " "):
+                if video_duration_sec is None:
+                    raise ValueError(
+                        f"Timestamp {timestamp!r} is a natural-language end marker; "
+                        "need video_duration_sec or use MM:SS only."
+                    )
+                return float(video_duration_sec)
+
+    compact = raw.replace(" ", "")
+
+    m = re.fullmatch(r"(\d+):(\d{1,2}):(\d{2})(?:\.(\d+))?", compact)
+    if m:
+        h, mi, se = int(m.group(1)), int(m.group(2)), int(m.group(3))
+        frac = float("0." + m.group(4)) if m.group(4) else 0.0
+        return h * 3600 + mi * 60 + se + frac
+
+    m = re.fullmatch(r"(\d{1,4}):(\d{2})(?:\.(\d+))?", compact)
+    if m:
+        mi, se = int(m.group(1)), int(m.group(2))
+        frac = float("0." + m.group(3)) if m.group(3) else 0.0
+        return mi * 60 + se + frac
+
+    m = re.fullmatch(r"(\d+(?:\.\d+)?)", compact)
+    if m:
+        return float(m.group(1))
+
+    raise ValueError(f"Unrecognized timestamp format: {timestamp!r}")
+
+
+def seconds_to_mmss(sec: float) -> str:
+    sec = max(0.0, float(sec))
+    mi = int(sec // 60)
+    s = int(round(sec - mi * 60))
+    if s >= 60:
+        mi += s // 60
+        s %= 60
+    return f"{mi:02d}:{s:02d}"
+
+
+def normalize_subtask_annotation_timestamps(ann: SubtaskAnnotation, clip_duration_sec: float) -> SubtaskAnnotation:
+    """Canonicalize timestamps to MM:SS; map phrases like 'end of video' using clip length."""
+    clip = max(0.0, float(clip_duration_sec))
+    new_subs: list[Subtask] = []
+    for s in ann.subtasks:
+        st = parse_timestamp_to_seconds(s.timestamps.start, video_duration_sec=clip, role="start")
+        et = parse_timestamp_to_seconds(s.timestamps.end, video_duration_sec=clip, role="end")
+        st = min(max(st, 0.0), clip)
+        et = min(max(et, 0.0), clip)
+        new_subs.append(
+            Subtask(
+                name=s.name,
+                timestamps=Timestamp(start=seconds_to_mmss(st), end=seconds_to_mmss(et)),
+            )
+        )
+    return SubtaskAnnotation(subtasks=new_subs)
+
+
+def _ts_sort(ts: str) -> float:
+    try:
+        return parse_timestamp_to_seconds(ts, video_duration_sec=None, role="start")
+    except ValueError:
+        return float("inf")
+
+
+def extract_balanced_json_object(text: str) -> str | None:
+    start = text.find("{")
+    if start < 0:
+        return None
+    depth = 0
+    in_str = False
+    escape = False
+    for i in range(start, len(text)):
+        c = text[i]
+        if in_str:
+            if escape:
+                escape = False
+            elif c == "\\":
+                escape = True
+            elif c == '"':
+                in_str = False
+        elif c == '"':
+            in_str = True
+        elif c == "{":
+            depth += 1
+        elif c == "}":
+            depth -= 1
+            if depth == 0:
+                return text[start : i + 1]
+    return None
+
+
+def _is_junk_subtask_label(name: str) -> bool:
+    k = name.strip().lower()
+    if k in _JUNK_SUBTASK_NAME_NORMALIZED:
+        return True
+    if k.startswith("end of ") and ("video" in k or "clip" in k):
+        return True
+    return False
+
+
+def canonicalize_subtask_dict(data: dict[str, Any], allowed: list[str]) -> dict[str, Any]:
+    if "subtasks" not in data or not isinstance(data["subtasks"], list):
+        return data
+    al = {a.strip().lower(): a for a in allowed}
+    allowed_set = set(allowed)
+    out: list[dict[str, Any]] = []
+    for st in data["subtasks"]:
+        if not isinstance(st, dict):
+            continue
+        nm = st.get("name")
+        if not isinstance(nm, str):
+            continue
+        if _is_junk_subtask_label(nm):
+            continue
+        k = nm.strip().lower()
+        if k in al:
+            fix = al[k]
+        else:
+            m = difflib.get_close_matches(nm.strip(), allowed, n=1, cutoff=0.5)
+            if not m:
+                continue
+            fix = m[0]
+        if fix not in allowed_set:
+            continue
+        out.append({**st, "name": fix})
+    return {**data, "subtasks": out}
+
+
+def merge_consecutive_same_name_subtasks(subtasks: list[Subtask]) -> list[Subtask]:
+    """Merge adjacent segments with the same label (model / template duplication)."""
+    if not subtasks:
+        return []
+    merged: list[Subtask] = []
+    for s in subtasks:
+        if merged and s.name == merged[-1].name:
+            prev = merged[-1]
+            merged[-1] = Subtask(
+                name=prev.name,
+                timestamps=Timestamp(start=prev.timestamps.start, end=s.timestamps.end),
+            )
+        else:
+            merged.append(s)
+    return merged
+
+
+def truncate_repeated_skill_cycles(subtasks: list[Subtask], allowed: list[str]) -> list[Subtask]:
+    """
+    If the model outputs a second pick-place cycle, drop segments once stage order rolls back
+    (e.g. ... place in bin, then navigate to object again).
+    """
+    order = {n: i for i, n in enumerate(allowed)}
+    prev_o = -1
+    out: list[Subtask] = []
+    for s in subtasks:
+        o = order.get(s.name)
+        if o is None:
+            continue
+        if o < prev_o:
+            break
+        out.append(s)
+        prev_o = o
+    return out
+
+
+def _chunk_match_allowed(chunk: str, allowed_by_len: list[str]) -> tuple[str, str] | None:
+    c = chunk.strip().lstrip("-").strip()
+    if not c:
+        return None
+    for name in allowed_by_len:
+        if c.lower().startswith(name.lower()):
+            tail = c[len(name) :].strip()
+            if tail.startswith(":"):
+                tail = tail[1:].strip()
+            return name, tail
+    return None
+
+
+def _parse_time_tail(tail: str) -> tuple[float | None, float | None]:
+    """Return (start_sec, end_sec_or_none) from a model time suffix."""
+    tail = tail.strip()
+    if not tail:
+        return None, None
+    m = re.match(
+        r"^(\d{1,4}:\d{2}(?:\.\d+)?)\s*(?:[-–]|to)\s*(\d{1,4}:\d{2}(?:\.\d+)?)\s*$",
+        tail,
+        re.I,
+    )
+    if m:
+        return (
+            parse_timestamp_to_seconds(m.group(1), video_duration_sec=None, role="either"),
+            parse_timestamp_to_seconds(m.group(2), video_duration_sec=None, role="either"),
+        )
+    m = re.match(r"^(\d{1,4}:\d{2}(?:\.\d+)?)\s*$", tail)
+    if m:
+        ts = parse_timestamp_to_seconds(m.group(1), video_duration_sec=None, role="either")
+        return ts, None
+    return None, None
+
+
+def _redistribute_interval(names: list[str], t0: float, t1: float) -> list[dict[str, Any]]:
+    if not names or t1 < t0:
+        return []
+    n = len(names)
+    if n == 1:
+        return [
+            {
+                "name": names[0],
+                "timestamps": {"start": seconds_to_mmss(t0), "end": seconds_to_mmss(t1)},
+            }
+        ]
+    dt = (t1 - t0) / n
+    out: list[dict[str, Any]] = []
+    for i, nm in enumerate(names):
+        a, b = t0 + i * dt, t0 + (i + 1) * dt
+        out.append({"name": nm, "timestamps": {"start": seconds_to_mmss(a), "end": seconds_to_mmss(b)}})
+    return out
+
+
+def _finalize_bullet_segments(
+    segments: list[tuple[str, float | None, float | None]],
+    clip: float | None,
+) -> list[dict[str, Any]] | None:
+    """Turn parsed (name, start_sec?, end_sec?) rows into subtask dicts."""
+    if not segments:
+        return None
+    out: list[dict[str, Any]] = []
+    acc_names: list[str] = []
+    acc_t0: float | None = None
+    last_end = 0.0
+
+    def flush_open() -> bool:
+        nonlocal acc_names, acc_t0, out, last_end
+        if not acc_names:
+            return True
+        t0 = acc_t0 if acc_t0 is not None else last_end
+        t1 = clip
+        if t1 is None or t1 <= t0:
+            return False
+        out.extend(_redistribute_interval(acc_names, t0, t1))
+        last_end = t1
+        acc_names = []
+        acc_t0 = None
+        return True
+
+    for name, st, et in segments:
+        if et is not None:
+            t0 = st if st is not None else (acc_t0 if acc_t0 is not None else last_end)
+            if acc_names:
+                out.extend(_redistribute_interval(acc_names + [name], t0, et))
+                acc_names = []
+                acc_t0 = None
+            else:
+                out.append(
+                    {
+                        "name": name,
+                        "timestamps": {"start": seconds_to_mmss(t0), "end": seconds_to_mmss(et)},
+                    }
+                )
+            last_end = et
+        else:
+            if not acc_names:
+                acc_t0 = st if st is not None else last_end
+            acc_names.append(name)
+
+    if acc_names:
+        if clip is None or clip <= (acc_t0 if acc_t0 is not None else last_end):
+            return None
+        if not flush_open():
+            return None
+    return out
+
+
+def _parse_name_only_bullets(text: str, allowed: list[str]) -> list[str]:
+    """Match `- a - b` chains to allowed labels (fuzzy)."""
+    t = re.sub(r"\s+", " ", text.strip())
+    chunks = [c.strip().lstrip("-").strip() for c in re.split(r"\s+-\s+", t) if c.strip()]
+    out: list[str] = []
+    for ch in chunks:
+        k = ch.lower()
+        al = {a.lower(): a for a in allowed}
+        if k in al:
+            out.append(al[k])
+            continue
+        m = difflib.get_close_matches(ch, allowed, n=1, cutoff=0.55)
+        if m:
+            out.append(m[0])
+    return out
+
+
+def parse_subtasks_bullet_fallback(
+    text: str, allowed: list[str], clip_duration_sec: float | None
+) -> dict[str, Any] | None:
+    """
+    Recover subtasks when the model prints a bullet/timeline line instead of JSON, e.g.:
+    `- navigate to object: 00:00 - grasp object:00:00-00:10 - ...`
+    or name-only `- navigate to object - descend gantry - ...`
+    """
+    t = re.sub(r"\s+", " ", text.strip())
+    if not t or not any(a.lower() in t.lower() for a in allowed):
+        return None
+    allowed_by_len = sorted(allowed, key=len, reverse=True)
+    chunks = [c.strip() for c in re.split(r"\s+-\s+", t) if c.strip()]
+    segments: list[tuple[str, float | None, float | None]] = []
+    for ch in chunks:
+        hit = _chunk_match_allowed(ch, allowed_by_len)
+        if not hit:
+            continue
+        name, tail = hit
+        st, et = _parse_time_tail(tail)
+        segments.append((name, st, et))
+
+    clip = float(clip_duration_sec) if clip_duration_sec is not None and clip_duration_sec > 0 else None
+
+    if len(segments) >= 3:
+        subtasks = _finalize_bullet_segments(segments, clip)
+        if subtasks:
+            return {"subtasks": subtasks}
+
+    names = _parse_name_only_bullets(t, allowed)
+    if len(names) >= 3 and clip is not None:
+        n = len(names)
+        subtasks = []
+        for i, name in enumerate(names):
+            st = seconds_to_mmss((i / n) * clip)
+            et = seconds_to_mmss(((i + 1) / n) * clip)
+            subtasks.append({"name": name, "timestamps": {"start": st, "end": et}})
+        return {"subtasks": subtasks}
+    return None
+
+
+def _coerce_annotation_from_subtasks_data(data: dict[str, Any], allowed: list[str]) -> SubtaskAnnotation:
+    data = canonicalize_subtask_dict(data, allowed)
+    if not data.get("subtasks"):
+        raise ValueError("No subtasks left after filtering junk / unknown labels")
+    ann = SubtaskAnnotation.model_validate(data)
+    ann = SubtaskAnnotation(subtasks=sorted(ann.subtasks, key=lambda s: _ts_sort(s.timestamps.start)))
+    ann = SubtaskAnnotation(
+        subtasks=truncate_repeated_skill_cycles(ann.subtasks, allowed),
+    )
+    ann = SubtaskAnnotation(subtasks=merge_consecutive_same_name_subtasks(ann.subtasks))
+    validate_subtask_annotation(ann, allowed)
+    return ann
+
+
+def validate_subtask_annotation(ann: SubtaskAnnotation, allowed: list[str]) -> None:
+    # Allow partial annotations — model may merge or miss subtle stages (e.g. gantry descent).
+    if len(ann.subtasks) < 3:
+        raise ValueError(f"Need at least 3 subtasks, got {len(ann.subtasks)}")
+    allowed_set, got = set(allowed), {s.name for s in ann.subtasks}
+    unknown = got - allowed_set
+    if unknown:
+        raise ValueError(f"Unknown labels {sorted(unknown)!r}; allowed {sorted(allowed)!r}")
+
+
+def raw_response_to_subtask_annotation(
+    raw: str,
+    allowed: list[str],
+    clip_duration_sec: float | None = None,
+) -> SubtaskAnnotation:
+    r0 = raw.strip()
+    r = r0
+    if "```json" in r:
+        r = r.split("```json", 1)[1].split("```", 1)[0].strip()
+    elif "```" in r:
+        r = r.split("```", 1)[1].split("```", 1)[0].strip()
+    blob = extract_balanced_json_object(r) or extract_balanced_json_object(r0)
+    data: dict[str, Any] | None = None
+    if blob is not None:
+        try:
+            data = json.loads(blob)
+        except json.JSONDecodeError as e:
+            try:
+                data = json.loads(re.sub(r",\s*([}\]])", r"\1", blob))
+            except json.JSONDecodeError as e2:
+                raise ValueError(f"Invalid JSON: {e}") from e2
+    if data is None:
+        fb = parse_subtasks_bullet_fallback(r0, allowed, clip_duration_sec)
+        if fb is not None:
+            data = fb
+    if data is None:
+        raise ValueError("No JSON object in model response")
+    return _coerce_annotation_from_subtasks_data(data, allowed)
 
 
 def compute_temporal_proportions(
@@ -123,17 +592,15 @@ def compute_temporal_proportions(
         durations: dict[str, int] = {}
 
         for subtask in annotation.subtasks:
-            start_parts = subtask.timestamps.start.split(":")
-            end_parts = subtask.timestamps.end.split(":")
-
-            start_seconds = (
-                int(start_parts[0]) * 60 + int(start_parts[1])
-                if len(start_parts) == 2
-                else int(start_parts[0])
-            )
-            end_seconds = (
-                int(end_parts[0]) * 60 + int(end_parts[1]) if len(end_parts) == 2 else int(end_parts[0])
-            )
+            try:
+                start_seconds = parse_timestamp_to_seconds(
+                    subtask.timestamps.start, video_duration_sec=None, role="start"
+                )
+                end_seconds = parse_timestamp_to_seconds(
+                    subtask.timestamps.end, video_duration_sec=None, role="end"
+                )
+            except ValueError:
+                continue
 
             duration = end_seconds - start_seconds
             durations[subtask.name] = duration
@@ -208,9 +675,9 @@ def create_sarm_prompt(subtask_list: list[str]) -> str:
            - Only use nearly equal durations if the video truly shows each subtask taking the same amount of time (this is very rare).
 
         5. **Timestamps:**
-           - Timestamps must be in `"MM:SS"` format.
+           - Every `"start"` and `"end"` value MUST be a literal clock string in `"MM:SS"` form (digits and one colon only), e.g. `"00:00"`, `"00:35"`. Do NOT use phrases like `"end of video"` or `"start"` inside JSON.
            - The first subtask always starts at `"00:00"`.
-           - The last subtask ends at the final visible frame of the video.
+           - The last subtask `"end"` must be the true MM:SS time of the final frame (same as the clip length).
 
         # Step 1 — Textual Timeline (must do this first)
         First, write a extensive and detailed textual timeline describing what happens in the video with approximate timestamps.
@@ -223,6 +690,8 @@ def create_sarm_prompt(subtask_list: list[str]) -> str:
 
         # Step 2 — JSON Output (final answer)
         After the textual timeline, output **only** valid JSON with this structure.
+        The JSON **must** include **every** subtask from the list above **exactly once**, in order — no merging, no skipping.
+        Keep the textual timeline brief enough that the full JSON fits in your answer (complete closing braces).
         The JSON **must** be consistent with the textual timeline above:
 
         {{
@@ -249,48 +718,39 @@ def create_sarm_prompt(subtask_list: list[str]) -> str:
 
 
 class VideoAnnotator:
-    """Annotates robot manipulation videos using local Qwen3-VL model on GPU"""
+    """Local Qwen* VL for subtask timestamps (uses correct class per checkpoint)."""
 
     def __init__(
         self,
         subtask_list: list[str],
-        model_name: str = "Qwen/Qwen3-VL-30B-A3B-Instruct",
+        model_name: str = "Qwen/Qwen2-VL-2B-Instruct",
         device: str = "cuda",
         torch_dtype: torch.dtype = torch.bfloat16,
-        model: Qwen3VLMoeForConditionalGeneration | None = None,  # noqa: F821
-        processor: AutoProcessor | None = None,  # noqa: F821
+        model: Any | None = None,
+        processor: Any | None = None,
+        *,
+        max_annotation_retries: int = 5,
+        max_new_tokens: int = 4096,
+        greedy: bool = True,
+        temperature: float = 0.35,
     ):
-        """
-        Initialize the video annotator with local model.
-
-        Args:
-            subtask_list: List of allowed subtask names (for consistency)
-            model_name: Hugging Face model name (default: Qwen/Qwen3-VL-30B-A3B-Instruct)
-            device: Device to use (cuda, cpu)
-            torch_dtype: Data type for model (bfloat16, float16, float32)
-            model: Pre-loaded model instance (optional, to share between annotators)
-            processor: Pre-loaded processor instance (optional, to share between annotators)
-        """
         self.subtask_list = subtask_list
         self.prompt = create_sarm_prompt(subtask_list)
         self.device = device
+        self.max_annotation_retries = max_annotation_retries
+        self.max_new_tokens = max_new_tokens
+        self.greedy = greedy
+        self.temperature = temperature
 
-        # Use provided model/processor or load new ones
         if model is not None and processor is not None:
             self.model = model
             self.processor = processor
             print(f"Using shared model on {device}")
         else:
-            from transformers import AutoProcessor, Qwen3VLMoeForConditionalGeneration
-
             print(f"Loading model: {model_name}...")
-
-            self.model = Qwen3VLMoeForConditionalGeneration.from_pretrained(
-                model_name, torch_dtype=torch_dtype, device_map=device, trust_remote_code=True
+            self.model, self.processor = load_qwen_vl_model_and_processor(
+                model_name, device=device, torch_dtype=torch_dtype
             )
-
-            self.processor = AutoProcessor.from_pretrained(model_name, trust_remote_code=True)
-
             print(f"Model loaded successfully on {device}")
 
     def extract_episode_segment(
@@ -380,12 +840,15 @@ class VideoAnnotator:
         fps: int,
         start_timestamp: float = 0.0,
         end_timestamp: float | None = None,
-        max_retries: int = 3,
+        max_retries: int | None = None,
     ) -> SubtaskAnnotation:
         """Annotate a video segment using local GPU."""
         from qwen_vl_utils import process_vision_info
 
         file_path = Path(file_path)
+        retries = max_retries if max_retries is not None else self.max_annotation_retries
+        last_err: BaseException | None = None
+        last_response = ""
 
         if end_timestamp is None:
             cap = cv2.VideoCapture(str(file_path))
@@ -413,7 +876,7 @@ class VideoAnnotator:
                 },
             ]
 
-            for attempt in range(max_retries):
+            for attempt in range(retries):
                 try:
                     text = self.processor.apply_chat_template(
                         messages, tokenize=False, add_generation_prompt=True
@@ -425,35 +888,40 @@ class VideoAnnotator:
                         videos=video_inputs,
                         padding=True,
                         return_tensors="pt",
-                    ).to(self.device)
+                    )
+                    model_device = next(self.model.parameters()).device
+                    inputs = inputs.to(model_device)
+
+                    do_sample = not self.greedy
+                    if self.greedy and attempt == retries - 1 and retries > 1:
+                        do_sample = True
+                    gen_kw: dict[str, Any] = {"max_new_tokens": self.max_new_tokens}
+                    if do_sample:
+                        gen_kw["do_sample"] = True
+                        gen_kw["temperature"] = self.temperature
+                    else:
+                        gen_kw["do_sample"] = False
 
                     with torch.no_grad():
-                        generated_ids = self.model.generate(
-                            **inputs, max_new_tokens=1024, do_sample=True, temperature=0.7
-                        )
+                        generated_ids = self.model.generate(**inputs, **gen_kw)
 
                     response = self.processor.batch_decode(
                         [out[len(inp) :] for inp, out in zip(inputs.input_ids, generated_ids, strict=True)],
                         skip_special_tokens=True,
                     )[0].strip()
-
-                    # Extract JSON
-                    if "```json" in response:
-                        response = response.split("```json")[1].split("```")[0]
-                    elif "```" in response:
-                        response = response.split("```")[1].split("```")[0]
-
-                    try:
-                        return SubtaskAnnotation.model_validate(json.loads(response))
-                    except json.JSONDecodeError:
-                        match = re.search(r"\{.*\}", response, re.DOTALL)
-                        if match:
-                            return SubtaskAnnotation.model_validate(json.loads(match.group()))
-                        raise ValueError("No JSON found") from None
+                    last_response = response
+                    ann = raw_response_to_subtask_annotation(
+                        response, self.subtask_list, clip_duration_sec=duration
+                    )
+                    return normalize_subtask_annotation_timestamps(ann, duration)
                 except Exception as e:
-                    if attempt == max_retries - 1:
-                        raise RuntimeError(f"Failed after {max_retries} attempts") from e
-                    time.sleep(1)
+                    last_err = e
+                    if attempt < retries - 1:
+                        time.sleep(1.0 + 0.5 * attempt)
+            snippet = last_response[:1200].replace("\n", " ")
+            raise RuntimeError(
+                f"Failed after {retries} attempts. Last error: {last_err!r}. Snippet: {snippet!r}"
+            ) from last_err
         finally:
             if is_extracted and extracted_path.exists():
                 extracted_path.unlink()
@@ -467,35 +935,78 @@ def display_annotation(annotation: SubtaskAnnotation, episode_idx: int, fps: int
     print(f"Episode {episode_idx} {prefix}: {len(annotation.subtasks)} subtasks - {subtask_summary}")
 
 
-def timestamp_to_seconds(timestamp: str) -> float:
-    """Convert MM:SS or SS timestamp to seconds"""
-    parts = timestamp.split(":")
-    if len(parts) == 2:
-        return int(parts[0]) * 60 + int(parts[1])
-    else:
-        return int(parts[0])
+def timestamp_to_seconds(timestamp: str, video_duration_sec: float | None = None) -> float:
+    """Convert MM:SS / SS / etc. to seconds (see parse_timestamp_to_seconds)."""
+    return parse_timestamp_to_seconds(timestamp, video_duration_sec=video_duration_sec, role="either")
 
 
 def extract_frame(video_path: Path, timestamp: float) -> np.ndarray | None:
-    """Extract a single frame from video at given timestamp."""
+    """
+    Extract a single RGB frame at ``timestamp`` seconds.
+
+    Tries OpenCV first; falls back to ffmpeg for codecs OpenCV mishandles (e.g. AV1),
+    provided ffmpeg is built with a software AV1 decoder (e.g. libdav1d).
+    """
+    ts = max(0.0, float(timestamp))
     cap = cv2.VideoCapture(str(video_path))
-    if not cap.isOpened():
-        return None
-    cap.set(cv2.CAP_PROP_POS_MSEC, timestamp * 1000)
-    ret, frame = cap.read()
-    cap.release()
-    return cv2.cvtColor(frame, cv2.COLOR_BGR2RGB) if ret else None
+    if cap.isOpened():
+        cap.set(cv2.CAP_PROP_POS_MSEC, ts * 1000)
+        ret, frame = cap.read()
+        cap.release()
+        if ret and frame is not None:
+            return cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
+
+    with tempfile.NamedTemporaryFile(suffix=".png", delete=False) as tmp:
+        out_path = Path(tmp.name)
+    try:
+        cmd = [
+            "ffmpeg",
+            "-hide_banner",
+            "-loglevel",
+            "error",
+            "-nostdin",
+            "-y",
+            "-i",
+            str(video_path),
+            "-ss",
+            f"{ts:.3f}",
+            "-frames:v",
+            "1",
+            "-an",
+            str(out_path),
+        ]
+        r = subprocess.run(
+            cmd,
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.PIPE,
+            text=True,
+            check=False,
+            timeout=120,
+        )
+        if r.returncode != 0:
+            return None
+        frame = cv2.imread(str(out_path))
+        if frame is not None:
+            return cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
+    except (FileNotFoundError, subprocess.TimeoutExpired, OSError):
+        pass
+    finally:
+        out_path.unlink(missing_ok=True)
+    return None
 
 
-def draw_timeline(ax, subtasks, total_duration, colors):
+def draw_timeline(
+    ax, subtasks, total_duration, colors, clip_duration_sec: float | None = None
+):
     """Draw a timeline with color-coded subtask segments."""
     import matplotlib.patches as mpatches
 
     bar_height, bar_y = 0.6, 0.5
+    vd = clip_duration_sec if clip_duration_sec is not None else None
 
     for i, subtask in enumerate(subtasks):
-        start = timestamp_to_seconds(subtask.timestamps.start)
-        end = timestamp_to_seconds(subtask.timestamps.end)
+        start = timestamp_to_seconds(subtask.timestamps.start, video_duration_sec=vd)
+        end = timestamp_to_seconds(subtask.timestamps.end, video_duration_sec=vd)
         color = colors[i % len(colors)]
 
         rect = mpatches.FancyBboxPatch(
@@ -531,7 +1042,7 @@ def draw_timeline(ax, subtasks, total_duration, colors):
     ax.axvline(x=0, ymin=0.1, ymax=0.9, color="#00ff00", linestyle="-", linewidth=2, alpha=0.9)
     if subtasks:
         ax.axvline(
-            x=timestamp_to_seconds(subtasks[-1].timestamps.end),
+            x=timestamp_to_seconds(subtasks[-1].timestamps.end, video_duration_sec=vd),
             ymin=0.1,
             ymax=0.9,
             color="white",
@@ -563,6 +1074,9 @@ def visualize_episode(
     """Create visualization for a single episode with frames and timeline."""
     import matplotlib.pyplot as plt
 
+    # Quieter OpenCV/FFmpeg stderr (AV1 hardware messages, etc.).
+    os.environ.setdefault("OPENCV_FFMPEG_LOGLEVEL", "-8")
+
     if annotation is None:
         print(f"No {ann_type} annotation for episode {ep_idx}")
         return
@@ -573,13 +1087,14 @@ def visualize_episode(
         return
 
     colors = plt.cm.tab10(np.linspace(0, 1, max(len(subtasks), 10)))
-    total_duration = timestamp_to_seconds(subtasks[-1].timestamps.end)
+    clip_sec = max(video_end - video_start, 0.0)
+    total_duration = clip_sec
 
     # Extract middle frame from each subtask
     sample_frames, frame_times = [], []
     for subtask in subtasks:
-        start = timestamp_to_seconds(subtask.timestamps.start)
-        end = timestamp_to_seconds(subtask.timestamps.end)
+        start = timestamp_to_seconds(subtask.timestamps.start, video_duration_sec=clip_sec)
+        end = timestamp_to_seconds(subtask.timestamps.end, video_duration_sec=clip_sec)
         mid = (start + end) / 2
         frame_times.append(mid)
         sample_frames.append(extract_frame(video_path, video_start + mid))
@@ -642,7 +1157,7 @@ def visualize_episode(
     # Plot timeline
     ax_timeline = fig.add_subplot(gs[1, :])
     ax_timeline.set_facecolor("#16213e")
-    draw_timeline(ax_timeline, subtasks, total_duration, colors)
+    draw_timeline(ax_timeline, subtasks, total_duration, colors, clip_duration_sec=clip_sec)
 
     output_path.parent.mkdir(parents=True, exist_ok=True)
     plt.savefig(output_path, dpi=150, facecolor=fig.get_facecolor(), edgecolor="none", bbox_inches="tight")
@@ -673,6 +1188,14 @@ def visualize_annotations(
         annotation_type: "sparse", "dense", or "both"
         episode_indices: Specific episode indices to visualize (optional)
     """
+    try:
+        import matplotlib.pyplot as plt  # noqa: F401
+        import pyparsing  # noqa: F401
+    except ImportError as e:
+        print("Skipping visualizations: pip install matplotlib pyparsing  OR  pip install -e '.[sarm]'")
+        print(f"  ({e})")
+        return
+
     # Determine available episodes based on annotation type
     if annotation_type == "sparse":
         available = set(sparse_annotations.keys())
@@ -742,6 +1265,27 @@ def visualize_annotations(
     print(f"Visualizations saved to: {output_dir.absolute()}")
 
 
+def _episode_duration_seconds_from_df(episodes_df: pd.DataFrame, ep_idx: int, fps: float) -> float | None:
+    """Episode wall-clock duration from frame count / fps; None if unknown."""
+    if ep_idx not in episodes_df.index:
+        return None
+    row = episodes_df.loc[ep_idx]
+    for key in ("length", "meta/episodes/length"):
+        if key not in row.index:
+            continue
+        v = row[key]
+        if v is None or (isinstance(v, float) and pd.isna(v)):
+            continue
+        if isinstance(v, (list, tuple, np.ndarray)) and len(v) > 0:
+            v = v[0]
+        try:
+            length = int(v)
+            return length / max(float(fps), 1e-6)
+        except (TypeError, ValueError):
+            continue
+    return None
+
+
 def save_annotations_to_dataset(
     dataset_path: Path, annotations: dict[int, SubtaskAnnotation], fps: int, prefix: str = "sparse"
 ):
@@ -770,14 +1314,21 @@ def save_annotations_to_dataset(
     for ep_idx, ann in annotations.items():
         if ep_idx >= len(episodes_df):
             continue
+        dur = _episode_duration_seconds_from_df(episodes_df, ep_idx, float(fps))
+        vd = dur if dur is not None and dur > 0 else None
         names, starts, ends, start_frames, end_frames = [], [], [], [], []
-        for s in ann.subtasks:
-            names.append(s.name)
-            st, et = timestamp_to_seconds(s.timestamps.start), timestamp_to_seconds(s.timestamps.end)
-            starts.append(st)
-            ends.append(et)
-            start_frames.append(int(st * fps))
-            end_frames.append(int(et * fps))
+        try:
+            for s in ann.subtasks:
+                names.append(s.name)
+                st = timestamp_to_seconds(s.timestamps.start, video_duration_sec=vd)
+                et = timestamp_to_seconds(s.timestamps.end, video_duration_sec=vd)
+                starts.append(st)
+                ends.append(et)
+                start_frames.append(int(st * fps))
+                end_frames.append(int(et * fps))
+        except ValueError as e:
+            print(f"WARNING: skip saving episode {ep_idx} ({prefix}): invalid timestamps ({e})")
+            continue
         episodes_df.at[ep_idx, cols[0]] = names
         episodes_df.at[ep_idx, cols[1]] = starts
         episodes_df.at[ep_idx, cols[2]] = ends
@@ -911,12 +1462,22 @@ def worker_process_episodes(
     dense_subtask_list: list[str] | None,
     model_name: str,
     torch_dtype: torch.dtype,
+    max_annotation_retries: int,
+    max_new_tokens: int,
+    greedy: bool,
+    temperature: float,
 ) -> tuple[dict, dict | None]:
     """Worker for parallel processing across GPUs."""
     device = f"cuda:{gpu_id}"
     dataset = LeRobotDataset(repo_id, download_videos=False)
 
-    sparse_annotator = VideoAnnotator(sparse_subtask_list, model_name, device, torch_dtype)
+    ann_kw = dict(
+        max_annotation_retries=max_annotation_retries,
+        max_new_tokens=max_new_tokens,
+        greedy=greedy,
+        temperature=temperature,
+    )
+    sparse_annotator = VideoAnnotator(sparse_subtask_list, model_name, device, torch_dtype, **ann_kw)
     dense_annotator = (
         VideoAnnotator(
             dense_subtask_list,
@@ -925,6 +1486,7 @@ def worker_process_episodes(
             torch_dtype,
             sparse_annotator.model,
             sparse_annotator.processor,
+            **ann_kw,
         )
         if dense_subtask_list
         else None
@@ -950,7 +1512,7 @@ def worker_process_episodes(
 
 
 def main():
-    parser = argparse.ArgumentParser(description="SARM-style subtask annotation using local GPU (Qwen3-VL)")
+    parser = argparse.ArgumentParser(description="SARM subtask annotation (Qwen VL; see HF LeRobot SARM docs)")
     parser.add_argument("--repo-id", type=str, required=True, help="HuggingFace dataset repository ID")
     parser.add_argument(
         "--sparse-subtasks", type=str, default=None, help="Comma-separated sparse subtask names"
@@ -962,7 +1524,12 @@ def main():
         "--dense-only", action="store_true", help="Dense-only mode with auto-generated sparse 'task' stage"
     )
     parser.add_argument("--episodes", type=int, nargs="+", default=None, help="Episode indices to annotate")
-    parser.add_argument("--model", type=str, default="Qwen/Qwen3-VL-30B-A3B-Instruct", help="VLM model")
+    parser.add_argument(
+        "--model",
+        type=str,
+        default="Qwen/Qwen2-VL-2B-Instruct",
+        help="HF model id (Qwen2-VL-7B uses Qwen2VL*, not Qwen3VLMoe*)",
+    )
     parser.add_argument("--skip-existing", action="store_true", help="Skip already annotated episodes")
     parser.add_argument("--video-key", type=str, default=None, help="Video key (default: first available)")
     parser.add_argument("--push-to-hub", action="store_true", help="Push to HuggingFace Hub")
@@ -971,6 +1538,17 @@ def main():
     parser.add_argument("--dtype", type=str, default="bfloat16", choices=["bfloat16", "float16", "float32"])
     parser.add_argument("--num-workers", type=int, default=1, help="Parallel workers for multi-GPU")
     parser.add_argument("--gpu-ids", type=int, nargs="+", default=None, help="GPU IDs to use")
+    parser.add_argument("--max-retries", type=int, default=5, help="Retries per episode on parse failure")
+    parser.add_argument(
+        "--max-new-tokens",
+        type=int,
+        default=4096,
+        help="Gen budget (raise if JSON is truncated / missing subtasks)",
+    )
+    parser.add_argument(
+        "--sample", action="store_true", help="Stochastic decode (default: greedy, better for JSON)"
+    )
+    parser.add_argument("--temperature", type=float, default=0.35, help="With --sample or last retry")
     # Visualization options
     parser.add_argument(
         "--visualize-only",
@@ -1054,7 +1632,9 @@ def main():
 
     existing_annotations = load_annotations_from_dataset(dataset.root, prefix="sparse")
     if args.skip_existing:
+        n_skip = sum(1 for ep in episode_indices if ep in existing_annotations)
         episode_indices = [ep for ep in episode_indices if ep not in existing_annotations]
+        print(f"--skip-existing: skip {n_skip} already annotated, {len(episode_indices)} to run")
 
     if not episode_indices:
         return print("All episodes already annotated!")
@@ -1101,6 +1681,10 @@ def main():
                         dense_subtask_list,
                         args.model,
                         torch_dtype,
+                        args.max_retries,
+                        args.max_new_tokens,
+                        not args.sample,
+                        args.temperature,
                     )
                     for w in range(args.num_workers)
                     if episodes_per_worker[w]
@@ -1119,8 +1703,14 @@ def main():
                         raise RuntimeError(f"Worker failed: {e}") from e
         else:
             # Sequential processing
+            ann_kw = dict(
+                max_annotation_retries=args.max_retries,
+                max_new_tokens=args.max_new_tokens,
+                greedy=not args.sample,
+                temperature=args.temperature,
+            )
             sparse_annotator = (
-                VideoAnnotator(sparse_subtask_list, args.model, args.device, torch_dtype)
+                VideoAnnotator(sparse_subtask_list, args.model, args.device, torch_dtype, **ann_kw)
                 if not auto_sparse and sparse_subtask_list
                 else None
             )
@@ -1132,6 +1722,7 @@ def main():
                     torch_dtype,
                     sparse_annotator.model if sparse_annotator else None,
                     sparse_annotator.processor if sparse_annotator else None,
+                    **ann_kw,
                 )
                 if dense_mode
                 else None
@@ -1176,6 +1767,8 @@ def main():
         save_proportions(dense_annotations, "dense", dense_subtask_list)
 
     print(f"\nComplete! {len(sparse_annotations)} sparse, {len(dense_annotations or {})} dense annotations")
+    on_disk = load_annotations_from_dataset(dataset.root, prefix="sparse")
+    print(f"Sparse rows on disk (reload): {len(on_disk)} / {dataset.meta.total_episodes}")
 
     # Visualize annotations after generation
     if args.num_visualizations > 0:
@@ -1184,7 +1777,7 @@ def main():
         visualize_annotations(
             dataset=dataset,
             sparse_annotations=sparse_annotations,
-            dense_annotations=dense_annotations,
+            dense_annotations=dense_annotations if dense_mode else None,
             video_key=video_key,
             output_dir=Path(args.output_dir),
             num_episodes=args.num_visualizations,

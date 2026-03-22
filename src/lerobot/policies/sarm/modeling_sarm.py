@@ -440,7 +440,7 @@ class SARMRewardModel(PreTrainedPolicy):
         """Load temporal proportions based on annotation_mode."""
         meta_path = dataset_meta.root / "meta"
 
-        if self.config.annotation_mode == "dual":
+        if self.config.annotation_mode in ("dual", "sparse_only"):
             names, props = self._load_proportions_from_json(
                 meta_path / "temporal_proportions_sparse.json", "sparse"
             )

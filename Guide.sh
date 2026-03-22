@@ -346,6 +346,326 @@ lerobot-train \
     --resume=true
 
 # =============================================================================
+# SARM + RA-BC PIPELINE (trash_pickup — stage-aware reward modelling)
+# =============================================================================
+# Paper: https://arxiv.org/abs/2509.25358
+# Why trash_pickup: 6 distinct phases (navigate→descend→grasp→lift→navigate→place),
+# long episodes (~37 s), known quality variance (ghost grasps, base corrections).
+# SARM learns progress 0→1 per frame from videos, then RA-BC down-weights bad frames.
+#
+# ── KNOWN LIMITATIONS (as of Mar 2026) ──────────────────────────────────────
+# 1. single_stage mode trivially converges: loss drops to ~0.001 in 500 steps
+#    because the model learns the linear 0→1 ramp, not actual stage transitions.
+#    Do not use single_stage for RA-BC weighting.
+#
+# 2. data loading is slow (~18 s/step) due to CLIP encoding 13 temporally-dispersed
+#    libsvtav1 video frames per sample in the main process. 5000-step runs take
+#    ~25 hours on a 3090 Ti. Plan accordingly — annotation first, then leave overnight.
+#
+# UNBLOCKED (Mar 2026): the annotation script is now in this repo at
+#   src/lerobot/data_processing/sarm_annotations/subtask_annotation.py
+# Run STEP 0 (annotation) before STEP 1 (SARM training) to get meaningful
+# per-episode stage boundaries. Dual mode is the correct path.
+#
+# NOTE: always clear PYTHONPATH first (IsaacSim/ROS pollute it with Python 3.11 pydantic)
+unset PYTHONPATH
+
+# ── STEP 0: Annotate subtask boundaries with Qwen2-VL ────────────────────────
+# Uses Qwen2-VL-2B-Instruct (~6GB VRAM) to watch each episode at 1fps and identify
+# when each of the 6 stages starts/ends. Writes per-episode timestamps to the local
+# dataset cache parquet files and saves aggregate temporal proportions to JSON.
+# Runtime: ~30 min for 72 episodes on 3090 Ti.
+#
+# Defaults: greedy decode + 5 retries + 2048 max_new_tokens (reliable JSON). Use
+# --sample only if you need diversity. Re-run failures only: add --skip-existing.
+# Larger VLMs: pass --model ... but keep the checkpoint type matching the loader
+# (Qwen2-VL vs Qwen3-VL-MoE — wrong class OOMs; see subtask_annotation.py).
+#
+# Inspect the 5 visualisation PNGs saved to ./subtask_viz before proceeding.
+# Good annotation: stage boundaries align with visible robot state transitions.
+# Bad annotation: all stages equal-length or misaligned → adjust subtask descriptions.
+python src/lerobot/data_processing/sarm_annotations/subtask_annotation.py \
+    --repo-id Odog16/trash_pickup \
+    --sparse-subtasks "navigate to object,descend gantry,grasp object,lift object,navigate to bin,place in bin" \
+    --video-key observation.images.head \
+    --model Qwen/Qwen2-VL-2B-Instruct \
+    --max-retries 5 \
+    --max-new-tokens 2048 \
+    --num-visualizations 5 \
+    --output-dir ./subtask_viz
+# Retry only missing/failed episodes after a partial run (keeps parquet rows for
+# episodes that already succeeded). Qwen2-VL-7B-Instruct ~15GB BF16 on 24GB GPU:
+# python src/lerobot/data_processing/sarm_annotations/subtask_annotation.py \
+#     --repo-id Odog16/trash_pickup \
+#     --sparse-subtasks "navigate to object,descend gantry,grasp object,lift object,navigate to bin,place in bin" \
+#     --video-key observation.images.head \
+#     --model Qwen/Qwen2-VL-7B-Instruct \
+#     --skip-existing \
+#     --num-visualizations 0 \
+#     --output-dir ./subtask_viz
+# Verify: --visualize-only should print "Found 72 sparse" when done.
+#
+# ON-DISK OUTPUTS (LeRobot SARM format, under ~/.cache/huggingface/lerobot/<repo>/):
+#   meta/episodes/chunk-*/file-*.parquet → sparse_subtask_* columns (+ legacy subtask_*)
+#   meta/temporal_proportions_sparse.json  → priors for training
+#   ./subtask_viz/*.png                    → optional QC plots (--num-visualizations > 0)
+
+# After annotation, read the computed temporal proportions to use in STEP 1:
+python3 -c "
+import json, pathlib
+p = pathlib.Path('~/.cache/huggingface/lerobot/Odog16/trash_pickup/meta/temporal_proportions_sparse.json').expanduser()
+d = json.loads(p.read_text())
+vals = list(d.values())
+print('Subtask names:', list(d.keys()))
+print('Proportions:  ', [round(v, 3) for v in vals])
+print('Sum:', round(sum(vals), 4))
+"
+
+# ── STEP 1: Train SARM reward model ───────────────────────────────────────────
+# dual: needs STEP 0 sparse + dense annotations (temporal_proportions_dense.json).
+# sparse_only: only sparse annotations (temporal_proportions_sparse.json) — use this
+#   if you did not run --dense-subtasks. Set: --policy.annotation_mode=sparse_only
+#
+# dual mode uses the per-episode subtask timestamps written by STEP 0.
+# Replace sparse_temporal_proportions with the values printed above.
+# Runtime: ~25 h on 3090 Ti (bottleneck is CLIP dataloading, not GPU util).
+# Leave overnight. Monitor WandB: loss should descend from ~1.5 and NOT trivially
+# collapse to ~0.001 within 500 steps (that only happens in single_stage mode).
+(lerobot) owen@PC1:~/lerobot$ python src/lerobot/scripts/lerobot_train.py \
+  --dataset.repo_id=Odog16/trash_pickup \
+  --policy.type=sarm \
+  --policy.annotation_mode=sparse_only \
+  --policy.image_key=observation.images.head \
+  --policy.state_key=observation.state \
+  --policy.n_obs_steps=8 \
+  --policy.frame_gap=10 \
+  --policy.drop_n_last_frames=200 \
+  --output_dir=outputs/train/trash_pickup_sarm \
+  --batch_size=32 \
+  --steps=5000 \
+  --save_freq=2500 \
+  --log_freq=100 \
+  --num_workers=1 \
+  --wandb.enable=true \
+  --wandb.project=lerobot \
+  --policy.push_to_hub=false \
+  --policy.repo_id=Odog16/trash_pickup_sarm
+# ── STEP 2: Visualise predictions (before computing weights) ──────────────────
+# Inspect progress curves — want smooth monotonic rise 0→1 within each stage.
+# Single_stage will be a boring straight line; dual should show per-stage bumps.
+# If progress looks random after 8000 steps, check that STEP 0 annotations look
+# correct in subtask_viz/ before assuming the model is broken.
+# --visualize-only is a flag (no =true), --stride speeds things up 5x.
+python src/lerobot/policies/sarm/compute_rabc_weights.py \
+  --dataset-repo-id Odog16/trash_pickup \
+  --reward-model-path outputs/train/trash_pickup_sarm/checkpoints/005000/pretrained_model \
+  --visualize-only \
+  --num-visualizations 5 \
+  --head-mode sparse \
+  --output-dir ./sarm_predictions
+
+# ── STEP 3: Compute progress for all frames → sarm_progress.parquet ──────────
+# Saves to dataset's local cache, then uploads to the dataset repo on Hub.
+# --push-to-hub is a flag (no =true). Use --stride 5 to run ~5x faster.
+python src/lerobot/policies/sarm/compute_rabc_weights.py \
+    --dataset-repo-id Odog16/trash_pickup \
+    --reward-model-path outputs/train/trash_pickup_sarm_dual/checkpoints/008000/pretrained_model \
+    --head-mode sparse \
+    --num-visualizations 5 \
+    --output-dir ./sarm_viz \
+    --stride 5 \
+    --push-to-hub
+
+# ── STEP 4: Train SmolVLA with RA-BC (reward-aligned BC) ─────────────────────
+# Warm-starts from the already-trained trash_pickup_SmolVLA_v1 (20k steps).
+# The training script auto-loads sarm_progress.parquet from the dataset Hub repo.
+# Monitor rabc_mean_weight in WandB:
+#   0.3–0.8 → healthy;  ~1.0 → kappa too low (increase to rabc_delta_mean);
+#   ~0.0    → kappa too high or SARM quality issue
+lerobot-train \
+    --dataset.repo_id=Odog16/trash_pickup \
+    --policy.type=smolvla \
+    --policy.repo_id=Odog16/trash_pickup_SmolVLA_v2_rabc \
+    --policy.push_to_hub=false \
+    --policy.pretrained_path=Odog16/trash_pickup_SmolVLA_v1 \
+    --policy.train_expert_only=true \
+    --policy.train_state_proj=true \
+    --policy.use_amp=true \
+    --policy.num_vlm_layers=16 \
+    --policy.chunk_size=42 \
+    --policy.n_action_steps=42 \
+    --use_rabc=true \
+    --rabc_head_mode=sparse \
+    --rabc_kappa=0.01 \
+    --output_dir=outputs/train/trash_pickup_SmolVLA_v2_rabc \
+    --job_name=trash_pickup_SmolVLA_v2_rabc \
+    --batch_size=16 \
+    --steps=20000 \
+    --save_freq=5000 \
+    --log_freq=200 \
+    --scheduler.type=cosine_decay_with_warmup \
+    --scheduler.peak_lr=1e-4 \
+    --scheduler.decay_lr=2.5e-6 \
+    --scheduler.num_warmup_steps=1000 \
+    --scheduler.num_decay_steps=18000 \
+    --wandb.enable=true \
+    --wandb.project=lerobot
+
+# Resume RA-BC run if interrupted:
+# lerobot-train \
+#     --config_path=outputs/train/trash_pickup_SmolVLA_v2_rabc/checkpoints/last/pretrained_model/train_config.json \
+#     --resume=true
+
+# ── ABLATION RUNS (three-way comparison for robot evaluation) ─────────────────
+# v1 vanilla BC   → already trained: Odog16/trash_pickup_SmolVLA_v1   (20k steps)
+# v2 single_stage → above RA-BC run: Odog16/trash_pickup_SmolVLA_v2_rabc
+# v3 dual-stage   → same as v2 but with dual SARM model:
+#   --policy.pretrained_path=Odog16/trash_pickup_SmolVLA_v1
+#   --rabc_head_mode=sparse  (sparse head from dual model still works)
+#   change --policy.repo_id + --output_dir to trash_pickup_SmolVLA_v3_rabc_dual
+
+# =============================================================================
+# TRASH PICKUP TRAINING (Odog16/trash_pickup — 72 eps, 85K frames, xlerobot)
+# =============================================================================
+# Dataset: 3 cameras (head/left_wrist/right_wrist @ 640x360), 18-DOF state/action, 1 task
+# Hardware: RTX 3090 Ti 24 GB
+# Steps math: 85K frames / batch_size=16 ≈ 5.3K steps/epoch → 15K ≈ 2.8 epochs
+#
+# IMPORTANT: IsaacSim + ROS pollute PYTHONPATH with Python 3.11 pydantic/pydantic_core
+# which breaks wandb import in the Python 3.12 conda env. Always clear it first:
+unset PYTHONPATH
+
+# ── OPTION A: SmolVLA (recommended — VLM-based, language-conditioned) ──────────
+# ~3.5 h on 3090 Ti (same speed as block_sorting at 1.6 step/s)
+# Warm-start from block_sorting checkpoint so the robot dynamics transfer.
+lerobot-train \
+    --dataset.repo_id=Odog16/trash_pickup \
+    --policy.type=smolvla \
+    --policy.pretrained_path=Odog16/block_sorting_SmolVLA_v5_15k \
+    --policy.train_expert_only=true \
+    --policy.train_state_proj=true \
+    --policy.use_amp=true \
+    --policy.num_vlm_layers=16 \
+    --policy.push_to_hub=true \
+    --policy.repo_id=Odog16/trash_pickup_SmolVLA_v1 \
+    --output_dir=outputs/train/trash_pickup_SmolVLA_v1 \
+    --job_name=trash_pickup_SmolVLA_v1 \
+    --batch_size=16 \
+    --steps=15000 \
+    --save_freq=5000 \
+    --log_freq=200 \
+    --num_workers=4 \
+    --scheduler.type=cosine_decay_with_warmup \
+    --scheduler.peak_lr=1e-4 \
+    --scheduler.decay_lr=2.5e-6 \
+    --scheduler.num_warmup_steps=1000 \
+    --scheduler.num_decay_steps=13000 \
+    --seed=1000 \
+    --wandb.enable=true \
+    --wandb.project=lerobot
+
+# ── OPTION A2: SmolVLA — train from scratch (no warm-start) ────────────────────
+lerobot-train \
+    --dataset.repo_id=Odog16/trash_pickup \
+    --policy.type=smolvla \
+    --policy.repo_id=Odog16/trash_pickup_SmolVLA_scratch \
+    --policy.push_to_hub=false \
+    --policy.train_expert_only=true \
+    --policy.train_state_proj=true \
+    --policy.use_amp=true \
+    --policy.num_vlm_layers=16 \
+    --output_dir=outputs/train/trash_pickup_SmolVLA_scratch \
+    --job_name=trash_pickup_SmolVLA_scratch \
+    --batch_size=16 \
+    --steps=15000 \
+    --save_freq=5000 \
+    --log_freq=200 \
+    --num_workers=4 \
+    --scheduler.type=cosine_decay_with_warmup \
+    --scheduler.peak_lr=1e-4 \
+    --scheduler.decay_lr=2.5e-6 \
+    --scheduler.num_warmup_steps=1000 \
+    --scheduler.num_decay_steps=13000 \
+    --seed=1000 \
+    --wandb.enable=true \
+    --wandb.project=lerobot
+
+# ── OPTION B: ACT (fast, deterministic, good for 72 episodes) ──────────────────
+# ~1–2 h on 3090 Ti. Larger batch fits easily in 24 GB.
+lerobot-train \
+    --dataset.repo_id=Odog16/trash_pickup \
+    --policy.type=act \
+    --policy.repo_id=Odog16/trash_pickup_ACT_v1 \
+    --policy.push_to_hub=false \
+    --policy.device=cuda \
+    --output_dir=outputs/train/trash_pickup_ACT_v1 \
+    --job_name=trash_pickup_ACT_v1 \
+    --batch_size=64 \
+    --steps=80000 \
+    --save_freq=20000 \
+    --log_freq=200 \
+    --num_workers=4 \
+    --seed=1000 \
+    --wandb.enable=true \
+    --wandb.project=lerobot
+
+# ── OPTION C: Diffusion (highest quality, slowest inference) ───────────────────
+# ~2–3 h training on 3090 Ti. Use async inference server for 30 Hz on Jetson.
+lerobot-train \
+    --dataset.repo_id=Odog16/trash_pickup \
+    --policy.type=diffusion \
+    --policy.repo_id=Odog16/trash_pickup_diffusion_v1 \
+    --policy.push_to_hub=false \
+    --policy.device=cuda \
+    --output_dir=outputs/train/trash_pickup_diffusion_v1 \
+    --job_name=trash_pickup_diffusion_v1 \
+    --batch_size=32 \
+    --steps=60000 \
+    --save_freq=20000 \
+    --log_freq=200 \
+    --num_workers=4 \
+    --seed=1000 \
+    --wandb.enable=true \
+    --wandb.project=lerobot
+
+# Resume any run:
+# lerobot-train \
+#     --config_path=outputs/train/trash_pickup_SmolVLA_v1/checkpoints/last/pretrained_model/train_config.json \
+#     --resume=true
+
+# Upload SmolVLA checkpoints after training (edit upload_checkpoints.py for each run):
+# python upload_checkpoints.py
+
+# ── MULTI-DATASET: combine trash_pickup with older datasets ────────────────────
+# (lerobot supports comma-separated repo_ids or use a local merged dataset)
+# Example — combine trash_pickup + block_sorting for a generalist SmolVLA:
+lerobot-train \
+    --dataset.repo_id='["Odog16/trash_pickup","Odog16/block_sorting_single"]' \
+    --policy.type=smolvla \
+    --policy.repo_id=Odog16/multi_task_SmolVLA_v1 \
+    --policy.push_to_hub=false \
+    --policy.pretrained_path=Odog16/block_sorting_SmolVLA_v5_15k \
+    --policy.train_expert_only=true \
+    --policy.train_state_proj=true \
+    --policy.use_amp=true \
+    --policy.num_vlm_layers=16 \
+    --output_dir=outputs/train/multi_task_SmolVLA_v1 \
+    --job_name=multi_task_SmolVLA_v1 \
+    --batch_size=16 \
+    --steps=20000 \
+    --save_freq=5000 \
+    --log_freq=200 \
+    --num_workers=4 \
+    --scheduler.type=cosine_decay_with_warmup \
+    --scheduler.peak_lr=1e-4 \
+    --scheduler.decay_lr=2.5e-6 \
+    --scheduler.num_warmup_steps=1000 \
+    --scheduler.num_decay_steps=18000 \
+    --seed=1000 \
+    --wandb.enable=true \
+    --wandb.project=lerobot
+
+# =============================================================================
 # ASYNC INFERENCE (policy on external GPU, robot on Jetson)
 # =============================================================================
 # Use when the policy is too large for Jetson or you want inference on a stronger GPU.

@@ -13,6 +13,7 @@
 # limitations under the License.
 import abc
 import builtins
+import io
 import json
 import os
 import tempfile
@@ -35,6 +36,18 @@ from lerobot.utils.hub import HubMixin
 
 T = TypeVar("T", bound="PreTrainedConfig")
 logger = getLogger(__name__)
+
+
+def _infer_policy_config_type(config: dict[str, Any]) -> str | None:
+    """
+    Infer draccus ChoiceRegistry ``type`` for JSON that omits it.
+
+    ``PreTrainedConfig.type`` is a property (not a dumped field), so older checkpoints
+    may lack the top-level ``type`` key required by ``draccus.parse``.
+    """
+    if "annotation_mode" in config and "clip_batch_size" in config:
+        return "sarm"
+    return None
 
 
 @dataclass
@@ -161,8 +174,15 @@ class PreTrainedConfig(draccus.ChoiceRegistry, HubMixin, abc.ABC):  # type: igno
         return None
 
     def _save_pretrained(self, save_directory: Path) -> None:
-        with open(save_directory / CONFIG_NAME, "w") as f, draccus.config_type("json"):
-            draccus.dump(self, f, indent=4)
+        # ``type`` is required for ``from_pretrained`` / draccus ChoiceRegistry but is a
+        # ``@property``, not a dataclass field, so draccus.dump omits it unless merged in.
+        buf = io.StringIO()
+        with draccus.config_type("json"):
+            draccus.dump(self, buf, indent=4)
+        data = json.loads(buf.getvalue())
+        data["type"] = self.type
+        with open(save_directory / CONFIG_NAME, "w") as f:
+            json.dump(data, f, indent=4)
 
     @classmethod
     def from_pretrained(
@@ -206,24 +226,38 @@ class PreTrainedConfig(draccus.ChoiceRegistry, HubMixin, abc.ABC):  # type: igno
         if config_file is None:
             raise FileNotFoundError(f"{CONFIG_NAME} not found in {model_id}")
 
-        # Some older configs used a top-level "type" field that no longer exists in the
-        # dataclass definition (and newer configs omit it entirely). Strip it out once
-        # so both parses below see a schema-compatible JSON.
         with open(config_file) as f:
             config = json.load(f)
 
-        config.pop("type", None)
+        if "type" not in config:
+            inferred = _infer_policy_config_type(config)
+            if inferred is not None:
+                config["type"] = inferred
+            else:
+                raise ValueError(
+                    f"Policy {CONFIG_NAME} at {config_file!r} has no top-level 'type' key and "
+                    "could not infer the policy class. Add \"type\": \"<policy_name>\" (e.g. "
+                    '"sarm") or re-save the checkpoint with a current lerobot version.'
+                )
+
         with tempfile.NamedTemporaryFile("w+", delete=False, suffix=".json") as f:
             json.dump(config, f)
-            config_file = f.name
+            temp_for_choice = f.name
 
         # HACK: Parse the original config to get the config subclass, so that we can
         # apply cli overrides.
         # This is very ugly, ideally we'd like to be able to do that natively with draccus
         # something like --policy.path (in addition to --policy.type)
         with draccus.config_type("json"):
-            orig_config = draccus.parse(cls, config_file, args=[])
+            orig_config = draccus.parse(cls, temp_for_choice, args=[])
+
+        # ChoiceRegistry dispatch requires top-level ``type``; concrete config dataclasses
+        # (e.g. SARMConfig) do not define that field — strip before the second parse.
+        config.pop("type", None)
+        with tempfile.NamedTemporaryFile("w+", delete=False, suffix=".json") as f:
+            json.dump(config, f)
+            temp_for_subclass = f.name
 
         cli_overrides = policy_kwargs.pop("cli_overrides", [])
         with draccus.config_type("json"):
-            return draccus.parse(orig_config.__class__, config_file, args=cli_overrides)
+            return draccus.parse(orig_config.__class__, temp_for_subclass, args=cli_overrides)
