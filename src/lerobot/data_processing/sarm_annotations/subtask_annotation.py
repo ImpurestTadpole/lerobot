@@ -941,58 +941,14 @@ def timestamp_to_seconds(timestamp: str, video_duration_sec: float | None = None
 
 
 def extract_frame(video_path: Path, timestamp: float) -> np.ndarray | None:
-    """
-    Extract a single RGB frame at ``timestamp`` seconds.
-
-    Tries OpenCV first; falls back to ffmpeg for codecs OpenCV mishandles (e.g. AV1),
-    provided ffmpeg is built with a software AV1 decoder (e.g. libdav1d).
-    """
-    ts = max(0.0, float(timestamp))
+    """Extract a single frame from video at given timestamp."""
     cap = cv2.VideoCapture(str(video_path))
-    if cap.isOpened():
-        cap.set(cv2.CAP_PROP_POS_MSEC, ts * 1000)
-        ret, frame = cap.read()
-        cap.release()
-        if ret and frame is not None:
-            return cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
-
-    with tempfile.NamedTemporaryFile(suffix=".png", delete=False) as tmp:
-        out_path = Path(tmp.name)
-    try:
-        cmd = [
-            "ffmpeg",
-            "-hide_banner",
-            "-loglevel",
-            "error",
-            "-nostdin",
-            "-y",
-            "-i",
-            str(video_path),
-            "-ss",
-            f"{ts:.3f}",
-            "-frames:v",
-            "1",
-            "-an",
-            str(out_path),
-        ]
-        r = subprocess.run(
-            cmd,
-            stdout=subprocess.DEVNULL,
-            stderr=subprocess.PIPE,
-            text=True,
-            check=False,
-            timeout=120,
-        )
-        if r.returncode != 0:
-            return None
-        frame = cv2.imread(str(out_path))
-        if frame is not None:
-            return cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
-    except (FileNotFoundError, subprocess.TimeoutExpired, OSError):
-        pass
-    finally:
-        out_path.unlink(missing_ok=True)
-    return None
+    if not cap.isOpened():
+        return None
+    cap.set(cv2.CAP_PROP_POS_MSEC, timestamp * 1000)
+    ret, frame = cap.read()
+    cap.release()
+    return cv2.cvtColor(frame, cv2.COLOR_BGR2RGB) if ret else None
 
 
 def draw_timeline(
@@ -1073,9 +1029,6 @@ def visualize_episode(
 ):
     """Create visualization for a single episode with frames and timeline."""
     import matplotlib.pyplot as plt
-
-    # Quieter OpenCV/FFmpeg stderr (AV1 hardware messages, etc.).
-    os.environ.setdefault("OPENCV_FFMPEG_LOGLEVEL", "-8")
 
     if annotation is None:
         print(f"No {ann_type} annotation for episode {ep_idx}")

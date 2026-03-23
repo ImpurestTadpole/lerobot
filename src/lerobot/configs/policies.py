@@ -38,6 +38,28 @@ T = TypeVar("T", bound="PreTrainedConfig")
 logger = getLogger(__name__)
 
 
+def _resolve_local_pretrained_path(pretrained_name_or_path: str | Path) -> Path:
+    p = Path(pretrained_name_or_path).expanduser()
+    return p.resolve() if p.is_absolute() else (Path.cwd() / p).resolve()
+
+
+def _looks_like_filesystem_checkpoint_path(s: str) -> bool:
+    """Heuristic: avoid sending local-style paths to Hugging Face Hub (invalid repo id)."""
+    s_norm = s.replace("\\", "/").strip()
+    if not s_norm:
+        return False
+    if s_norm.startswith(("/", "./", "../")):
+        return True
+    markers = (
+        "pretrained_model",
+        "outputs/train",
+        "/train/",
+        "/checkpoints/",
+        "checkpoints/",
+    )
+    return any(m in s_norm for m in markers)
+
+
 def _infer_policy_config_type(config: dict[str, Any]) -> str | None:
     """
     Infer draccus ChoiceRegistry ``type`` for JSON that omits it.
@@ -199,12 +221,20 @@ class PreTrainedConfig(draccus.ChoiceRegistry, HubMixin, abc.ABC):  # type: igno
         **policy_kwargs: Any,
     ) -> T:
         model_id = str(pretrained_name_or_path)
+        resolved_local = _resolve_local_pretrained_path(model_id)
         config_file: str | None = None
-        if Path(model_id).is_dir():
-            if CONFIG_NAME in os.listdir(model_id):
-                config_file = os.path.join(model_id, CONFIG_NAME)
+        if resolved_local.is_dir():
+            if CONFIG_NAME in os.listdir(resolved_local):
+                config_file = str(resolved_local / CONFIG_NAME)
             else:
-                logger.error(f"{CONFIG_NAME} not found in {Path(model_id).resolve()}")
+                logger.error(f"{CONFIG_NAME} not found in {resolved_local}")
+        elif _looks_like_filesystem_checkpoint_path(model_id):
+            raise FileNotFoundError(
+                f"Local policy path is not an existing directory: {resolved_local}. "
+                "If you meant a Hugging Face Hub repo, use 'namespace/repo_name'. "
+                "Otherwise fix the path (checkpoint step folder may be missing, e.g. 008000 vs 005000), "
+                "run from the repo root, or pass an absolute path to pretrained_model."
+            )
         else:
             try:
                 config_file = hf_hub_download(

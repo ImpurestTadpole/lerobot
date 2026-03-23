@@ -210,7 +210,7 @@ class StreamingLeRobotDataset(torch.utils.data.IterableDataset):
     Example:
         Basic usage:
         ```python
-        from lerobot.common.datasets.streaming_dataset import StreamingLeRobotDataset
+        from lerobot.datasets.streaming_dataset import StreamingLeRobotDataset
 
         # Create a streaming dataset with delta timestamps
         delta_timestamps = {
