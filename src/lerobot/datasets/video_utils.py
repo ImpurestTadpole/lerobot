@@ -17,8 +17,10 @@ import contextlib
 import glob
 import importlib
 import logging
+import os
 import queue
 import shutil
+import subprocess
 import tempfile
 import threading
 import warnings
@@ -510,15 +512,74 @@ def encode_video_frames(
         raise OSError(f"Video encoding did not work. File not found: {video_path}.")
 
 
+def _ffmpeg_concat_stream_copy(concat_list_path: Path, output_path: Path) -> None:
+    cmd = [
+        "ffmpeg",
+        "-y",
+        "-hide_banner",
+        "-loglevel",
+        "error",
+        "-f",
+        "concat",
+        "-safe",
+        "0",
+        "-i",
+        str(concat_list_path),
+        "-c",
+        "copy",
+        "-movflags",
+        "+faststart",
+        str(output_path),
+    ]
+    proc = subprocess.run(cmd, capture_output=True, text=True, check=False)
+    if proc.returncode != 0:
+        msg = (proc.stderr or proc.stdout or "").strip() or "ffmpeg stream-copy concat failed"
+        raise RuntimeError(msg)
+
+
+def _ffmpeg_concat_reencode_h264(concat_list_path: Path, output_path: Path) -> None:
+    """Decode concat segments and re-encode to H.264 (fixes DTS/GOP/SPS mismatches across files)."""
+    cmd = [
+        "ffmpeg",
+        "-y",
+        "-hide_banner",
+        "-loglevel",
+        "error",
+        "-f",
+        "concat",
+        "-safe",
+        "0",
+        "-i",
+        str(concat_list_path),
+        "-map",
+        "0:v:0",
+        "-c:v",
+        "libx264",
+        "-preset",
+        "fast",
+        "-crf",
+        "23",
+        "-pix_fmt",
+        "yuv420p",
+        "-movflags",
+        "+faststart",
+        str(output_path),
+    ]
+    proc = subprocess.run(cmd, capture_output=True, text=True, check=False)
+    if proc.returncode != 0:
+        msg = (proc.stderr or proc.stdout or "").strip() or "ffmpeg re-encode concat failed"
+        raise RuntimeError(msg)
+
+
 def concatenate_video_files(
     input_video_paths: list[Path | str], output_video_path: Path, overwrite: bool = True
 ):
     """
-    Concatenate multiple video files into a single video file using pyav.
+    Concatenate multiple video files into a single video file.
 
-    This function takes a list of video input file paths and concatenates them into a single
-    output video file. It uses ffmpeg's concat demuxer with stream copy mode for fast
-    concatenation without re-encoding.
+    Tries PyAV first (concat demuxer + stream copy). If that fails (common when joining
+    separately encoded H.264 MP4s with non-monotonic DTS at segment boundaries), falls back
+    to the ffmpeg CLI: stream copy, then H.264 re-encode if needed.
 
     Args:
         input_video_paths: Ordered list of input video file paths to concatenate.
@@ -526,9 +587,10 @@ def concatenate_video_files(
         overwrite: Whether to overwrite the output video file if it already exists. Default is True.
 
     Note:
-        - Creates a temporary directory for intermediate files that is cleaned up after use.
-        - Uses ffmpeg's concat demuxer which requires all input videos to have the same
-          codec, resolution, and frame rate for proper concatenation.
+        - Creates a temporary ffconcat list; cleaned up after use.
+        - Stream copy requires compatible codec, resolution, and frame rate across inputs.
+        - Re-encode fallback requires a system ``ffmpeg`` with libx264 and maps only the first
+          video stream (no audio in the output).
     """
 
     output_video_path = Path(output_video_path)
@@ -542,55 +604,71 @@ def concatenate_video_files(
     if len(input_video_paths) == 0:
         raise FileNotFoundError("No input video paths provided.")
 
-    # Create a temporary .ffconcat file to list the input video paths
     with tempfile.NamedTemporaryFile(mode="w", suffix=".ffconcat", delete=False) as tmp_concatenate_file:
         tmp_concatenate_file.write("ffconcat version 1.0\n")
         for input_path in input_video_paths:
-            tmp_concatenate_file.write(f"file '{str(input_path.resolve())}'\n")
+            tmp_concatenate_file.write(f"file '{str(Path(input_path).resolve())}'\n")
         tmp_concatenate_file.flush()
         tmp_concatenate_path = tmp_concatenate_file.name
 
-    # Create input and output containers
-    input_container = av.open(
-        tmp_concatenate_path, mode="r", format="concat", options={"safe": "0"}
-    )  # safe = 0 allows absolute paths as well as relative paths
+    tmp_concatenate_path_p = Path(tmp_concatenate_path)
+    fd, tmp_output_video_path = tempfile.mkstemp(suffix=".mp4")
+    os.close(fd)
+    tmp_output_video_path_p = Path(tmp_output_video_path)
 
-    with tempfile.NamedTemporaryFile(suffix=".mp4", delete=False) as tmp_named_file:
-        tmp_output_video_path = tmp_named_file.name
-
-    output_container = av.open(
-        tmp_output_video_path, mode="w", options={"movflags": "faststart"}
-    )  # faststart is to move the metadata to the beginning of the file to speed up loading
-
-    # Replicate input streams in output container
-    stream_map = {}
-    for input_stream in input_container.streams:
-        if input_stream.type in ("video", "audio", "subtitle"):  # only copy compatible streams
-            stream_map[input_stream.index] = output_container.add_stream_from_template(
-                template=input_stream, opaque=True
+    try:
+        try:
+            input_container = av.open(
+                tmp_concatenate_path, mode="r", format="concat", options={"safe": "0"}
             )
+            output_container = av.open(
+                tmp_output_video_path, mode="w", options={"movflags": "faststart"}
+            )
+            try:
+                stream_map = {}
+                for input_stream in input_container.streams:
+                    if input_stream.type in ("video", "audio", "subtitle"):
+                        stream_map[input_stream.index] = output_container.add_stream_from_template(
+                            template=input_stream, opaque=True
+                        )
+                        stream_map[input_stream.index].time_base = input_stream.time_base
 
-            # set the time base to the input stream time base (missing in the codec context)
-            stream_map[input_stream.index].time_base = input_stream.time_base
-
-    # Demux + remux packets (no re-encode)
-    for packet in input_container.demux():
-        # Skip packets from un-mapped streams
-        if packet.stream.index not in stream_map:
-            continue
-
-        # Skip demux flushing packets
-        if packet.dts is None:
-            continue
-
-        output_stream = stream_map[packet.stream.index]
-        packet.stream = output_stream
-        output_container.mux(packet)
-
-    input_container.close()
-    output_container.close()
-    shutil.move(tmp_output_video_path, output_video_path)
-    Path(tmp_concatenate_path).unlink()
+                for packet in input_container.demux():
+                    if packet.stream.index not in stream_map:
+                        continue
+                    if packet.dts is None:
+                        continue
+                    output_stream = stream_map[packet.stream.index]
+                    packet.stream = output_stream
+                    output_container.mux(packet)
+            finally:
+                input_container.close()
+                output_container.close()
+            shutil.move(tmp_output_video_path, output_video_path)
+        except (av.error.FFmpegError, av.error.ValueError, OSError) as e:
+            if tmp_output_video_path_p.exists():
+                tmp_output_video_path_p.unlink()
+            if shutil.which("ffmpeg") is None:
+                raise RuntimeError(
+                    "Video concatenation failed with PyAV and `ffmpeg` was not found on PATH. "
+                    "Install ffmpeg or re-encode inputs to a single consistent stream before merging."
+                ) from e
+            logger.warning(
+                "PyAV concatenate failed (%s); retrying with ffmpeg stream copy", e, exc_info=False
+            )
+            try:
+                _ffmpeg_concat_stream_copy(tmp_concatenate_path_p, tmp_output_video_path_p)
+                shutil.move(tmp_output_video_path, output_video_path)
+            except RuntimeError as e_copy:
+                logger.warning(
+                    "ffmpeg stream-copy concat failed (%s); re-encoding with libx264", e_copy, exc_info=False
+                )
+                _ffmpeg_concat_reencode_h264(tmp_concatenate_path_p, tmp_output_video_path_p)
+                shutil.move(tmp_output_video_path, output_video_path)
+    finally:
+        tmp_concatenate_path_p.unlink(missing_ok=True)
+        if tmp_output_video_path_p.exists() and tmp_output_video_path_p.resolve() != output_video_path.resolve():
+            tmp_output_video_path_p.unlink(missing_ok=True)
 
 
 class _CameraEncoderThread(threading.Thread):

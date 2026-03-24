@@ -10,7 +10,7 @@ RUNS = [
     # trash_pickup SmolVLA — upload 15k checkpoint (20k was auto-pushed at end of training)
     (
         "outputs/train/trash_pickup_SmolVLA_v1",
-        "Odog16/trash_pickup_SmolVLA",
+        "Odog16/trash_pickup_SmolVLA_v2.1_rabc",
         ["015000"],
     ),
     # Uncomment to upload additional checkpoints:

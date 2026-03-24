@@ -346,63 +346,92 @@ lerobot-train \
     --resume=true
 
 # =============================================================================
-# SARM (+ RA-BC) — trash_pickup (validated commands, Mar 2026)
+# SARM + RA-BC — mirrors Hugging Face doc order (dual / trash_pickup)
 # =============================================================================
-# Paper: https://arxiv.org/abs/2509.25358
-# Docs:  https://huggingface.co/docs/lerobot/en/sarm
+# Paper:  https://arxiv.org/abs/2509.25358
+# Docs:   https://huggingface.co/docs/lerobot/en/sarm
+# (same workflow as the doc: Annotate → Verify → Train SARM → Visualize predictions
+#  → optional RA-BC: precompute progress → train policy)
 #
-# trash_pickup: 6 sparse stages (navigate→descend→grasp→lift→navigate→place),
-# head cam observation.images.head, ~72 episodes.
+# This block: dual annotation (sparse + dense VLM labels) → annotation_mode=dual.
+# sparse_only path: only --sparse-subtasks in Step 1, then Step 3 “Alternative”.
 #
-# This block uses SPARSE annotations only → SARM --policy.annotation_mode=sparse_only.
-# (dual needs dense VLM labels + temporal_proportions_dense.json — not used below.)
-#
-# Do NOT use single_stage for meaningful stage progress or RA-BC; loss collapses on a
-# trivial linear ramp. Training is slow (CLIP + video decode); plan long runs.
-#
-# Reward checkpoint path must exist on disk, e.g. 005000 after 5000 steps with
-# --save_freq=2500. Run all python from repo root: cd ~/lerobot (conda env: lerobot).
+# trash_pickup: observation.images.head, ~72 episodes. Avoid single_stage for real stages / RA-BC.
+# VLM: “No JSON object in model response” → --skip-existing, --max-new-tokens 4096, or Qwen2-VL-2B.
+# Isaac Sim / ROS: unset PYTHONPATH before Python (wandb, matplotlib, kiwisolver).
+# SARM checkpoint example: .../005000 after 5000 steps, --save_freq=2500.
 #
 unset PYTHONPATH
 
-# ── STEP 0: Sparse subtask annotation (Qwen2-VL) ─────────────────────────────
+# -----------------------------------------------------------------------------
+# Step 1 — Subtask annotation (HF doc “Step 1: Subtask Annotation”)
+# -----------------------------------------------------------------------------
+#
+# Generic dual example from the doc (swap repo, subtasks, video-key):
+#   python src/lerobot/data_processing/sarm_annotations/subtask_annotation.py \
+#     --repo-id your-username/your-dataset \
+#     --sparse-subtasks "Bring arms up from starting position,Fold the towel (3 folds in total)" \
+#     --dense-subtasks "Bring robot arms up from starting position,Grab near side and do 1st fold,Grab side and do 2nd fold,Grab side and do 3rd fold to finish folding" \
+#     --video-key observation.images.base \
+#     --num-workers 4 \
+#     --push-to-hub
+#
+# trash_pickup — dual (sparse + dense):
 python src/lerobot/data_processing/sarm_annotations/subtask_annotation.py \
     --repo-id Odog16/trash_pickup \
     --sparse-subtasks "navigate to object,descend gantry,grasp object,lift object,navigate to bin,place in bin" \
+    --dense-subtasks "drive toward object,align in front of object,descend gantry to grasp height,grasp object,lift object clear,navigate toward bin,position over bin,place object in bin" \
     --video-key observation.images.head \
-    --model Qwen/Qwen2-VL-2B-Instruct \
+    --model Qwen/Qwen2-VL-7B-Instruct \
     --max-retries 5 \
     --max-new-tokens 2048 \
     --num-visualizations 5 \
     --output-dir ./subtask_viz
 
-# Optional: resume only failed/missing episodes — add --skip-existing
-# Optional QC only: --visualize-only --num-visualizations 5 --output-dir ./subtask_viz
+# Optional: --push-to-hub  |  resume failures: --skip-existing  |  lighter model: Qwen/Qwen2-VL-2B-Instruct
 #
-# Outputs: ~/.cache/huggingface/lerobot/Odog16/trash_pickup/meta/temporal_proportions_sparse.json
-#          episode parquet sparse_subtask_* columns; ./subtask_viz/*.png
+# sparse_only (no dense): omit --dense-subtasks; use Step 3 “Alternative” for SARM training.
+# Writes: meta/temporal_proportions_{sparse,dense}.json, parquet sparse_*/dense_* columns, ./subtask_viz/
 
+# -----------------------------------------------------------------------------
+# Step 2 — Verify annotations (HF doc “Step 2: Verify Annotations”)
+# -----------------------------------------------------------------------------
+python src/lerobot/data_processing/sarm_annotations/subtask_annotation.py \
+    --repo-id Odog16/trash_pickup \
+    --visualize-only \
+    --visualize-type both \
+    --num-visualizations 5 \
+    --video-key observation.images.head \
+    --output-dir ./subtask_viz
+
+# Optional: inspect dataset-level priors (after Step 1):
 python3 -c "
 import json, pathlib
-p = pathlib.Path.home() / '.cache/huggingface/lerobot/Odog16/trash_pickup/meta/temporal_proportions_sparse.json'
-d = json.loads(p.read_text())
-vals = list(d.values())
-print('Subtask names:', list(d.keys()))
-print('Proportions:  ', [round(v, 3) for v in vals])
-print('Sum:', round(sum(vals), 4))
+root = pathlib.Path.home() / '.cache/huggingface/lerobot/Odog16/trash_pickup/meta'
+for name in ('temporal_proportions_sparse.json', 'temporal_proportions_dense.json'):
+    p = root / name
+    if not p.is_file():
+        print(name, ': (missing)')
+        continue
+    d = json.loads(p.read_text())
+    vals = list(d.values())
+    print(name, '| stages:', list(d.keys()))
+    print('  proportions:', [round(v, 3) for v in vals], '| sum', round(sum(vals), 4))
 "
 
-# ── STEP 1: Train SARM (sparse_only) ─────────────────────────────────────────
+# -----------------------------------------------------------------------------
+# Step 3 — Train SARM (HF doc “Step 3: Train SARM”, annotation_mode=dual)
+# -----------------------------------------------------------------------------
 lerobot-train \
     --dataset.repo_id=Odog16/trash_pickup \
     --policy.type=sarm \
-    --policy.annotation_mode=sparse_only \
+    --policy.annotation_mode=dual \
     --policy.image_key=observation.images.head \
     --policy.state_key=observation.state \
     --policy.n_obs_steps=8 \
     --policy.frame_gap=10 \
     --policy.drop_n_last_frames=200 \
-    --output_dir=outputs/train/trash_pickup_sarm \
+    --output_dir=outputs/train/trash_pickup_sarm_dual \
     --batch_size=32 \
     --steps=5000 \
     --save_freq=2500 \
@@ -411,34 +440,47 @@ lerobot-train \
     --wandb.enable=true \
     --wandb.project=lerobot \
     --policy.push_to_hub=false \
-    --policy.repo_id=Odog16/trash_pickup_sarm
+    --policy.repo_id=Odog16/trash_pickup_sarm_dual
 
-# ── STEP 2: Visualise SARM predictions (optional QC) ────────────────────────
+# Alternative — sparse_only labels: --policy.annotation_mode=sparse_only,
+#   --output_dir=outputs/train/trash_pickup_sarm, --policy.repo_id=Odog16/trash_pickup_sarm
+#   Point Steps 4–5a --reward-model-path at that run’s .../005000/pretrained_model.
+
+# -----------------------------------------------------------------------------
+# Step 4 — Visualize predictions (HF doc “Step 4: Visualize Predictions”)
+# -----------------------------------------------------------------------------
+# matplotlib: if kiwisolver._cext fails → unset PYTHONPATH (Isaac Sim PYTHONPATH).
 python src/lerobot/policies/sarm/compute_rabc_weights.py \
     --dataset-repo-id Odog16/trash_pickup \
-    --reward-model-path outputs/train/trash_pickup_sarm/checkpoints/005000/pretrained_model \
+    --reward-model-path outputs/train/trash_pickup_sarm_dual/checkpoints/005000/pretrained_model \
     --visualize-only \
     --num-visualizations 5 \
-    --head-mode sparse \
+    --head-mode both \
     --output-dir ./sarm_predictions
 
-# ── STEP 3: Full progress → sarm_progress.parquet (+ Hub upload by default) ─
+# -----------------------------------------------------------------------------
+# Step 5 (optional) — Train policy with RA-BC (HF doc “Step 5”)
+# -----------------------------------------------------------------------------
+
+# Step 5a — Compute SARM progress values (HF “Step 5a: Compute SARM Progress Values”)
+# Writes sarm_progress.parquet; uploads to dataset repo by default (--push-to-hub).
 python src/lerobot/policies/sarm/compute_rabc_weights.py \
     --dataset-repo-id Odog16/trash_pickup \
-    --reward-model-path outputs/train/trash_pickup_sarm/checkpoints/005000/pretrained_model \
-    --head-mode sparse \
+    --reward-model-path outputs/train/trash_pickup_sarm_dual/checkpoints/005000/pretrained_model \
+    --head-mode both \
     --num-visualizations 0 \
     --output-dir ./sarm_predictions \
     --stride 5
 
-# Local copy: ~/.cache/huggingface/lerobot/Odog16/trash_pickup/sarm_progress.parquet
-# RA-BC training resolves hf://datasets/Odog16/trash_pickup/sarm_progress.parquet automatically.
+# Local: ~/.cache/huggingface/lerobot/Odog16/trash_pickup/sarm_progress.parquet
+# Hub:   hf://datasets/Odog16/trash_pickup/sarm_progress.parquet (auto for RA-BC)
 
-# ── STEP 4: SmolVLA + RA-BC (uses STEP 3 parquet on Hub) ───────────────────
+# Step 5b — Train policy with RA-BC (HF “Step 5b: Train Policy with RA-BC”)
+# --rabc_head_mode: sparse or dense (must exist in parquet when using dual SARM).
 lerobot-train \
     --dataset.repo_id=Odog16/trash_pickup \
     --policy.type=smolvla \
-    --policy.repo_id=Odog16/trash_pickup_SmolVLA_v2_rabc \
+    --policy.repo_id=Odog16/trash_pickup_SmolVLA_v2.1_rabc \
     --policy.push_to_hub=false \
     --policy.pretrained_path=Odog16/trash_pickup_SmolVLA_v1 \
     --policy.train_expert_only=true \
@@ -450,8 +492,8 @@ lerobot-train \
     --use_rabc=true \
     --rabc_head_mode=sparse \
     --rabc_kappa=0.01 \
-    --output_dir=outputs/train/trash_pickup_SmolVLA_v2_rabc \
-    --job_name=trash_pickup_SmolVLA_v2_rabc \
+    --output_dir=outputs/train/trash_pickup_SmolVLA_v2.1_rabc \
+    --job_name=trash_pickup_SmolVLA_v2.1_rabc \
     --batch_size=16 \
     --steps=20000 \
     --save_freq=5000 \
@@ -464,16 +506,17 @@ lerobot-train \
     --wandb.enable=true \
     --wandb.project=lerobot
 
-# Push SmolVLA checkpoints (correct import — no lerobot.common):
+# Push SmolVLA checkpoint (import path is lerobot.policies.smolvla, not lerobot.common):
 # python3 -c "from lerobot.policies.smolvla.modeling_smolvla import SmolVLAPolicy; \
 # p=SmolVLAPolicy.from_pretrained('outputs/train/trash_pickup_SmolVLA_v2_rabc/checkpoints/020000/pretrained_model'); \
 # p.push_to_hub('Odog16/trash_pickup_SmolVLA_v2_rabc_20k')"
 
-# Resume RA-BC: lerobot-train --config_path=outputs/train/trash_pickup_SmolVLA_v2_rabc/checkpoints/last/pretrained_model/train_config.json --resume=true
+# Resume Step 5b: lerobot-train --config_path=outputs/train/trash_pickup_SmolVLA_v2_rabc/checkpoints/last/pretrained_model/train_config.json --resume=true
 
 # =============================================================================
-# TRASH PICKUP TRAINING (Odog16/trash_pickup — 72 eps, 85K frames, xlerobot)
+# TRASH PICKUP — base policy training (not numbered on HF SARM page)
 # =============================================================================
+# Train a vanilla policy first if Step 5b uses --policy.pretrained_path (e.g. SmolVLA v1).
 # Dataset: 3 cameras (head/left_wrist/right_wrist @ 640x360), 18-DOF state/action, 1 task
 # Hardware: RTX 3090 Ti 24 GB
 # Steps math: 85K frames / batch_size=16 ≈ 5.3K steps/epoch → 15K ≈ 2.8 epochs

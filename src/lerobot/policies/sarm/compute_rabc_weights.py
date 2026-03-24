@@ -140,6 +140,12 @@ def visualize_episode(
 
     Same as sarm_inference_visualization.py
     """
+    # Lazy import: avoids matplotlib/kiwisolver when only computing parquet (RA-BC path).
+    # If this import fails with kiwisolver._cext errors, Isaac Sim / ROS often pollute
+    # PYTHONPATH — run: unset PYTHONPATH
+    import matplotlib.gridspec as gridspec
+    import matplotlib.pyplot as plt
+
     num_stages = stage_preds.shape[1]
     colors = plt.cm.tab10(np.linspace(0, 1, num_stages))
     frame_indices = np.arange(len(progress_preds))
