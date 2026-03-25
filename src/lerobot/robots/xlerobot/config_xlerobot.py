@@ -79,7 +79,7 @@ def xlerobot_cameras_config() -> dict[str, CameraConfig]:
         # PERFORMANCE: MJPG format is critical for 30 Hz control rate
         # If MJPG fails (camera defaults to YUYV), run: ./setup_camera_formats.sh
         "left_wrist": OpenCVCameraConfig(
-            index_or_path="/dev/video8",  # Innomaker camera 2 (swapped)
+            index_or_path="/dev/video4",  # Innomaker camera 2 (swapped)
             fps=30,
             width=640,   # For 30 Hz with MJPG. If using YUYV, reduce to 320x240
             height=360,  # For 30 Hz with MJPG. If using YUYV, reduce to 320x240
@@ -92,7 +92,7 @@ def xlerobot_cameras_config() -> dict[str, CameraConfig]:
         # PERFORMANCE: MJPG format is critical for 30 Hz control rate
         # If MJPG fails (camera defaults to YUYV), run: ./setup_camera_formats.sh
         "right_wrist": OpenCVCameraConfig(
-            index_or_path="/dev/video6",  # Innomaker camera 1 (swapped)
+            index_or_path="/dev/video8",  # Innomaker camera 1 (swapped)
             fps=30,
             width=640,   # For 30 Hz with MJPG. If using YUYV, reduce to 320x240
             height=360,  # For 30 Hz with MJPG. If using YUYV, reduce to 320x240
@@ -108,8 +108,8 @@ def xlerobot_cameras_config() -> dict[str, CameraConfig]:
 class XLerobotConfig(RobotConfig):
     
     # Port 0 = left arm + base. Port 1 = right arm + head + (optional) lift axis.
-    port1: str = "/dev/ttyACM0"  # left arm motors 1-6 + base motors 7-9
-    port2: str = "/dev/ttyACM1"  # right arm motors 1-6 + head motors 7-8 + lift (motor 9)
+    port1: str = "/dev/ttyACM1"  # left arm motors 1-6 + base motors 7-9
+    port2: str = "/dev/ttyACM0"  # right arm motors 1-6 + head motors 7-8 + lift (motor 9)
     camera_start_order: tuple[str, ...] | None = ("head", "left_wrist", "right_wrist")
     camera_start_delay_s: float = 2.0  # Increased delay to allow cameras to initialize properly (especially right_wrist)
     disable_torque_on_disconnect: bool = True

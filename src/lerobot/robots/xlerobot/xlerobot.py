@@ -55,6 +55,10 @@ class XLerobot(Robot):
         super().__init__(config)
         self.config = config
         self.teleop_keys = config.teleop_keys
+        # EMA on base body-frame velocities (teleop + policy); shared motion language for train/infer.
+        # alpha ~0.3 ≈ few frames at 30 Hz; lower = smoother, higher = snappier.
+        self._base_vel_alpha = 0.35
+        self._base_vel_smooth = {"x.vel": 0.0, "y.vel": 0.0, "theta.vel": 0.0}
         # Define three speed levels and a current index
         self.speed_levels = [
             {"xy": 0.1, "theta": 30},  # slow
@@ -272,6 +276,7 @@ class XLerobot(Robot):
                     time.sleep(self.config.camera_start_delay_s)
 
         self.configure()
+        self._base_vel_smooth = {"x.vel": 0.0, "y.vel": 0.0, "theta.vel": 0.0}
         logger.info(f"{self} connected.")
 
     @property
@@ -661,6 +666,15 @@ class XLerobot(Robot):
             "theta.vel": theta_cmd,
         }
 
+    def _smooth_base_vel(self, cmd: dict[str, float]) -> dict[str, float]:
+        """EMA on x/y/theta body velocities; damps one-frame spikes (stick release, noisy policy)."""
+        for k in ("x.vel", "y.vel", "theta.vel"):
+            raw = float(cmd.get(k, 0.0))
+            self._base_vel_smooth[k] = (
+                self._base_vel_alpha * raw + (1.0 - self._base_vel_alpha) * self._base_vel_smooth[k]
+            )
+        return dict(self._base_vel_smooth)
+
     def get_observation(self, skip_cameras: bool = False, skip_depth: bool = False) -> dict[str, Any]:
         """
         Get robot observation with parallel bus reads and detailed profiling.
@@ -830,12 +844,13 @@ class XLerobot(Robot):
         left_arm_pos = {k: v for k, v in action.items() if k.startswith("left_arm_") and k.endswith(".pos")}
         right_arm_pos = {k: v for k, v in action.items() if k.startswith("right_arm_") and k.endswith(".pos")}
         head_pos = {k: v for k, v in action.items() if k.startswith("head_") and k.endswith(".pos")}
-        # Base velocity commands are ONLY x/y/theta to avoid accidentally treating other ".vel" keys as base.
-        base_goal_vel = {k: action.get(k, 0.0) for k in ("x.vel", "y.vel", "theta.vel") if k in action}
+        # Base: read raw body-frame cmds (0 if key absent) so EMA decays every tick.
+        base_goal_vel_raw = {k: float(action.get(k, 0.0)) for k in ("x.vel", "y.vel", "theta.vel")}
+        base_goal_vel_smooth = self._smooth_base_vel(base_goal_vel_raw)
         base_wheel_goal_vel = self._body_to_wheel_raw(
-            base_goal_vel.get("x.vel", 0.0),
-            base_goal_vel.get("y.vel", 0.0),
-            base_goal_vel.get("theta.vel", 0.0),
+            base_goal_vel_smooth["x.vel"],
+            base_goal_vel_smooth["y.vel"],
+            base_goal_vel_smooth["theta.vel"],
         )
         
         
@@ -907,7 +922,7 @@ class XLerobot(Robot):
             **left_arm_pos,
             **right_arm_pos,
             **head_pos,
-            **base_goal_vel,
+            **base_goal_vel_smooth,
             **lift_keys,
         }
 
@@ -915,6 +930,7 @@ class XLerobot(Robot):
         try:
             if self.bus1.is_connected:
                 self.bus1.sync_write("Goal_Velocity", dict.fromkeys(self.base_motors, 0), num_retry=5)
+                self._base_vel_smooth = {"x.vel": 0.0, "y.vel": 0.0, "theta.vel": 0.0}
                 logger.info("Base motors stopped")
             else:
                 logger.debug("Base bus not connected; skipping base stop.")

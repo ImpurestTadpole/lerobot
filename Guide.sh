@@ -129,6 +129,7 @@ rerun --serve-web --web-viewer-port 9090 --connect "rerun+http://172.20.10.13:98
 
 rerun --serve-web --web-viewer-port 9090 --connect "rerun+http://192.168.0.205:9876/proxy"
 
+rerun --serve-web --web-viewer-port 9090 --connect "rerun+http://10.249.40.136:9876/proxy"
 
 # OPTION 2: Via SSH tunnel
 # Terminal 1:
@@ -198,12 +199,12 @@ lerobot-record \
     --robot.type=xlerobot \
     --teleop.type=xlerobot_vr \
     --dataset.repo_id=Odog16/trash_pickup  \
-    --dataset.single_task="pick up the plastic bottle and place it in the trash bin" \
+    --dataset.single_task="pick up the can and place it in the trash bin" \
     --dataset.num_episodes=10 \
     --dataset.fps=30 \
     --display_data=true \
     --dataset.push_to_hub=false \
-    --resume=true 
+    --resume=true
 
 
 # Rerun live-view tuning — set before ANY lerobot-record call.
@@ -292,7 +293,7 @@ lerobot-record \
 # Manually push to hub after recording:
 # HF_DATASETS_CACHE=/tmp bypasses any corrupt Arrow cache from a previous interrupted load
 HF_DATASETS_CACHE=/tmp/hf_datasets_tmp python -c "from lerobot.datasets.lerobot_dataset import LeRobotDataset; \
-    dataset = LeRobotDataset('Odog16/block_sorting_single'); \
+    dataset = LeRobotDataset('Odog16/trash_pickup'); \
     dataset.push_to_hub()"
 
 # Local data location: ~/.cache/huggingface/lerobot/Odog16/ob15_test_1/
@@ -732,6 +733,19 @@ python -m lerobot.async_inference.robot_client \
     --actions_per_chunk=10 \
     --chunk_size_threshold=0.5 \
     --aggregate_fn_name="average" \
+    --fps=30
+
+
+python -m lerobot.async_inference.robot_client \
+    --server_address=10.249.40.136:8080 \
+    --robot.type=xlerobot \
+    --task="pick up the plastic bottle and place it in the trash bin" \
+    --policy_type=smolvla \
+    --pretrained_name_or_path=Odog16/trash_pickup_SmolVLA_v2.1_rabc_15k\
+    --policy_device=cuda \
+    --actions_per_chunk=42 \
+    --chunk_size_threshold=0.5 \
+    --aggregate_fn_name=weighted_average \
     --fps=30
 
 
