@@ -164,26 +164,57 @@ class PolicyServer(services_pb2_grpc.AsyncInferenceServicer):
         policy_class = get_policy_class(self.policy_type)
 
         start = time.perf_counter()
-        
-        # Enable RTC for flow-matching based policies (SmolVLA, Pi0, Pi0.5) if not already enabled
-        if self.policy_type in ["smolvla", "pi0", "pi05"]:
-            # Load config first using the policy's config_class
-            config = policy_class.config_class.from_pretrained(policy_specs.pretrained_name_or_path)
-            
-            # Enable RTC if not already enabled
-            if hasattr(config, "rtc_config") and (config.rtc_config is None or not getattr(config.rtc_config, "enabled", False)):
-                self.logger.info("Enabling RTC for flow-matching policy (recommended for smooth inference)")
-                config.rtc_config = RTCConfig(
-                    enabled=True,
-                    execution_horizon=10,
-                    max_guidance_weight=10.0,
-                    prefix_attention_schedule=RTCAttentionSchedule.EXP,
-                    debug=False,
+
+        # Fail fast when CUDA is explicitly requested but unavailable on this host.
+        # This avoids downloading/loading large checkpoints before crashing on first CUDA op.
+        if isinstance(self.device, str) and self.device.startswith("cuda"):
+            if not torch.cuda.is_available():
+                raise RuntimeError(
+                    "CUDA device was requested, but torch.cuda.is_available() is False. "
+                    "Check NVIDIA driver/kernel state and CUDA runtime visibility."
                 )
-                # Load policy with RTC-enabled config
-                self.policy = policy_class.from_pretrained(policy_specs.pretrained_name_or_path, config=config)
-            else:
-                # RTC already enabled or not applicable
+            if self.device != "cuda":
+                try:
+                    device_index = int(self.device.split(":")[1])
+                except (IndexError, ValueError) as e:
+                    raise ValueError(f"Invalid CUDA device specifier: {self.device}") from e
+                if device_index >= torch.cuda.device_count():
+                    raise RuntimeError(
+                        f"Requested CUDA device '{self.device}' does not exist. "
+                        f"Visible CUDA device count: {torch.cuda.device_count()}."
+                    )
+        
+        # Enable RTC for flow-matching based policies (SmolVLA, Pi0, Pi0.5) if not already enabled.
+        # Some checkpoints include top-level "type" metadata that can fail strict concrete-config parsing.
+        # In that case, fall back to loading the policy directly without pre-loading config.
+        if self.policy_type in ["smolvla", "pi0", "pi05"]:
+            try:
+                # Load config first using the policy's concrete config class
+                config = policy_class.config_class.from_pretrained(policy_specs.pretrained_name_or_path)
+
+                # Enable RTC if not already enabled
+                if hasattr(config, "rtc_config") and (
+                    config.rtc_config is None or not getattr(config.rtc_config, "enabled", False)
+                ):
+                    self.logger.info("Enabling RTC for flow-matching policy (recommended for smooth inference)")
+                    config.rtc_config = RTCConfig(
+                        enabled=True,
+                        execution_horizon=10,
+                        max_guidance_weight=10.0,
+                        prefix_attention_schedule=RTCAttentionSchedule.EXP,
+                        debug=False,
+                    )
+                    # Load policy with RTC-enabled config
+                    self.policy = policy_class.from_pretrained(policy_specs.pretrained_name_or_path, config=config)
+                else:
+                    # RTC already enabled or not applicable
+                    self.policy = policy_class.from_pretrained(policy_specs.pretrained_name_or_path)
+            except Exception as e:
+                self.logger.warning(
+                    "Failed to pre-load policy config for RTC setup (%s). "
+                    "Falling back to direct policy load.",
+                    e,
+                )
                 self.policy = policy_class.from_pretrained(policy_specs.pretrained_name_or_path)
         else:
             # For other policy types, load normally

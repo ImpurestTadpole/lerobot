@@ -125,7 +125,7 @@ lerobot-teleoperate \
 # =============================================================================
 
 # OPTION 1: Direct connection (recommended - best performance)
-rerun --serve-web --web-viewer-port 9090 --connect "rerun+http://172.20.10.13:9876/proxy"
+rerun --serve-web --web-viewer-port 9090 --connect "rerun+http://172.20.10.2:9876/proxy"
 
 rerun --serve-web --web-viewer-port 9090 --connect "rerun+http://192.168.0.205:9876/proxy"
 
@@ -299,6 +299,13 @@ HF_DATASETS_CACHE=/tmp/hf_datasets_tmp python -c "from lerobot.datasets.lerobot_
 # Local data location: ~/.cache/huggingface/lerobot/Odog16/ob15_test_1/
 # Parquet files: data/chunk-000/episode_*.parquet
 # Videos: videos/chunk-000/observation.images.*/episode_*.mp4
+# Push edited local dataset (set HF_TOKEN in env or `huggingface-cli login`; never commit tokens):
+# conda run -n lerobot bash -c 'export HF_TOKEN="${HF_TOKEN:?export HF_TOKEN first}"; python -c "
+# from pathlib import Path
+# from lerobot.datasets.lerobot_dataset import LeRobotDataset
+# ds = LeRobotDataset(\"Odog16/trash_pickup\", root=Path.home() / \".cache/huggingface/lerobot/Odog16/trash_pickup\")
+# ds.push_to_hub()
+# "'
 
 # Delete local dataset (if you want to start fresh):
 rm -rf ~/.cache/huggingface/lerobot/Odog16/tool_pickup
