@@ -22,6 +22,7 @@ import pandas as pd
 import pyarrow as pa
 import pyarrow.parquet as pq
 from huggingface_hub import snapshot_download
+from huggingface_hub.errors import RepositoryNotFoundError
 
 from lerobot.datasets.compute_stats import aggregate_stats
 from lerobot.datasets.feature_utils import _validate_feature_names, create_empty_dataset_info
@@ -93,7 +94,7 @@ class LeRobotDatasetMetadata:
         """
         self.repo_id = repo_id
         self.revision = revision if revision else CODEBASE_VERSION
-        self._requested_root = Path(root) if root is not None else None
+        self._requested_root = Path(root).expanduser() if root is not None else None
         self.root = self._requested_root if self._requested_root is not None else HF_LEROBOT_HOME / repo_id
         self._pq_writer = None
         self.latest_episode = None
@@ -107,12 +108,28 @@ class LeRobotDatasetMetadata:
             ):
                 raise FileNotFoundError
             self._load_metadata()
-        except (FileNotFoundError, NotADirectoryError):
-            if is_valid_version(self.revision):
-                self.revision = get_safe_version(self.repo_id, self.revision)
+        except (FileNotFoundError, NotADirectoryError) as local_err:
+            try:
+                if is_valid_version(self.revision):
+                    self.revision = get_safe_version(self.repo_id, self.revision)
 
-            self._pull_from_repo(allow_patterns="meta/")
-            self._load_metadata()
+                self._pull_from_repo(allow_patterns="meta/")
+                self._load_metadata()
+            except Exception as hub_err:
+                if isinstance(hub_err, RepositoryNotFoundError):
+                    if self._requested_root is not None:
+                        raise FileNotFoundError(
+                            f"Could not load metadata from local root {self.root} ({local_err}). "
+                            f"Dataset repo {self.repo_id!r} is not on the Hub yet, so meta/ cannot "
+                            f"be downloaded. Rebuild the local dataset (e.g. co_training_utils with "
+                            f"--force-rebuild if _align_tmp_* is stale), then push."
+                        ) from hub_err
+                    raise FileNotFoundError(
+                        f"Dataset {self.repo_id!r} is not available: no meta/ under {self.root} "
+                        f"({local_err}), and the Hugging Face dataset repo returned 404 (wrong id, "
+                        f"deleted, or private without `huggingface-cli login`)."
+                    ) from hub_err
+                raise
 
     def _flush_metadata_buffer(self) -> None:
         """Write all buffered episode metadata to parquet file."""
@@ -620,7 +637,7 @@ class LeRobotDatasetMetadata:
         """
         obj = cls.__new__(cls)
         obj.repo_id = repo_id
-        obj._requested_root = Path(root) if root is not None else None
+        obj._requested_root = Path(root).expanduser() if root is not None else None
         obj.root = obj._requested_root if obj._requested_root is not None else HF_LEROBOT_HOME / repo_id
 
         obj.root.mkdir(parents=True, exist_ok=False)

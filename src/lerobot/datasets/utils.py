@@ -28,7 +28,6 @@ import numpy as np
 import packaging.version
 import torch
 from huggingface_hub import DatasetCard, DatasetCardData, HfApi
-from huggingface_hub.errors import RevisionNotFoundError
 
 V30_MESSAGE = """
 The dataset you requested ({repo_id}) is in {version} format.
@@ -322,7 +321,7 @@ def get_safe_version(repo_id: str, version: str | packaging.version.Version) -> 
         str: The safe version string (e.g., "v1.2.3") to use as a revision.
 
     Raises:
-        RevisionNotFoundError: If the repo has no version tags.
+        ValueError: If the repo has no version tags on the Hub.
         BackwardCompatibilityError: If only older major versions are available.
         ForwardCompatibilityError: If only newer major versions are available.
     """
@@ -332,7 +331,7 @@ def get_safe_version(repo_id: str, version: str | packaging.version.Version) -> 
     hub_versions = get_repo_versions(repo_id)
 
     if not hub_versions:
-        raise RevisionNotFoundError(
+        raise ValueError(
             f"""Your dataset must be tagged with a codebase version.
             Assuming _version_ is the codebase_version value in the info.json, you can run this:
             ```python

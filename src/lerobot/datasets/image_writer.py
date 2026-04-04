@@ -74,6 +74,9 @@ def image_array_to_pil_image(
         if image_array.dtype == np.uint16:
             # Already in correct format (millimeters)
             pass
+        elif image_array.dtype == np.int16:
+            # Some pipelines store raw depth as signed int16; treat invalid (<0) as zero mm.
+            image_array = np.where(image_array < 0, 0, image_array).astype(np.uint16)
         elif np.issubdtype(image_array.dtype, np.floating):
             # Convert from meters to millimeters
             if range_check and image_array.min() < 0:

@@ -248,7 +248,21 @@ def write_episodes(episodes: Dataset, local_dir: Path) -> None:
 
 
 def load_episodes(local_dir: Path) -> datasets.Dataset:
-    episodes = load_nested_dataset(local_dir / EPISODES_DIR)
+    """Load ``meta/episodes`` shards into one Dataset.
+
+    Pandas concat avoids HF ``from_parquet`` multi-file schema merge failures when one shard
+    has all-null subtask columns and another has ``list<string>`` (e.g. after SARM writes).
+    """
+    ep_dir = local_dir / EPISODES_DIR
+    paths = sorted(ep_dir.glob("*/*.parquet"))
+    if len(paths) == 0:
+        raise FileNotFoundError(f"Provided directory does not contain any parquet file: {ep_dir}")
+    dfs = [pd.read_parquet(p) for p in paths]
+    df = pd.concat(dfs, ignore_index=True)
+    if "episode_index" in df.columns:
+        df = df.sort_values("episode_index", kind="mergesort").reset_index(drop=True)
+    with SuppressProgressBars():
+        episodes = Dataset.from_pandas(df, preserve_index=False)
     # Select episode features/columns containing references to episode data and videos
     # (e.g. tasks, dataset_from_index, dataset_to_index, data/chunk_index, data/file_index, etc.)
     # This is to speedup access to these data, instead of having to load episode stats.

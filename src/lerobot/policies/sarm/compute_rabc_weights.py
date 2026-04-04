@@ -49,8 +49,6 @@ import argparse
 import logging
 from pathlib import Path
 
-import matplotlib.gridspec as gridspec
-import matplotlib.pyplot as plt
 import numpy as np
 import pyarrow as pa
 import pyarrow.parquet as pq
@@ -80,6 +78,7 @@ def load_sarm_resources(
     dataset_repo_id: str,
     reward_model_path: str,
     device: str = "cuda",
+    tolerance_s: float = 1e-4,
 ) -> tuple[LeRobotDataset, SARMRewardModel, any]:
     """
     Load SARM model, dataset, and preprocessor.
@@ -97,14 +96,16 @@ def load_sarm_resources(
     delta_indices = reward_model.config.observation_delta_indices
 
     logging.info(f"Loading dataset: {dataset_repo_id}")
-    temp_dataset = LeRobotDataset(dataset_repo_id, download_videos=True)
+    temp_dataset = LeRobotDataset(dataset_repo_id, download_videos=True, tolerance_s=tolerance_s)
     fps = temp_dataset.fps
 
     delta_timestamps = {
         image_key: [idx / fps for idx in delta_indices],
         state_key: [idx / fps for idx in delta_indices],
     }
-    dataset = LeRobotDataset(dataset_repo_id, delta_timestamps=delta_timestamps)
+    dataset = LeRobotDataset(
+        dataset_repo_id, delta_timestamps=delta_timestamps, tolerance_s=tolerance_s
+    )
     logging.info(f"Dataset: {dataset.num_episodes} episodes, {dataset.num_frames} frames")
 
     preprocess, _ = make_sarm_pre_post_processors(
@@ -133,6 +134,30 @@ def to_numpy_image(img) -> np.ndarray:
     return img
 
 
+def _prep_sys_path_for_matplotlib() -> None:
+    """Isaac Sim's ``pip_prebundle`` is often prepended via PYTHONPATH and shadows conda's
+    ``kiwisolver`` (no ``_cext``). Strip those entries and prioritize this env's site-packages.
+    """
+    import site
+    import sys
+
+    def _is_isaac_prebundle(p: str) -> bool:
+        if not p:
+            return False
+        pl = p.replace("\\", "/").lower()
+        if "pip_prebundle" not in pl:
+            return False
+        return "isaacsim" in pl or "omni.isaac" in pl
+
+    sys.path[:] = [p for p in sys.path if not _is_isaac_prebundle(p)]
+    for p in reversed(site.getsitepackages()):
+        if not p:
+            continue
+        if p in sys.path:
+            sys.path.remove(p)
+        sys.path.insert(0, p)
+
+
 def visualize_episode(
     frames, progress_preds, stage_preds, title, output_path, stage_labels, gt_progress=None, gt_stages=None
 ):
@@ -141,8 +166,7 @@ def visualize_episode(
     Same as sarm_inference_visualization.py
     """
     # Lazy import: avoids matplotlib/kiwisolver when only computing parquet (RA-BC path).
-    # If this import fails with kiwisolver._cext errors, Isaac Sim / ROS often pollute
-    # PYTHONPATH — run: unset PYTHONPATH
+    _prep_sys_path_for_matplotlib()
     import matplotlib.gridspec as gridspec
     import matplotlib.pyplot as plt
 
@@ -475,6 +499,7 @@ def compute_sarm_progress(
     num_visualizations: int = 5,
     output_dir: str = "./sarm_viz",
     stride: int = 1,
+    tolerance_s: float = 1e-4,
 ):
     """
     Compute SARM progress predictions for all frames in a dataset.
@@ -488,8 +513,11 @@ def compute_sarm_progress(
         num_visualizations: Number of episodes to visualize (0 to skip)
         output_dir: Directory to save visualizations
         stride: Compute progress every N frames, interpolate the rest (default: 1 = every frame)
+        tolerance_s: Max seconds between parquet timestamps and decoded video PTS (merged/ffmpeg video may need ~1e-3).
     """
-    dataset, reward_model, preprocess = load_sarm_resources(dataset_repo_id, reward_model_path, device)
+    dataset, reward_model, preprocess = load_sarm_resources(
+        dataset_repo_id, reward_model_path, device, tolerance_s=tolerance_s
+    )
 
     # Set preprocessor to eval mode to disable augmentations
     if hasattr(preprocess, "eval"):
@@ -791,6 +819,12 @@ Examples:
         default=1,
         help="Compute progress every N frames, interpolate the rest (default: 1 = every frame)",
     )
+    parser.add_argument(
+        "--tolerance-s",
+        type=float,
+        default=1e-4,
+        help="Video timestamp match tolerance in seconds. Merged/ffmpeg-concat MP4s + torchcodec often need 0.02 (default: 1e-4).",
+    )
 
     args = parser.parse_args()
 
@@ -813,7 +847,10 @@ Examples:
     # Handle visualize-only mode
     if args.visualize_only:
         dataset, reward_model, preprocess = load_sarm_resources(
-            args.dataset_repo_id, reward_model_path, args.device
+            args.dataset_repo_id,
+            reward_model_path,
+            args.device,
+            tolerance_s=args.tolerance_s,
         )
         logging.info(f"Visualization-only mode: visualizing {args.num_visualizations} episodes")
         viz_episodes = list(range(min(args.num_visualizations, dataset.num_episodes)))
@@ -839,6 +876,7 @@ Examples:
         num_visualizations=args.num_visualizations,
         output_dir=args.output_dir,
         stride=args.stride,
+        tolerance_s=args.tolerance_s,
     )
 
     print(f"\nSARM progress values saved to: {output_path}")

@@ -51,6 +51,9 @@ def get_hf_features_from_features(features: dict) -> datasets.Features:
             continue
         elif ft["dtype"] == "image":
             hf_features[key] = datasets.Image()
+        elif ft["dtype"] == "depth":
+            # Parquet uses Image{bytes,path} like RGB; HF has no scalar "depth" dtype.
+            hf_features[key] = datasets.Image()
         elif ft["shape"] == (1,):
             hf_features[key] = datasets.Value(dtype=ft["dtype"])
         elif len(ft["shape"]) == 1:
@@ -433,8 +436,8 @@ def validate_feature_dtype_and_shape(
     expected_shape = feature["shape"]
     if is_valid_numpy_dtype_string(expected_dtype):
         return validate_feature_numpy_array(name, expected_dtype, expected_shape, value)
-    elif expected_dtype in ["image", "video"]:
-        return validate_feature_image_or_video(name, expected_shape, value)
+    elif expected_dtype in ["image", "video", "depth"]:
+        return validate_feature_image_or_video(name, expected_shape, value, feature=feature)
     elif expected_dtype == "string":
         return validate_feature_string(name, value)
     else:
@@ -472,7 +475,10 @@ def validate_feature_numpy_array(
 
 
 def validate_feature_image_or_video(
-    name: str, expected_shape: list[str], value: np.ndarray | PILImage.Image
+    name: str,
+    expected_shape: list[int] | tuple[int, ...],
+    value: np.ndarray | PILImage.Image,
+    feature: dict | None = None,
 ) -> str:
     """Validate a feature that is expected to be an image or video frame.
 
@@ -480,8 +486,12 @@ def validate_feature_image_or_video(
 
     Args:
         name (str): The name of the feature.
-        expected_shape (list[str]): The expected shape (C, H, W).
+        expected_shape: Expected spatial layout depends on ``feature["names"]`` when set:
+            ``["channel", "height", "width"]`` → (C, H, W);
+            ``["height", "width", "channel"]`` or ``["height", "width", "channels"]`` → (H, W, C).
+            If *feature* is omitted, (C, H, W) is assumed (backward compatible).
         value: The image data to validate.
+        feature: Optional LeRobot feature dict (uses ``names`` for layout).
 
     Returns:
         str: An error message if validation fails, otherwise an empty string.
@@ -490,9 +500,18 @@ def validate_feature_image_or_video(
     error_message = ""
     if isinstance(value, np.ndarray):
         actual_shape = value.shape
-        c, h, w = expected_shape
-        if len(actual_shape) != 3 or (actual_shape != (c, h, w) and actual_shape != (h, w, c)):
-            error_message += f"The feature '{name}' of shape '{actual_shape}' does not have the expected shape '{(c, h, w)}' or '{(h, w, c)}'.\n"
+        names = list(feature.get("names", [])) if feature else []
+        if names in (["height", "width", "channels"], ["height", "width", "channel"]):
+            h, w, c = (int(expected_shape[0]), int(expected_shape[1]), int(expected_shape[2]))
+            chw, hwc = (c, h, w), (h, w, c)
+        else:
+            c, h, w = (int(expected_shape[0]), int(expected_shape[1]), int(expected_shape[2]))
+            chw, hwc = (c, h, w), (h, w, c)
+        if len(actual_shape) != 3 or (actual_shape != chw and actual_shape != hwc):
+            error_message += (
+                f"The feature '{name}' of shape '{actual_shape}' does not have the expected shape "
+                f"'{chw}' or '{hwc}'.\n"
+            )
     elif isinstance(value, PILImage.Image):
         pass
     else:

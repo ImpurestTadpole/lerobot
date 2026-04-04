@@ -25,8 +25,11 @@ Paper: https://arxiv.org/pdf/2509.25358
 
 import argparse
 import difflib
+import gc
 import json
 import os
+import shutil
+from collections import defaultdict
 import multiprocessing as mp
 import random
 import re
@@ -247,6 +250,25 @@ def _ts_sort(ts: str) -> float:
         return parse_timestamp_to_seconds(ts, video_duration_sec=None, role="start")
     except ValueError:
         return float("inf")
+
+
+def _try_parse_json_to_subtasks_dict(text: str) -> dict[str, Any] | None:
+    """Parse JSON object or a top-level array of subtask objects into ``{"subtasks": ...}``."""
+    text = text.strip()
+    if not text:
+        return None
+    try:
+        data = json.loads(text)
+    except json.JSONDecodeError:
+        try:
+            data = json.loads(re.sub(r",\s*([}\]])", r"\1", text))
+        except json.JSONDecodeError:
+            return None
+    if isinstance(data, list):
+        return {"subtasks": data}
+    if isinstance(data, dict):
+        return data
+    return None
 
 
 def extract_balanced_json_object(text: str) -> str | None:
@@ -550,16 +572,26 @@ def raw_response_to_subtask_annotation(
         r = r.split("```json", 1)[1].split("```", 1)[0].strip()
     elif "```" in r:
         r = r.split("```", 1)[1].split("```", 1)[0].strip()
-    blob = extract_balanced_json_object(r) or extract_balanced_json_object(r0)
-    data: dict[str, Any] | None = None
-    if blob is not None:
-        try:
-            data = json.loads(blob)
-        except json.JSONDecodeError as e:
+    data: dict[str, Any] | None = _try_parse_json_to_subtasks_dict(r) or _try_parse_json_to_subtasks_dict(
+        r0
+    )
+    if data is None:
+        blob = extract_balanced_json_object(r) or extract_balanced_json_object(r0)
+        if blob is not None:
             try:
-                data = json.loads(re.sub(r",\s*([}\]])", r"\1", blob))
-            except json.JSONDecodeError as e2:
-                raise ValueError(f"Invalid JSON: {e}") from e2
+                parsed = json.loads(blob)
+            except json.JSONDecodeError as e:
+                try:
+                    parsed = json.loads(re.sub(r",\s*([}\]])", r"\1", blob))
+                except json.JSONDecodeError as e2:
+                    raise ValueError(f"Invalid JSON: {e}") from e2
+            data = (
+                {"subtasks": parsed}
+                if isinstance(parsed, list)
+                else parsed
+                if isinstance(parsed, dict)
+                else None
+            )
     if data is None:
         fb = parse_subtasks_bullet_fallback(r0, allowed, clip_duration_sec)
         if fb is not None:
@@ -733,6 +765,7 @@ class VideoAnnotator:
         max_new_tokens: int = 4096,
         greedy: bool = True,
         temperature: float = 0.35,
+        extract_fps: int = 1,
     ):
         self.subtask_list = subtask_list
         self.prompt = create_sarm_prompt(subtask_list)
@@ -741,6 +774,7 @@ class VideoAnnotator:
         self.max_new_tokens = max_new_tokens
         self.greedy = greedy
         self.temperature = temperature
+        self.extract_fps = max(1, int(extract_fps))
 
         if model is not None and processor is not None:
             self.model = model
@@ -858,7 +892,9 @@ class VideoAnnotator:
         duration = end_timestamp - start_timestamp
         duration_str = f"{int(duration // 60):02d}:{int(duration % 60):02d}"
 
-        extracted_path = self.extract_episode_segment(file_path, start_timestamp, end_timestamp, 1)
+        extracted_path = self.extract_episode_segment(
+            file_path, start_timestamp, end_timestamp, self.extract_fps
+        )
         is_extracted = extracted_path != file_path
 
         try:
@@ -867,7 +903,7 @@ class VideoAnnotator:
                 {
                     "role": "user",
                     "content": [
-                        {"type": "video", "video": str(extracted_path), "fps": 1.0},
+                        {"type": "video", "video": str(extracted_path), "fps": float(self.extract_fps)},
                         {
                             "type": "text",
                             "text": f"Video is {duration_str} (~{duration:.1f}s). Follow instructions.",
@@ -909,6 +945,7 @@ class VideoAnnotator:
                         [out[len(inp) :] for inp, out in zip(inputs.input_ids, generated_ids, strict=True)],
                         skip_special_tokens=True,
                     )[0].strip()
+                    del inputs, generated_ids
                     last_response = response
                     ann = raw_response_to_subtask_annotation(
                         response, self.subtask_list, clip_duration_sec=duration
@@ -925,6 +962,9 @@ class VideoAnnotator:
         finally:
             if is_extracted and extracted_path.exists():
                 extracted_path.unlink()
+            gc.collect()
+            if torch.cuda.is_available() and str(self.device).startswith("cuda"):
+                torch.cuda.empty_cache()
 
 
 def display_annotation(annotation: SubtaskAnnotation, episode_idx: int, fps: int, prefix: str = ""):
@@ -940,12 +980,47 @@ def timestamp_to_seconds(timestamp: str, video_duration_sec: float | None = None
     return parse_timestamp_to_seconds(timestamp, video_duration_sec=video_duration_sec, role="either")
 
 
-def extract_frame(video_path: Path, timestamp: float) -> np.ndarray | None:
-    """Extract a single frame from video at given timestamp."""
-    cap = cv2.VideoCapture(str(video_path))
+def extract_frame(video_path: Path | str, timestamp: float) -> np.ndarray | None:
+    """Extract a single frame from video at given timestamp.
+
+    Prefer ffmpeg: OpenCV seek + read is unreliable on AV1 and some merged MP4s (noisy libav
+    errors, missing frames). Annotation already requires ffmpeg for episode extraction.
+    """
+    path = Path(video_path)
+    ts = max(0.0, float(timestamp))
+
+    if shutil.which("ffmpeg"):
+        cmd = [
+            "ffmpeg",
+            "-hide_banner",
+            "-loglevel",
+            "error",
+            "-ss",
+            str(ts),
+            "-i",
+            str(path.resolve()),
+            "-frames:v",
+            "1",
+            "-f",
+            "image2pipe",
+            "-vcodec",
+            "png",
+            "-",
+        ]
+        try:
+            proc = subprocess.run(cmd, capture_output=True, check=False, timeout=120)
+            if proc.returncode == 0 and proc.stdout:
+                buf = np.frombuffer(proc.stdout, dtype=np.uint8)
+                frame = cv2.imdecode(buf, cv2.IMREAD_COLOR)
+                if frame is not None:
+                    return cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
+        except (subprocess.TimeoutExpired, OSError):
+            pass
+
+    cap = cv2.VideoCapture(str(path))
     if not cap.isOpened():
         return None
-    cap.set(cv2.CAP_PROP_POS_MSEC, timestamp * 1000)
+    cap.set(cv2.CAP_PROP_POS_MSEC, ts * 1000)
     ret, frame = cap.read()
     cap.release()
     return cv2.cvtColor(frame, cv2.COLOR_BGR2RGB) if ret else None
@@ -1265,7 +1340,7 @@ def save_annotations_to_dataset(
         episodes_df[col] = None
 
     for ep_idx, ann in annotations.items():
-        if ep_idx >= len(episodes_df):
+        if ep_idx not in episodes_df.index:
             continue
         dur = _episode_duration_seconds_from_df(episodes_df, ep_idx, float(fps))
         vd = dur if dur is not None and dur > 0 else None
@@ -1288,43 +1363,57 @@ def save_annotations_to_dataset(
         episodes_df.at[ep_idx, cols[3]] = start_frames
         episodes_df.at[ep_idx, cols[4]] = end_frames
 
-    # Group by file and write
+    # Group by episodes parquet file. Chunk files use row index 0..n-1 per file; global episode id is in
+    # ``episode_index``. Using file_df.at[global_ep_idx, ...] fails after the first chunk (e.g. KeyError: 10).
+    legacy_cols = (
+        [
+            "subtask_names",
+            "subtask_start_times",
+            "subtask_end_times",
+            "subtask_start_frames",
+            "subtask_end_frames",
+        ]
+        if prefix == "sparse"
+        else []
+    )
+    file_to_eps: dict[tuple[int, int], list[int]] = defaultdict(list)
     for ep_idx in episodes_df.index:
         key = (
-            episodes_df.loc[ep_idx, "meta/episodes/chunk_index"],
-            episodes_df.loc[ep_idx, "meta/episodes/file_index"],
+            int(episodes_df.loc[ep_idx, "meta/episodes/chunk_index"]),
+            int(episodes_df.loc[ep_idx, "meta/episodes/file_index"]),
         )
+        file_to_eps[key].append(int(ep_idx))
+
+    for key in sorted(file_to_eps.keys()):
         path = dataset_path / DEFAULT_EPISODES_PATH.format(chunk_index=key[0], file_index=key[1])
-        if path.exists():
-            file_df = pd.read_parquet(path)
-            for col in cols + (
-                [
-                    "subtask_names",
-                    "subtask_start_times",
-                    "subtask_end_times",
-                    "subtask_start_frames",
-                    "subtask_end_frames",
-                ]
-                if prefix == "sparse"
-                else []
-            ):
-                if col not in file_df.columns:
-                    file_df[col] = None
-            if ep_idx in annotations:
-                for col in cols:
-                    file_df.at[ep_idx, col] = episodes_df.loc[ep_idx, col]
-                if prefix == "sparse":  # Legacy columns
-                    for i, legacy in enumerate(
-                        [
-                            "subtask_names",
-                            "subtask_start_times",
-                            "subtask_end_times",
-                            "subtask_start_frames",
-                            "subtask_end_frames",
-                        ]
-                    ):
-                        file_df.at[ep_idx, legacy] = episodes_df.loc[ep_idx, cols[i]]
-            file_df.to_parquet(path, engine="pyarrow", compression="snappy")
+        if not path.exists():
+            continue
+        file_df = pd.read_parquet(path)
+        for col in cols + legacy_cols:
+            if col not in file_df.columns:
+                file_df[col] = None
+        for ep_idx in file_to_eps[key]:
+            if ep_idx not in annotations:
+                continue
+            if "episode_index" in file_df.columns:
+                mask = file_df["episode_index"] == ep_idx
+                if not mask.any():
+                    print(f"WARNING: episode_index {ep_idx} not found in {path.name}, skip save")
+                    continue
+            else:
+                mask = file_df.index == ep_idx
+                if not mask.any():
+                    print(f"WARNING: no row for episode {ep_idx} in {path.name}, skip save")
+                    continue
+            # Use .at[row, col]: .loc[mask, col] = <list> makes pandas treat the list as an iterable
+            # aligned to multiple targets ("Must have equal len keys and value when setting with an iterable").
+            row_label = file_df.loc[mask].index[0]
+            for col in cols:
+                file_df.at[row_label, col] = episodes_df.loc[ep_idx, col]
+            if prefix == "sparse":
+                for i, legacy in enumerate(legacy_cols):
+                    file_df.at[row_label, legacy] = episodes_df.loc[ep_idx, cols[i]]
+        file_df.to_parquet(path, engine="pyarrow", compression="snappy")
 
 
 def generate_auto_sparse_annotations(
@@ -1419,6 +1508,7 @@ def worker_process_episodes(
     max_new_tokens: int,
     greedy: bool,
     temperature: float,
+    extract_fps: int = 1,
 ) -> tuple[dict, dict | None]:
     """Worker for parallel processing across GPUs."""
     device = f"cuda:{gpu_id}"
@@ -1429,6 +1519,7 @@ def worker_process_episodes(
         max_new_tokens=max_new_tokens,
         greedy=greedy,
         temperature=temperature,
+        extract_fps=extract_fps,
     )
     sparse_annotator = VideoAnnotator(sparse_subtask_list, model_name, device, torch_dtype, **ann_kw)
     dense_annotator = (
@@ -1487,6 +1578,12 @@ def main():
     parser.add_argument("--video-key", type=str, default=None, help="Video key (default: first available)")
     parser.add_argument("--push-to-hub", action="store_true", help="Push to HuggingFace Hub")
     parser.add_argument("--output-repo-id", type=str, default=None, help="Output repo ID for push")
+    parser.add_argument(
+        "--root",
+        type=Path,
+        default=None,
+        help="Local dataset root (e.g. ~/.cache/huggingface/lerobot/Odog16/name). Loads from disk.",
+    )
     parser.add_argument("--device", type=str, default="cuda", help="Device (cuda/cpu)")
     parser.add_argument("--dtype", type=str, default="bfloat16", choices=["bfloat16", "float16", "float32"])
     parser.add_argument("--num-workers", type=int, default=1, help="Parallel workers for multi-GPU")
@@ -1502,6 +1599,16 @@ def main():
         "--sample", action="store_true", help="Stochastic decode (default: greedy, better for JSON)"
     )
     parser.add_argument("--temperature", type=float, default=0.35, help="With --sample or last retry")
+    parser.add_argument(
+        "--extract-fps",
+        type=int,
+        default=1,
+        metavar="N",
+        help=(
+            "FPS of the short clip ffmpeg feeds to the VLM (default: 1). "
+            "Try 2–5 for finer timing; larger clips, slower and more VRAM."
+        ),
+    )
     # Visualization options
     parser.add_argument(
         "--visualize-only",
@@ -1531,8 +1638,9 @@ def main():
     args = parser.parse_args()
 
     # Load dataset first (needed for both annotation and visualization)
-    print(f"Loading dataset: {args.repo_id}")
-    dataset = LeRobotDataset(args.repo_id, download_videos=True)
+    root = args.root.expanduser() if args.root else None
+    print(f"Loading dataset: {args.repo_id}" + (f" (root={root})" if root else ""))
+    dataset = LeRobotDataset(args.repo_id, root=root, download_videos=True)
     fps = dataset.fps
 
     if not dataset.meta.video_keys:
@@ -1638,6 +1746,7 @@ def main():
                         args.max_new_tokens,
                         not args.sample,
                         args.temperature,
+                        args.extract_fps,
                     )
                     for w in range(args.num_workers)
                     if episodes_per_worker[w]
@@ -1661,6 +1770,7 @@ def main():
                 max_new_tokens=args.max_new_tokens,
                 greedy=not args.sample,
                 temperature=args.temperature,
+                extract_fps=args.extract_fps,
             )
             sparse_annotator = (
                 VideoAnnotator(sparse_subtask_list, args.model, args.device, torch_dtype, **ann_kw)

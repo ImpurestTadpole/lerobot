@@ -273,7 +273,7 @@ class StreamingLeRobotDataset(torch.utils.data.IterableDataset):
         """
         super().__init__()
         self.repo_id = repo_id
-        self._requested_root = Path(root) if root else None
+        self._requested_root = Path(root).expanduser() if root else None
         self.root = self._requested_root if self._requested_root is not None else HF_LEROBOT_HOME / repo_id
         self.streaming_from_local = root is not None
 

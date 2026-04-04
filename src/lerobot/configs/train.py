@@ -59,7 +59,9 @@ class TrainPipelineConfig(HubMixin):
     steps: int = 100_000
     eval_freq: int = 20_000
     log_freq: int = 200
-    tolerance_s: float = 1e-4
+    # Video frame PTS vs parquet timestamps can differ by a few ms (torchcodec, re-encoded/merged MP4s).
+    # 1e-4 was too strict and caused FrameTimestampError on many real datasets; use 0.02s (~half frame @ 30fps).
+    tolerance_s: float = 0.02
     save_checkpoint: bool = True
     # Checkpoint is saved every `save_freq` training iterations and after the last training step.
     save_freq: int = 20_000
@@ -147,7 +149,7 @@ class TrainPipelineConfig(HubMixin):
             # Auto-detect from dataset path
             repo_id = self.dataset.repo_id
             if self.dataset.root:
-                self.rabc_progress_path = str(Path(self.dataset.root) / "sarm_progress.parquet")
+                self.rabc_progress_path = str(Path(self.dataset.root).expanduser() / "sarm_progress.parquet")
             else:
                 self.rabc_progress_path = f"hf://datasets/{repo_id}/sarm_progress.parquet"
 

@@ -233,7 +233,7 @@ def decode_video_frames_torchvision(
     dist = torch.cdist(query_ts[:, None], loaded_ts[:, None], p=1)
     min_, argmin_ = dist.min(1)
 
-    is_within_tol = min_ < tolerance_s
+    is_within_tol = min_ <= tolerance_s
     if not is_within_tol.all():
         raise FrameTimestampError(
             f"One or several query timestamps unexpectedly violate the tolerance ({min_[~is_within_tol]} > {tolerance_s=})."
@@ -346,8 +346,18 @@ def decode_video_frames_torchcodec(
     # get metadata for frame information
     metadata = decoder.metadata
     average_fps = metadata.average_fps
+    n_frames = len(decoder)
     # convert timestamps to frame indices
     frame_indices = [round(ts * average_fps) for ts in timestamps]
+    for i, (ts, fi) in enumerate(zip(timestamps, frame_indices, strict=True)):
+        if fi < 0 or fi >= n_frames:
+            raise FrameTimestampError(
+                f"Timestamp maps to frame index {fi} but video has {n_frames} frames (valid 0..{n_frames - 1}): "
+                f"timestamp={ts:.4f}s, average_fps={average_fps:.4f}, path={video_path}. "
+                "This usually means episode/video metadata duration does not match the MP4 (e.g. merged dataset "
+                "built with summed durations after ffmpeg concat). Re-run dataset merge with an up-to-date lerobot, "
+                "or use source datasets without merging."
+            )
     # retrieve frames based on indices
     frames_batch = decoder.get_frames_at(indices=frame_indices)
 
@@ -364,7 +374,7 @@ def decode_video_frames_torchcodec(
     dist = torch.cdist(query_ts[:, None], loaded_ts[:, None], p=1)
     min_, argmin_ = dist.min(1)
 
-    is_within_tol = min_ < tolerance_s
+    is_within_tol = min_ <= tolerance_s
     if not is_within_tol.all():
         raise FrameTimestampError(
             f"One or several query timestamps unexpectedly violate the tolerance ({min_[~is_within_tol]} > {tolerance_s=})."
@@ -571,15 +581,46 @@ def _ffmpeg_concat_reencode_h264(concat_list_path: Path, output_path: Path) -> N
         raise RuntimeError(msg)
 
 
+def _concatenate_video_files_pyav(
+    concat_list_path: str, tmp_output_video_path: str, output_video_path: Path
+) -> None:
+    """Concat via PyAV concat demuxer + remux (no system ffmpeg required)."""
+    input_container = av.open(concat_list_path, mode="r", format="concat", options={"safe": "0"})
+    output_container = av.open(tmp_output_video_path, mode="w", options={"movflags": "faststart"})
+    try:
+        stream_map = {}
+        for input_stream in input_container.streams:
+            if input_stream.type in ("video", "audio", "subtitle"):
+                stream_map[input_stream.index] = output_container.add_stream_from_template(
+                    template=input_stream, opaque=True
+                )
+                stream_map[input_stream.index].time_base = input_stream.time_base
+
+        for packet in input_container.demux():
+            if packet.stream.index not in stream_map:
+                continue
+            if packet.dts is None:
+                continue
+            output_stream = stream_map[packet.stream.index]
+            packet.stream = output_stream
+            output_container.mux(packet)
+    finally:
+        input_container.close()
+        output_container.close()
+    shutil.move(tmp_output_video_path, output_video_path)
+
+
 def concatenate_video_files(
     input_video_paths: list[Path | str], output_video_path: Path, overwrite: bool = True
 ):
     """
     Concatenate multiple video files into a single video file.
 
-    Tries PyAV first (concat demuxer + stream copy). If that fails (common when joining
-    separately encoded H.264 MP4s with non-monotonic DTS at segment boundaries), falls back
-    to the ffmpeg CLI: stream copy, then H.264 re-encode if needed.
+    When the ``ffmpeg`` executable is on ``PATH``, uses it first (stream copy, then libx264
+    re-encode if copy fails). That avoids PyAV's concat+remux path, which is slow and noisy
+    for separately encoded H.264/HEVC segments and often hits non-monotonic DTS errors.
+
+    If ``ffmpeg`` is missing, falls back to PyAV (concat demuxer + packet remux).
 
     Args:
         input_video_paths: Ordered list of input video file paths to concatenate.
@@ -589,8 +630,7 @@ def concatenate_video_files(
     Note:
         - Creates a temporary ffconcat list; cleaned up after use.
         - Stream copy requires compatible codec, resolution, and frame rate across inputs.
-        - Re-encode fallback requires a system ``ffmpeg`` with libx264 and maps only the first
-          video stream (no audio in the output).
+        - Re-encode path maps only the first video stream (no audio in the output).
     """
 
     output_video_path = Path(output_video_path)
@@ -617,54 +657,26 @@ def concatenate_video_files(
     tmp_output_video_path_p = Path(tmp_output_video_path)
 
     try:
-        try:
-            input_container = av.open(
-                tmp_concatenate_path, mode="r", format="concat", options={"safe": "0"}
-            )
-            output_container = av.open(
-                tmp_output_video_path, mode="w", options={"movflags": "faststart"}
-            )
-            try:
-                stream_map = {}
-                for input_stream in input_container.streams:
-                    if input_stream.type in ("video", "audio", "subtitle"):
-                        stream_map[input_stream.index] = output_container.add_stream_from_template(
-                            template=input_stream, opaque=True
-                        )
-                        stream_map[input_stream.index].time_base = input_stream.time_base
-
-                for packet in input_container.demux():
-                    if packet.stream.index not in stream_map:
-                        continue
-                    if packet.dts is None:
-                        continue
-                    output_stream = stream_map[packet.stream.index]
-                    packet.stream = output_stream
-                    output_container.mux(packet)
-            finally:
-                input_container.close()
-                output_container.close()
-            shutil.move(tmp_output_video_path, output_video_path)
-        except (av.error.FFmpegError, av.error.ValueError, OSError) as e:
-            if tmp_output_video_path_p.exists():
-                tmp_output_video_path_p.unlink()
-            if shutil.which("ffmpeg") is None:
-                raise RuntimeError(
-                    "Video concatenation failed with PyAV and `ffmpeg` was not found on PATH. "
-                    "Install ffmpeg or re-encode inputs to a single consistent stream before merging."
-                ) from e
-            logger.warning(
-                "PyAV concatenate failed (%s); retrying with ffmpeg stream copy", e, exc_info=False
-            )
+        if shutil.which("ffmpeg"):
             try:
                 _ffmpeg_concat_stream_copy(tmp_concatenate_path_p, tmp_output_video_path_p)
-                shutil.move(tmp_output_video_path, output_video_path)
             except RuntimeError as e_copy:
                 logger.warning(
                     "ffmpeg stream-copy concat failed (%s); re-encoding with libx264", e_copy, exc_info=False
                 )
+                tmp_output_video_path_p.unlink(missing_ok=True)
                 _ffmpeg_concat_reencode_h264(tmp_concatenate_path_p, tmp_output_video_path_p)
-                shutil.move(tmp_output_video_path, output_video_path)
+            shutil.move(tmp_output_video_path, output_video_path)
+        else:
+            try:
+                _concatenate_video_files_pyav(
+                    tmp_concatenate_path, tmp_output_video_path, output_video_path
+                )
+            except (av.error.FFmpegError, av.error.ValueError, OSError) as e:
+                raise RuntimeError(
+                    "Video concatenation failed with PyAV and `ffmpeg` was not found on PATH. "
+                    "Install ffmpeg (recommended for merging datasets with separate video files)."
+                ) from e
     finally:
         tmp_concatenate_path_p.unlink(missing_ok=True)
         if tmp_output_video_path_p.exists() and tmp_output_video_path_p.resolve() != output_video_path.resolve():
