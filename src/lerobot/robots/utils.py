@@ -44,10 +44,10 @@ def make_robot_from_config(config: RobotConfig) -> Robot:
         from .xlerobot import XLerobot
 
         return XLerobot(config)
-    # elif config.type == "xlerobot_client":
-    #     from .xlerobot.xlerobot_client import XLerobotClient
-    #
-    #     return XLerobotClient(config)
+    elif config.type == "xlerobot_client":
+        from .xlerobot.xlerobot_client import XLerobotClient
+
+        return XLerobotClient(config)
     elif config.type == "lekiwi":
         from .lekiwi import LeKiwi
 

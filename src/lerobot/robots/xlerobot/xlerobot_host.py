@@ -14,16 +14,58 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+from __future__ import annotations
+
+import argparse
 import base64
 import json
 import logging
 import time
+from pathlib import Path
+from typing import Any
 
 import cv2
+import draccus
+import numpy as np
 import zmq
 
-from .xlerobot import XLerobot
+from lerobot.robots.config import RobotConfig
+from lerobot.robots.utils import make_robot_from_config
+
 from .config_xlerobot import XLerobotConfig, XLerobotHostConfig
+from .xlerobot import XLerobot
+
+
+def _observation_to_zmq_payload(
+    obs: dict[str, Any],
+    camera_keys: tuple[str, ...],
+    jpeg_quality: int,
+) -> dict[str, Any]:
+    """Scalars JSON-safe; RGB cameras → JPEG base64. Skips depth / large ndarrays."""
+    out: dict[str, Any] = {}
+    cam_set = set(camera_keys)
+    for k, v in obs.items():
+        if k in cam_set:
+            if not isinstance(v, np.ndarray) or v.size == 0:
+                out[k] = ""
+                continue
+            ret, buffer = cv2.imencode(".jpg", v, [int(cv2.IMWRITE_JPEG_QUALITY), jpeg_quality])
+            out[k] = base64.b64encode(buffer).decode("utf-8") if ret else ""
+            continue
+        if isinstance(v, np.ndarray):
+            if v.size == 1:
+                out[k] = float(np.asarray(v).reshape(-1)[0])
+            continue
+        if isinstance(v, (np.floating, np.integer)):
+            out[k] = v.item()
+        elif isinstance(v, (float, int, str, bool)) or v is None:
+            out[k] = v
+        else:
+            try:
+                out[k] = float(v)
+            except (TypeError, ValueError):
+                pass
+    return out
 
 
 class XLerobotHost:
@@ -40,6 +82,7 @@ class XLerobotHost:
         self.connection_time_s = config.connection_time_s
         self.watchdog_timeout_ms = config.watchdog_timeout_ms
         self.max_loop_freq_hz = config.max_loop_freq_hz
+        self.jpeg_quality = config.jpeg_quality
 
     def disconnect(self):
         self.zmq_observation_socket.close()
@@ -48,79 +91,109 @@ class XLerobotHost:
 
 
 def main():
-    logging.info("Configuring Xlerobot")
-    robot_config = XLerobotConfig(id="my_xlerobot_pc")
-    robot = XLerobot(robot_config)
+    logging.basicConfig(level=logging.INFO)
+    parser = argparse.ArgumentParser(description="XLerobot ZMQ host (robot USB on this machine).")
+    parser.add_argument(
+        "--robot-config",
+        type=str,
+        default=None,
+        help="JSON profile (type=xlerobot). Default: XLerobotConfig() defaults.",
+    )
+    parser.add_argument("--port-cmd", type=int, default=5555)
+    parser.add_argument("--port-observations", type=int, default=5556)
+    parser.add_argument("--connection-time-s", type=int, default=3600)
+    parser.add_argument("--watchdog-timeout-ms", type=int, default=500)
+    parser.add_argument("--max-loop-freq-hz", type=int, default=30)
+    parser.add_argument("--jpeg-quality", type=int, default=90)
+    args = parser.parse_args()
 
-    logging.info("Connecting Xlerobot")
-    robot.connect()
+    import lerobot.cameras.opencv.configuration_opencv  # noqa: F401
+    import lerobot.cameras.realsense.configuration_realsense  # noqa: F401
+    import lerobot.robots.xlerobot  # noqa: F401
 
-    logging.info("Starting HostAgent")
-    host_config = XLerobotHostConfig()
+    if args.robot_config:
+        path = Path(args.robot_config).expanduser()
+        with path.open() as f:
+            profile = json.load(f)
+        if "fields" in profile:
+            config_dict = {"type": profile["type"]}
+            for k, v in profile["fields"].items():
+                config_dict[k] = v
+            if "cameras" in profile:
+                config_dict["cameras"] = profile["cameras"]
+        else:
+            config_dict = profile
+        robot_cfg = draccus.decode(RobotConfig, config_dict)
+        robot = make_robot_from_config(robot_cfg)
+        if not isinstance(robot, XLerobot):
+            raise ValueError("--robot-config must describe type=xlerobot for this host.")
+    else:
+        robot = XLerobot(XLerobotConfig(id="xlerobot_zmq_host"))
+
+    host_config = XLerobotHostConfig(
+        port_zmq_cmd=args.port_cmd,
+        port_zmq_observations=args.port_observations,
+        connection_time_s=args.connection_time_s,
+        watchdog_timeout_ms=args.watchdog_timeout_ms,
+        max_loop_freq_hz=args.max_loop_freq_hz,
+        jpeg_quality=args.jpeg_quality,
+    )
     host = XLerobotHost(host_config)
+    cam_keys = tuple(robot.cameras.keys())
+
+    logging.info("Connecting XLerobot (local USB)")
+    robot.connect()
 
     last_cmd_time = time.time()
     watchdog_active = False
-    logging.info("Waiting for commands...")
+    logging.info(
+        "ZMQ host: cmd PULL *:%d, obs PUSH *:%d — point xlerobot_client.remote_ip here.",
+        host_config.port_zmq_cmd,
+        host_config.port_zmq_observations,
+    )
     try:
-        # Business logic
         start = time.perf_counter()
-        duration = 0
+        duration = 0.0
         while duration < host.connection_time_s:
             loop_start_time = time.time()
             try:
                 msg = host.zmq_cmd_socket.recv_string(zmq.NOBLOCK)
                 data = dict(json.loads(msg))
-                _action_sent = robot.send_action(data)
+                robot.send_action(data)
                 last_cmd_time = time.time()
                 watchdog_active = False
             except zmq.Again:
-                if not watchdog_active:
-                    logging.warning("No command available")
+                pass
             except Exception as e:
-                logging.error("Message fetching failed: %s", e)
+                logging.error("Command handling failed: %s", e)
 
             now = time.time()
             if (now - last_cmd_time > host.watchdog_timeout_ms / 1000) and not watchdog_active:
                 logging.warning(
-                    f"Command not received for more than {host.watchdog_timeout_ms} milliseconds. Stopping the base."
+                    "No command for > %d ms — stopping base (watchdog).",
+                    host.watchdog_timeout_ms,
                 )
                 watchdog_active = True
                 robot.stop_base()
 
-            last_observation = robot.get_observation()
-
-            # Encode ndarrays to base64 strings
-            for cam_key, _ in robot.cameras.items():
-                ret, buffer = cv2.imencode(
-                    ".jpg", last_observation[cam_key], [int(cv2.IMWRITE_JPEG_QUALITY), 90]
-                )
-                if ret:
-                    last_observation[cam_key] = base64.b64encode(buffer).decode("utf-8")
-                else:
-                    last_observation[cam_key] = ""
-
-            # Send the observation to the remote agent
             try:
-                host.zmq_observation_socket.send_string(json.dumps(last_observation), flags=zmq.NOBLOCK)
+                raw_obs = robot.get_observation()
+                payload = _observation_to_zmq_payload(raw_obs, cam_keys, host.jpeg_quality)
+                host.zmq_observation_socket.send_string(json.dumps(payload), flags=zmq.NOBLOCK)
             except zmq.Again:
-                logging.info("Dropping observation, no client connected")
+                logging.debug("Dropping observation (no client)")
+            except Exception as e:
+                logging.error("Observation send failed: %s", e)
 
-            # Ensure a short sleep to avoid overloading the CPU.
             elapsed = time.time() - loop_start_time
-
             time.sleep(max(1 / host.max_loop_freq_hz - elapsed, 0))
             duration = time.perf_counter() - start
-        print("Cycle time reached.")
-
     except KeyboardInterrupt:
-        print("Keyboard interrupt received. Exiting...")
+        logging.info("Keyboard interrupt — exiting")
     finally:
-        print("Shutting down Lekiwi Host.")
         robot.disconnect()
         host.disconnect()
-
-    logging.info("Finished LeKiwi cleanly")
+        logging.info("XLerobot host shut down")
 
 
 if __name__ == "__main__":

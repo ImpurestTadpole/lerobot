@@ -147,55 +147,43 @@ class XLerobotConfig(RobotConfig):
     )
 
 
+# ZMQ bridge: host on robot (Jetson), client on GPU PC.
 
-# ============================================================================
-# CLIENT/HOST CONFIGURATIONS DISABLED - DIRECT USB CONNECTION ONLY
-# ============================================================================
-# The following configurations are commented out to enforce direct USB connection
-# to the operating PC. Uncomment these if you need remote operation via ZMQ.
-# ============================================================================
 
-# @dataclass
-# class XLerobotHostConfig:
-#     # Network Configuration
-#     port_zmq_cmd: int = 5555
-#     port_zmq_observations: int = 5556
-#
-#     # Duration of the application
-#     connection_time_s: int = 3600
-#
-#     # Watchdog: stop the robot if no command is received for over 0.5 seconds.
-#     watchdog_timeout_ms: int = 500
-#
-#     # If robot jitters decrease the frequency and monitor cpu load with `top` in cmd
-#     max_loop_freq_hz: int = 30
+@dataclass
+class XLerobotHostConfig:
+    """ZMQ ports bound on the robot machine. Client connects to these."""
 
-# @RobotConfig.register_subclass("xlerobot_client")
-# @dataclass
-# class XLerobotClientConfig(RobotConfig):
-#     # Network Configuration
-#     remote_ip: str
-#     port_zmq_cmd: int = 5555
-#     port_zmq_observations: int = 5556
-#
-#     teleop_keys: dict[str, str] = field(
-#         default_factory=lambda: {
-#             # Movement
-#             "forward": "i",
-#             "backward": "k",
-#             "left": "j",
-#             "right": "l",
-#             "rotate_left": "u",
-#             "rotate_right": "o",
-#             # Speed control
-#             "speed_up": "n",
-#             "speed_down": "m",
-#             # quit teleop
-#             "quit": "b",
-#         }
-#     )
-#
-#     cameras: dict[str, CameraConfig] = field(default_factory=xlerobot_cameras_config)
-#
-#     polling_timeout_ms: int = 15
-#     connect_timeout_s: int = 5
+    port_zmq_cmd: int = 5555
+    port_zmq_observations: int = 5556
+    connection_time_s: int = 3600
+    watchdog_timeout_ms: int = 500
+    max_loop_freq_hz: int = 30
+    jpeg_quality: int = 90
+
+
+@RobotConfig.register_subclass("xlerobot_client")
+@dataclass
+class XLerobotClientConfig(RobotConfig):
+    """Remote XLerobot over ZMQ (`type: xlerobot_client` in robot JSON)."""
+
+    remote_ip: str
+    port_zmq_cmd: int = 5555
+    port_zmq_observations: int = 5556
+    teleop_keys: dict[str, str] = field(
+        default_factory=lambda: {
+            "forward": "i",
+            "backward": "k",
+            "left": "j",
+            "right": "l",
+            "rotate_left": "u",
+            "rotate_right": "o",
+            "speed_up": "n",
+            "speed_down": "m",
+            "quit": "b",
+        }
+    )
+    cameras: dict[str, CameraConfig] = field(default_factory=xlerobot_cameras_config)
+    lift_axis: LiftAxisConfig = field(default_factory=LiftAxisConfig)
+    polling_timeout_ms: int = 15
+    connect_timeout_s: int = 5

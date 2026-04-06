@@ -1,0 +1,47 @@
+{
+  "type": "xlerobot_client",
+  "id": "jetson_zmq_bridge",
+  "remote_ip": "192.168.0.207",
+  "port_zmq_cmd": 5555,
+  "port_zmq_observations": 5556,
+  "lift_axis": {
+    "enabled": true,
+    "name": "lift_axis",
+    "bus": "bus2"
+  },
+  "cameras": {
+    "head": {
+      "type": "intelrealsense",
+      "serial_number_or_name": "placeholder-not-used-on-client",
+      "fps": 30,
+      "width": 640,
+      "height": 360,
+      "color_mode": "rgb",
+      "use_depth": false,
+      "rotation": 0,
+      "warmup_s": 1
+    },
+    "left_wrist": {
+      "type": "opencv",
+      "index_or_path": 0,
+      "fps": 30,
+      "width": 640,
+      "height": 360,
+      "color_mode": "rgb",
+      "fourcc": "MJPG",
+      "rotation": 0,
+      "warmup_s": 1
+    },
+    "right_wrist": {
+      "type": "opencv",
+      "index_or_path": 0,
+      "fps": 30,
+      "width": 640,
+      "height": 360,
+      "color_mode": "rgb",
+      "fourcc": "MJPG",
+      "rotation": 0,
+      "warmup_s": 1
+    }
+  }
+}

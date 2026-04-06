@@ -201,6 +201,39 @@ python -m lerobot.policies.hvla.launch \
 
 S1 auto-discovers the running S2 via well-known shared memory names. No `--s2-checkpoint` needed when S2 is already running.
 
+### 3d. S1 + S2 on GPU PC, robot on Jetson (ZMQ robot bridge)
+
+`launch.py` always runs the control loop in the process that owns `Robot`. To run **both** S2 and S1 on a single GPU machine while motors stay on the Jetson, use **`xlerobot_client`** on the PC and **`xlerobot_host`** on the Jetson (ports **5555** cmd, **5556** observations — Jetson binds, PC connects).
+
+**Do not** pass `--zmq-latent-host` here; that mode moves only S2↔S1 images/latents. For “all inference on PC2”, use normal shared-memory HVLA on one machine + network robot.
+
+**Jetson** (USB robot, firewall open to PC2):
+
+```bash
+python -m lerobot.robots.xlerobot.xlerobot_host \
+  --robot-config ~/.config/lerobot/robots/xlerobot.json \
+  --port-cmd 5555 --port-observations 5556
+```
+
+**PC2** (copy and edit `examples/xlerobot/xlerobot_client_pc2_remote.example.json`; set `remote_ip` to the Jetson):
+
+One process (spawns S2 + runs S1 against the remote robot):
+
+```bash
+python -m lerobot.policies.hvla.launch \
+  --hvla-preset xlerobot \
+  --s1-type flow \
+  --s1-checkpoint /path/to/s1/checkpoints/last \
+  --s2-checkpoint ~/.cache/lerobot/converted/soarm-pi05-state-11997-pytorch/model.safetensors \
+  --robot-config /path/to/xlerobot_client_pc2_remote.example.json \
+  --task "pick up the tools from the table and place it in the red bin" \
+  --resize-images 224x224
+```
+
+Or keep S2 hot in a first terminal (`s2_standalone`), then run the same `launch` **without** `--s2-checkpoint` so S1 attaches over shared memory.
+
+Match **`lift_axis`** and **camera names / resolutions** between host JSON and client JSON so `observation.state` matches the trained policy (e.g. 18-DOF with head + lift).
+
 ## Module Structure
 
 ```
