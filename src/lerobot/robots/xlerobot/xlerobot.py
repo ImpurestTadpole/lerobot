@@ -15,6 +15,8 @@
 # limitations under the License.
 
 import logging
+import os
+import sys
 import time
 import threading
 from concurrent.futures import ThreadPoolExecutor, as_completed
@@ -221,9 +223,24 @@ class XLerobot(Robot):
         # Check if calibration file exists and ask user if they want to restore it
         if self.calibration_fpath.is_file():
             logger.info(f"Calibration file found at {self.calibration_fpath}")
-            user_input = input(
-                f"Press ENTER to restore calibration from file, or type 'c' and press ENTER to run manual calibration: "
+            # Non-interactive runs (robot_client under bridge/systemd) must not call input() — EOFError or hang.
+            # isatty() can be true under some PTY wrappers; EOFError still happens on read.
+            noninteractive = (
+                sys.stdin is None
+                or not sys.stdin.isatty()
+                or os.environ.get("LEROBOT_NONINTERACTIVE", "").lower() in ("1", "true", "yes")
             )
+            if noninteractive:
+                user_input = ""
+                logger.info("Non-interactive mode — auto-restoring calibration from file.")
+            else:
+                try:
+                    user_input = input(
+                        "Press ENTER to restore calibration from file, or type 'c' and press ENTER to run manual calibration: "
+                    )
+                except EOFError:
+                    user_input = ""
+                    logger.info("EOF on calibration prompt — auto-restoring calibration from file.")
             if user_input.strip().lower() != "c":
                 logger.info("Attempting to restore calibration from file...")
                 try:
@@ -468,11 +485,12 @@ class XLerobot(Robot):
             # velocity commands) are fully flushed before we broadcast enable_torque to all
             # motors.  Without this, a delayed response from the lift motor can collide with
             # the next write and produce "Incorrect status packet!" on an unrelated motor.
-            time.sleep(0.2)
+            time.sleep(0.35)
 
-        # Enable torque on both buses
-        self.bus1.enable_torque()
-        self.bus2.enable_torque()
+        # Enable torque on both buses (retries + spacing help after homing / heavy config traffic)
+        self.bus1.enable_torque(num_retry=4)
+        time.sleep(0.05)
+        self.bus2.enable_torque(num_retry=4)
         
 
     def setup_motors(self) -> None:

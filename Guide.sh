@@ -1478,15 +1478,15 @@ python -m lerobot.async_inference.policy_server \
 
 
 python -m lerobot.async_inference.robot_client \
-    --server_address=10.249.36.224:8080 \
+    --server_address=10.249.44.71:8080 \
     --robot.type=xlerobot \
     --task="pick up the tools from the table and place it in the red bin" \
-    --policy_type=act \
-    --pretrained_name_or_path=Odog16/tool_pickup_ACT_policy_B\
+    --policy_type=smolvla \
+    --pretrained_name_or_path=Odog16/tool_pickup_SmolVLA_v2rabc_15k\
     --policy_device=cuda \
-    --actions_per_chunk=40\
+    --actions_per_chunk=42\
     --chunk_size_threshold=0.5 \
-    --aggregate_fn_name="average" \
+    --aggregate_fn_name="weighted_average" \
     --fps=30
 
 
