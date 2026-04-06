@@ -155,8 +155,11 @@ pip3 install rerun-sdk
 # =============================================================================
 # HUGGINGFACE SETUP (ONE-TIME)
 # =============================================================================
-# Login to HuggingFace (will prompt for token)
+# Login to HuggingFace (will prompt for token). Use the lerobot conda env so you
+# get the real CLI (`hf` / `huggingface-cli`), not a broken ~/.local/bin shim.
+conda activate lerobot
 huggingface-cli login
+# Downloads: prefer `hf download REPO --local-dir ...` (same env).
 
 # =============================================================================
 # RECORDING
@@ -1624,6 +1627,264 @@ lerobot-edit-dataset \
      --operation.episode_indices "[35, 69]" \
      --push_to_hub true
 
+
+# =============================================================================
+# HVLA — TOOL PICKUP (Hierarchical VLA: S2 VLM + S1 Flow Matching)
+# =============================================================================
+# Dataset: Odog16/tool_pickup — 100 episodes, 76 829 frames, 30 fps
+#   Cameras : head / left_wrist / right_wrist  (360×640, h264)
+#   State   : 18-DOF  (left arm ×6, right arm ×6, head ×2, base vel ×3, gantry ×1)
+#   Task    : "pick up the tools from the table and place it in the red bin"
+#
+# Architecture: two separate processes.
+#   S2 (VLM, ~4-15 Hz)  — PaliGemma (SigLIP + Gemma 2B) extracts a [2048] scene
+#                          latent from 3 cameras + task text.  Runs on the GPU.
+#   S1 (action, ~29 Hz) — DINOv2 ViT-S + flow-matching decoder conditioned on the
+#                          S2 latent.  97 M trainable params, bf16, torch.compile.
+#
+# Training flow (one-time per checkpoint, one-time per dataset, then iterative):
+#   Step 0 — Convert Pi0.5 checkpoint  JAX → PyTorch  (one-time, run once ever)
+#   Step 1 — Extract S2 latents from tool_pickup        (one-time per dataset)
+#   Step 2 — Train S1 flow-matching policy              (iterative)
+#   Step 3 — Run inference on robot                     (persistent S2 recommended)
+#
+# IMPORTANT: HVLA does NOT use lerobot-train / factory.py.
+# Use the standalone scripts below instead.
+#
+# --- Conda + Hub CLI (avoid broken ~/.local/bin/huggingface-cli) -------------
+# Run Steps 1–3 only with the lerobot conda env active (see SETUP at top):
+#   conda activate lerobot
+# Use the Hub CLI from that env — NOT a stale user pip shim:
+#   which hf && hf --version
+# If you must run a one-off without activating conda:
+#   conda run -n lerobot hf download ...
+# Same pattern as the rest of this file: `unset PYTHONPATH` before training if
+# Isaac Sim / ROS polluted PYTHONPATH breaks imports (wandb, matplotlib, etc.).
+#
+# --- Fits next to existing LeRobot policy stack --------------------------------
+# - Training / eval for ACT, SmolVLA, diffusion, etc. still use `lerobot-train`
+#   and `lerobot.async_inference.*` as documented above.  HVLA is a separate
+#   code path: `python -m lerobot.policies.hvla.*` only.
+# - On-robot inference uses the same robot JSON as teleop/record
+#   (`~/.config/lerobot/robots/<profile>.json`), overridable with
+#   `--robot-config` on `hvla.launch`.
+# - xlerobot: pass `--hvla-preset xlerobot` so S1→S2 shared memory matches
+#   360×640 RGB and maps head/left_wrist/right_wrist → S2 slots (see ipc.py).
+
+# -----------------------------------------------------------------------------
+# Step 0 — Convert S2 checkpoint: JAX → PyTorch  (one-time, skip if done)
+# -----------------------------------------------------------------------------
+# Download the Pi0.5 base checkpoint (Hub CLI from conda env — see note above):
+conda activate lerobot
+hf download KeWangRobotics/soarm-pi05-state-11997 \
+    --local-dir ~/.cache/openpi/checkpoints/soarm-pi05-state-11997
+
+# Convert (separate from the lerobot conda env).
+# OpenPI requires Python >= 3.11. Use a dedicated env, e.g.:
+#   conda create -n openpi python=3.11 -y && conda activate openpi
+#
+# Do NOT rely on plain `pip install -e .` alone: pip ignores [tool.uv.sources] in pyproject.toml
+# and resolves `lerobot` from PyPI (unpinned), which triggers huge backtracking and often:
+#   error: resolution-too-deep
+# Upstream expects uv + uv.lock: `lerobot` is pinned to a specific git revision.
+#   pip install uv
+#   cd ~/src/openpi && GIT_LFS_SKIP_SMUDGE=1 uv sync && GIT_LFS_SKIP_SMUDGE=1 uv pip install -e .
+# One-time after uv sync: OpenPI overrides Hugging Face `transformers` (Pi0 PyTorch path). Without this,
+# convert_jax_model_to_pytorch.py raises: transformers_replace is not installed correctly
+#   cd ~/src/openpi
+#   DST="$(uv run python -c 'import pathlib, transformers; print(pathlib.Path(transformers.__file__).parent)')"
+#   cp -r src/openpi/models_pytorch/transformers_replace/* "$DST/"
+# Then run the converter ONLY with `uv run python ...` from ~/src/openpi, or explicitly
+#   ~/src/openpi/.venv/bin/python examples/convert_jax_model_to_pytorch.py --checkpoint-dir ... --config-name ...
+# Conda's `python` (e.g. after `conda activate openpi`) is a different env — if `pip install -e .`
+# failed, you will get ModuleNotFoundError: safetensors, flax, etc.
+# If pip pulls packages from Isaac Sim via PYTHONPATH, run: unset PYTHONPATH
+# Upstream script: examples/convert_jax_model_to_pytorch.py (there is no scripts/run_conversion.py).
+#   git clone --recurse-submodules https://github.com/Physical-Intelligence/openpi.git ~/src/openpi
+# HF layout has assets/ next to params/; the stock converter looks for ../assets (parent dir).
+# If assets are not copied into the output folder, HVLA only needs model.safetensors anyway.
+# Config: HF card lists train config soarm_pi05_flow (Pi05Config); the converter only accepts
+# Pi0Config names — use pi05_aloha (Pi0Config(pi05=True), action_horizon=50 default).
+cd ~/src/openpi
+# Tyro requires flags (positional args are not accepted):
+uv run python examples/convert_jax_model_to_pytorch.py \
+    --checkpoint-dir ~/.cache/openpi/checkpoints/soarm-pi05-state-11997 \
+    --config-name pi05_aloha \
+    --output-path ~/.cache/lerobot/converted/soarm-pi05-state-11997-pytorch
+# Optional if you want assets beside the PyTorch folder:
+# cp -r ~/.cache/openpi/checkpoints/soarm-pi05-state-11997/assets \
+#    ~/.cache/lerobot/converted/soarm-pi05-state-11997-pytorch/
+# Output: ~/.cache/lerobot/converted/soarm-pi05-state-11997-pytorch/model.safetensors
+
+# Return to this repo root (Jetson vs PC — adjust path):
+cd /home/owen/lerobot
+
+# -----------------------------------------------------------------------------
+# Step 1 — Extract S2 latents from Odog16/tool_pickup  (one-time per dataset)
+# -----------------------------------------------------------------------------
+# Runs VLM inference over all 76 829 frames offline and saves a [76829, 2048]
+# float32 .npy file.  ~81 ms/frame on GPU → ~1.7 h for the full dataset.
+# Re-run only if you retrain S2 or change the task prompt.
+# Script: scripts/extract_s2_latents_hvla.py (repo root; requires lerobot env).
+conda activate lerobot
+cd /home/owen/lerobot
+python scripts/extract_s2_latents_hvla.py \
+    --checkpoint ~/.cache/lerobot/converted/soarm-pi05-state-11997-pytorch/model.safetensors \
+    --dataset Odog16/tool_pickup \
+    --prompt "pick up the tools from the table and place it in the red bin" \
+    --output ~/.cache/huggingface/lerobot/Odog16/tool_pickup/s2_latents.npy \
+    --image-keys observation.images.head,observation.images.left_wrist,observation.images.right_wrist \
+    --batch-size 8
+
+# -----------------------------------------------------------------------------
+# Step 2 — Train S1 flow-matching policy
+# -----------------------------------------------------------------------------
+# Hardware target: RTX 3090 Ti (24 GB).  batch_size=32 fits comfortably.
+# Steps math: 76 829 frames / 32 ≈ 2 400 steps/epoch → 50 000 steps ≈ 21 epochs.
+# Training logs → outputs/train/tool_pickup_hvla_flow_v1/train.log
+# Checkpoints  → outputs/train/tool_pickup_hvla_flow_v1/checkpoints/
+# Use --image-keys to match the xlerobot camera names (head, not front/top).
+# Use --action-dim 18 / --state-dim 18 for the full 18-DOF xlerobot schema.
+
+conda activate lerobot
+unset PYTHONPATH
+cd /home/owen/lerobot
+
+python -u -m lerobot.policies.hvla.s1.flow_matching.train \
+    --dataset-repo-id Odog16/tool_pickup \
+    --s2-latent-path ~/.cache/huggingface/lerobot/Odog16/tool_pickup/s2_latents.npy \
+    --output-dir outputs/train/tool_pickup_hvla_flow_v1 \
+    --steps 50000 \
+    --batch-size 32 \
+    --save-freq 10000 \
+    --num-workers 8 \
+    --resize-images 224x224 \
+    --image-keys head,left_wrist,right_wrist \
+    --action-dim 18 \
+    --state-dim 18
+
+# Resume from a checkpoint (append --resume with the checkpoint dir):
+# python -u -m lerobot.policies.hvla.s1.flow_matching.train \
+#     --dataset-repo-id Odog16/tool_pickup \
+#     --s2-latent-path ~/.cache/huggingface/lerobot/Odog16/tool_pickup/s2_latents.npy \
+#     --output-dir outputs/train/tool_pickup_hvla_flow_v1 \
+#     --steps 50000 --batch-size 32 --save-freq 10000 --num-workers 8 \
+#     --resize-images 224x224 --image-keys head,left_wrist,right_wrist \
+#     --action-dim 18 --state-dim 18 \
+#     --resume outputs/train/tool_pickup_hvla_flow_v1/checkpoints/last
+
+# Ablation — train without S2 (images + state only, useful for comparison):
+# python -u -m lerobot.policies.hvla.s1.flow_matching.train \
+#     --dataset-repo-id Odog16/tool_pickup \
+#     --output-dir outputs/train/tool_pickup_hvla_no_s2_v1 \
+#     --steps 50000 --batch-size 32 --save-freq 10000 --num-workers 8 \
+#     --resize-images 224x224 --image-keys head,left_wrist,right_wrist \
+#     --action-dim 18 --state-dim 18
+
+# -----------------------------------------------------------------------------
+# Step 3 — Inference on robot
+# -----------------------------------------------------------------------------
+# Jetson / robot PC: conda activate lerobot, repo root on PYTHONPATH via editable install.
+# --hvla-preset xlerobot: SHM image size 360×640 + camera map head/wrists → S2 slots
+# (must match between s2_standalone and launch if you split terminals).
+# Optional: --robot-config ~/.config/lerobot/robots/<your_xlerobot_profile>.json
+
+conda activate lerobot
+unset PYTHONPATH
+cd /home/owen/lerobot
+
+# OPTION A: Single launch (S2 cold-start takes ~45 s, then S1 begins).
+
+python -m lerobot.policies.hvla.launch \
+    --hvla-preset xlerobot \
+    --s1-type flow \
+    --s1-checkpoint outputs/train/tool_pickup_hvla_flow_v1/checkpoints/last \
+    --s2-checkpoint ~/.cache/lerobot/converted/soarm-pi05-state-11997-pytorch/model.safetensors \
+    --task "pick up the tools from the table and place it in the red bin" \
+    --resize-images 224x224
+
+# OPTION B: Persistent S2 (recommended when iterating on S1 checkpoints).
+# S2 loads once in Terminal 1; S1 in Terminal 2 auto-discovers it via /dev/shm.
+# Restart S1 freely without waiting for S2 to reload each time.
+
+# Terminal 1 — start S2 once, leave it running:
+python -m lerobot.policies.hvla.s2_standalone \
+    --hvla-preset xlerobot \
+    --checkpoint ~/.cache/lerobot/converted/soarm-pi05-state-11997-pytorch/model.safetensors \
+    --task "pick up the tools from the table and place it in the red bin"
+
+# Terminal 2 — start/restart S1 freely (no --s2-checkpoint needed):
+python -m lerobot.policies.hvla.launch \
+    --hvla-preset xlerobot \
+    --s1-type flow \
+    --s1-checkpoint outputs/train/tool_pickup_hvla_flow_v1/checkpoints/last \
+    --task "pick up the tools from the table and place it in the red bin" \
+    --resize-images 224x224
+
+# Useful inference flags:
+#   --denoise-steps N            Override denoising steps (default 10, range 5-15)
+#   --s1-query-interval N        Re-query every N actions (default 2, ~67 ms)
+#   --no-compile-s1              Disable torch.compile if it causes issues
+#   --record-dataset REPO_ID     Record episode to LeRobotDataset (e.g. Odog16/hvla_tool_pickup_eval)
+#   --teleop-config PATH         Enable leader-arm intervention / inverse-follow
+#   --intervention-dataset REPO_ID  Record human takeover segments as separate episodes
+#   --save-grip-drops DIR        Save observations when gripper drops detected (debugging)
+
+# -----------------------------------------------------------------------------
+# Step 3 (OPTION C) — Cross-machine inference: S2 on GPU PC, S1 + robot on Jetson
+# -----------------------------------------------------------------------------
+# Architecture:
+#   GPU PC  : S2 (PaliGemma 3B) — receives JPEG camera frames from Jetson over ZMQ,
+#             extracts [2048] latent, publishes over ZMQ @4-15Hz.
+#   Jetson  : S1 (DINOv2 + flow) — publishes images to GPU PC, subscribes to latent,
+#             runs action loop at ~15-25Hz, drives motors via USB.
+#
+# Ports (both machines must agree):
+#   5580 — Jetson → GPU PC : camera frames (JPEG, ~1-3 MB/s)
+#   5581 — GPU PC → Jetson : S2 latent   (8 KB/update @4-15Hz)
+# Make sure firewall allows these ports between the machines.
+#
+# GPU_IP  = IP address of the GPU PC (e.g. 192.168.1.10)
+# JET_IP  = IP address of the Jetson  (e.g. 192.168.1.50)
+
+GPU_IP="192.168.1.10"
+JET_IP="192.168.1.50"
+
+# --- GPU PC: start S2 standalone (subscribe to Jetson images, publish latent) ---
+conda activate lerobot
+cd /home/owen/lerobot
+python -m lerobot.policies.hvla.s2_standalone \
+    --hvla-preset xlerobot \
+    --checkpoint ~/.cache/lerobot/converted/soarm-pi05-state-11997-pytorch/model.safetensors \
+    --task "pick up the tools from the table and place it in the red bin" \
+    --zmq-image-host ${JET_IP} \
+    --zmq-image-port 5580 \
+    --zmq-latent-port 5581
+# S2 waits for image frames from Jetson; publishes latents as soon as frames arrive.
+
+# --- Jetson: start S1 + robot (publish images to GPU PC, subscribe to latent) ---
+conda activate lerobot
+unset PYTHONPATH
+cd /home/jetson/lerobot
+python -m lerobot.policies.hvla.launch \
+    --hvla-preset xlerobot \
+    --s1-type flow \
+    --s1-checkpoint outputs/train/tool_pickup_hvla_flow_v1/checkpoints/last \
+    --task "pick up the tools from the table and place it in the red bin" \
+    --resize-images 224x224 \
+    --zmq-latent-host ${GPU_IP} \
+    --zmq-latent-port 5581 \
+    --zmq-image-port 5580
+# No --s2-checkpoint needed — S2 is already running on the GPU PC.
+# No --robot-config needed if using default xlerobot profile on Jetson.
+
+# Notes:
+# - Start S2 on GPU PC first, then S1 on Jetson (S2 blocks until it gets image frames).
+# - S1 pre-fills action chunks from a zero latent until S2's first reply arrives (safe).
+# - Data collection (lerobot-record, VR teleop) stays entirely on Jetson — no GPU PC needed.
+# - JPEG quality 85 (default) gives ~200-400 KB per frame per camera at 360×640.
+#   Lower with --zmq-image-jpeg-quality 70 if bandwidth is tight (WiFi).
+# - Wired LAN strongly recommended; WiFi adds jitter that can stale the latent.
 
 # =============================================================================
 # GIT WORKFLOW

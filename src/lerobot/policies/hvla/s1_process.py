@@ -1,0 +1,1710 @@
+"""S1 process: loads action policy, reads shared latent, runs robot control loop.
+
+Runs in the main process (needs direct robot/camera access). S1 is latency-critical (~30Hz).
+Adapted from dual_system_infer.py.
+"""
+
+import logging
+import math
+import os
+import time
+from pathlib import Path
+
+import cv2
+import numpy as np
+import torch
+
+from lerobot.policies.hvla.ipc import SharedLatentCache, SharedImageBuffer
+
+logger = logging.getLogger(__name__)
+
+
+def _resolve_hvla_robot_config_path(explicit: str | None) -> str:
+    """Robot JSON for HVLA launch: --robot-config, env, or ~/.config/lerobot/robots/."""
+    if explicit:
+        p = Path(explicit).expanduser()
+        if not p.is_file():
+            raise FileNotFoundError(f"Robot config not found: {p}")
+        return str(p)
+    env_path = os.environ.get("LEROBOT_ROBOT_CONFIG", "").strip()
+    if env_path:
+        p = Path(env_path).expanduser()
+        if p.is_file():
+            return str(p)
+        raise FileNotFoundError(f"LEROBOT_ROBOT_CONFIG points to missing file: {p}")
+    base = Path.home() / ".config" / "lerobot" / "robots"
+    for name in ("xlerobot.json", "white.json"):
+        cand = base / name
+        if cand.is_file():
+            return str(cand)
+    try:
+        found = sorted(base.glob("*.json"))
+    except OSError:
+        found = []
+    names = [f.name for f in found]
+    extra = f" Found: {names}. Pass --robot-config with one of these." if names else ""
+    raise FileNotFoundError(
+        f"No robot profile at {base}/xlerobot.json or white.json.{extra} "
+        "Create a profile (e.g. from lerobot-record) or set LEROBOT_ROBOT_CONFIG."
+    )
+
+
+# Default joint names for SO107 bimanual robot (backward compat / tests)
+JOINT_NAMES = [
+    "left_shoulder_pan.pos", "left_shoulder_lift.pos", "left_elbow_flex.pos",
+    "left_forearm_roll.pos", "left_wrist_flex.pos", "left_wrist_roll.pos", "left_gripper.pos",
+    "right_shoulder_pan.pos", "right_shoulder_lift.pos", "right_elbow_flex.pos",
+    "right_forearm_roll.pos", "right_wrist_flex.pos", "right_wrist_roll.pos", "right_gripper.pos",
+]
+
+# Default S1→S2 camera key map for SO107 (override via --s2-camera-map)
+S2_CAM_KEY_MAP = {
+    "front": "base_0_rgb",
+    "top": "base_1_rgb",
+    "left_wrist": "left_wrist_0_rgb",
+    "right_wrist": "right_wrist_0_rgb",
+}
+
+
+def _joint_names_from_robot(robot) -> list[str]:
+    """Derive joint names from a connected LeRobot Robot instance."""
+    return list(robot.action_features.keys())
+
+
+def _camera_keys_from_robot(robot) -> list[str]:
+    """Derive camera keys from a connected LeRobot Robot instance."""
+    return [k for k, v in robot.observation_features.items() if isinstance(v, tuple)]
+
+
+def _compute_chunk_index(t_now: float, t_origin: float, fps: int, chunk_len: int) -> int:
+    """Time-based index into current action chunk."""
+    elapsed = t_now - t_origin
+    idx = round(elapsed * fps)
+    return max(0, min(idx, chunk_len - 1))
+
+
+def _osc_skip(chunk: np.ndarray, idx: int, step_count: int) -> int:
+    """Oscillation skip: if all joints have low displacement in the next 5
+    frames, scan ahead to where movement starts. Robot-agnostic."""
+    if idx >= len(chunk) - 10:
+        return idx
+    origin = chunk[idx]
+    check_at = min(idx + 5, len(chunk) - 1)
+    total_disp = np.linalg.norm(chunk[check_at] - origin)
+    if total_disp >= 2.0:
+        return idx
+    for k in range(idx + 5, min(idx + 30, len(chunk))):
+        disp = np.linalg.norm(chunk[k] - origin)
+        if disp > 3.0:
+            if step_count % 50 == 0:
+                logger.info("S1 osc-skip: flat [%d]→[%d] (disp=%.1f)", idx, k, disp)
+            return max(0, min(k, len(chunk) - 1))
+    return idx
+
+
+def _apply_delta_filter(action_np: np.ndarray, prev_action_np: np.ndarray,
+                        max_step_delta: float) -> np.ndarray:
+    """Per-joint delta filter: hold joints that jump > max_step_delta."""
+    diff = np.abs(action_np - prev_action_np)
+    bad_mask = diff > max_step_delta
+    if bad_mask.any():
+        action_np[bad_mask] = prev_action_np[bad_mask]
+    return action_np
+
+
+def _save_infer_drop(chunk_np: np.ndarray, obs: dict, infer_count: int, save_dir: str,
+                     joint_names: list[str] | None = None):
+    """Detect large jumps in any joint of predicted chunk and save obs for analysis."""
+    # Max per-joint jump in first 20 steps
+    per_joint_max = np.max(np.abs(np.diff(chunk_np[:20], axis=0)), axis=0)
+    max_jump = np.max(per_joint_max)
+    if max_jump <= 10:
+        return
+    worst_joint = int(np.argmax(per_joint_max))
+    names = joint_names or JOINT_NAMES
+    joint_label = names[worst_joint] if worst_joint < len(names) else f"joint_{worst_joint}"
+    import os, cv2
+    drop_dir = os.path.join(save_dir, f"infer_drop_{infer_count}")
+    os.makedirs(drop_dir, exist_ok=True)
+    for k, v in obs.items():
+        if isinstance(v, np.ndarray) and v.ndim == 3:
+            safe = k.replace("/", "_").replace(".", "_")
+            cv2.imwrite(os.path.join(drop_dir, f"{safe}.jpg"), v[:, :, ::-1])
+    state_arr = np.array([float(obs.get(j, 0)) for j in names])
+    np.save(os.path.join(drop_dir, "state.npy"), state_arr)
+    np.save(os.path.join(drop_dir, "chunk.npy"), chunk_np)
+    logger.info("S1 INFER DROP infer#%d | max_jump=%.1f (%s) | saved to %s",
+                infer_count, max_jump, joint_label, drop_dir)
+
+
+def _log_joint_jump(
+    action_np: np.ndarray, prev_action_np: np.ndarray,
+    step_count: int, idx: int, chunk_data: np.ndarray | None,
+    robot_state: np.ndarray | None = None,
+    save_dir: str | None = None,
+    obs_images: dict | None = None,
+    joint_names: list[str] | None = None,
+):
+    """Log large per-joint jumps with chunk trajectory and optional obs saving."""
+    per_joint_delta = np.abs(action_np - prev_action_np)
+    max_delta = np.max(per_joint_delta)
+    if max_delta <= 10:
+        return
+    if chunk_data is None:
+        return
+    names = joint_names or JOINT_NAMES
+    worst = int(np.argmax(per_joint_delta))
+    joint_label = names[worst] if worst < len(names) else f"joint_{worst}"
+    delta = np.linalg.norm(action_np - prev_action_np)
+
+    # Show trajectory of worst joint
+    traj = [f"{chunk_data[i, worst]:.0f}" for i in range(min(20, len(chunk_data)))]
+    state_str = ""
+    if robot_state is not None:
+        state_str = "\n  state: " + " ".join(f"{v:6.1f}" for v in robot_state)
+    logger.info(
+        "S1 JUMP step %d idx=%d | %s: %.1f→%.1f (Δ%.1f) | Δaction=%.1f\n"
+        "  chunk %s[0:20]: %s%s",
+        step_count, idx, joint_label,
+        prev_action_np[worst], action_np[worst], per_joint_delta[worst],
+        delta, joint_label, " ".join(traj), state_str,
+    )
+    # Save observation snapshot for offline analysis
+    if save_dir and obs_images:
+        import os, cv2
+        drop_dir = os.path.join(save_dir, f"joint_jump_{step_count}")
+        os.makedirs(drop_dir, exist_ok=True)
+        for cam_name, img_np in obs_images.items():
+            safe_name = cam_name.replace("/", "_").replace(".", "_")
+            cv2.imwrite(os.path.join(drop_dir, f"{safe_name}.jpg"), img_np[:, :, ::-1])
+        if robot_state is not None:
+            np.save(os.path.join(drop_dir, "state.npy"), robot_state)
+        if chunk_data is not None:
+            np.save(os.path.join(drop_dir, "chunk.npy"), chunk_data)
+
+
+def obs_to_s1_batch(
+    robot_obs: dict,
+    s1_image_keys: list[str],
+    shared_cache: SharedLatentCache,
+    s2_latent_key: str,
+    device: torch.device,
+    resize_to: tuple[int, int] | None = None,
+    joint_names: list[str] | None = None,
+) -> dict:
+    """Convert robot observation to S1 input batch.
+
+    Images are resized on CPU before GPU transfer (0.6MB vs 10.5MB per image).
+    """
+    if joint_names is None:
+        joint_names = JOINT_NAMES
+
+    batch = {}
+
+    for key in s1_image_keys:
+        cam_name = key.split(".")[-1]
+        if cam_name in robot_obs:
+            img = np.asarray(robot_obs[cam_name], dtype=np.uint8)
+            if resize_to is not None:
+                img = cv2.resize(img, (resize_to[1], resize_to[0]), interpolation=cv2.INTER_LINEAR)
+            img_tensor = torch.from_numpy(img).permute(2, 0, 1).unsqueeze(0).float().div_(255.0).to(device)
+            batch[key] = img_tensor
+
+    state = [float(robot_obs[name]) for name in joint_names]
+    batch["observation.state"] = torch.tensor([state], dtype=torch.float32, device=device)
+
+    if shared_cache is not None:
+        latent, age_seconds = shared_cache.read_with_age()
+        # Clamp age to training range — model was trained with max_delay_seconds
+        # (e.g., 0.15s). Ages beyond that are out-of-distribution.
+        max_train_age = 0.15  # must match --max-delay used during training
+        age_seconds = min(age_seconds, max_train_age)
+        batch[s2_latent_key] = latent.unsqueeze(0).to(device)
+        batch["observation.s2_latent_age"] = torch.tensor([[age_seconds]], dtype=torch.float32, device=device)
+
+    return batch
+
+
+def _warmup_s1(policy, preprocessor, s1_image_keys, device, resize_to,
+               state_dim: int = 14, s2_latent_dim: int = 2048,
+               use_s2: bool = True):
+    """Run dummy forward passes to trigger torch.compile kernel compilation.
+
+    Uses fake data — no robot needed. After this, the control loop runs
+    at full compiled speed with no compilation stalls.
+    """
+    import time as _time
+
+    h, w = resize_to if resize_to else (224, 224)
+    dummy_batch = {}
+    for key in s1_image_keys:
+        dummy_batch[key] = torch.randn(1, 3, h, w, device=device)
+    dummy_batch["observation.state"] = torch.zeros(1, state_dim, device=device)
+    if use_s2:
+        dummy_batch["observation.s2_latent"] = torch.zeros(1, s2_latent_dim, device=device)
+        dummy_batch["observation.s2_latent_age"] = torch.zeros(1, 1, device=device)
+
+    dummy_batch = preprocessor(dummy_batch)
+
+    t0 = _time.perf_counter()
+    with torch.no_grad():
+        for i in range(3):
+            if hasattr(policy, 'select_action'):
+                policy.select_action(dummy_batch)
+            else:
+                policy.predict_action_chunk(dummy_batch)
+            if i == 0:
+                logger.info("S1: First compiled forward done (%.1fs)", _time.perf_counter() - t0)
+    policy.reset()  # clear any state from warmup
+    logger.info("S1: Warmup complete (%.1fs total)", _time.perf_counter() - t0)
+
+
+def _create_or_resume_dataset(repo_id: str, fps: int, features: dict, robot_type: str):
+    """HACK: wrapper over LeRobotDataset.create that resumes if dir exists.
+
+    When a previous run crashes mid-creation, the dataset dir is left behind
+    and LeRobotDataset.create(exist_ok=False) refuses to overwrite.
+    This tries to resume first, falling back to delete+recreate if corrupted.
+    TODO: move this logic into LeRobotDataset itself.
+    """
+    from lerobot.datasets.lerobot_dataset import LeRobotDataset, HF_LEROBOT_HOME
+
+    dataset_root = HF_LEROBOT_HOME / repo_id
+    if dataset_root.exists():
+        try:
+            dataset = LeRobotDataset(repo_id)
+            dataset.episode_buffer = dataset.create_episode_buffer()
+            dataset._init_video_encoders()
+            return dataset
+        except Exception as e:
+            logger.warning("Failed to resume '%s' (%s), recreating", repo_id, e)
+            import shutil
+            shutil.rmtree(dataset_root)
+
+    return LeRobotDataset.create(
+        repo_id=repo_id, fps=fps, features=features,
+        robot_type=robot_type, use_videos=True,
+    )
+
+
+def _create_recording_dataset(repo_id: str, fps: int, robot, task: str):
+    """Create a LeRobotDataset for recording inference episodes.
+
+    Features are derived from the robot's action/observation specs.
+    """
+    from lerobot.datasets.lerobot_dataset import LeRobotDataset
+
+    obs_ft = robot.observation_features
+    action_ft = robot.action_features
+
+    # Joint names = non-camera observation features
+    joint_names = [k for k, v in action_ft.items() if not isinstance(v, tuple)]
+    cam_features = {k: v for k, v in obs_ft.items() if isinstance(v, tuple)}
+
+    features = {}
+    features["observation.state"] = {
+        "dtype": "float32",
+        "shape": (len(joint_names),),
+        "names": list(joint_names),
+    }
+    for cam_name, shape in cam_features.items():
+        features[f"observation.images.{cam_name}"] = {
+            "dtype": "video",
+            "shape": shape,
+            "names": ["height", "width", "channels"],
+        }
+    features["action"] = {
+        "dtype": "float32",
+        "shape": (len(joint_names),),
+        "names": list(joint_names),
+    }
+
+    dataset = _create_or_resume_dataset(
+        repo_id=repo_id, fps=fps, features=features,
+        robot_type=robot.robot_type,
+    )
+    logger.info("S1: Recording dataset '%s' (%d joints, %d cameras, %d existing episodes)",
+                repo_id, len(joint_names), len(cam_features), dataset.meta.total_episodes)
+    return dataset
+
+
+def _add_frame_to_dataset(dataset, obs: dict, action_np: np.ndarray, joint_names: list[str], task: str):
+    """Add a single frame (obs + action) to the recording dataset."""
+    frame = {"task": task}
+    frame["observation.state"] = np.array(
+        [float(obs.get(j, 0)) for j in joint_names], dtype=np.float32,
+    )
+    frame["action"] = action_np.astype(np.float32)
+    for k, v in obs.items():
+        if isinstance(v, np.ndarray) and v.ndim == 3:
+            frame[f"observation.images.{k}"] = v
+    dataset.add_frame(frame)
+
+
+def _dry_run_inference(policy, preprocessor, s1_image_keys, shared_cache, device,
+                       resize_to, s1_type: str, n_steps: int = 5):
+    """Run synthetic inference steps without robot hardware.
+
+    Validates the full S1 forward pass (including S2 latent injection if S2 is running)
+    and reports timing per step.
+    """
+    import time as _time
+    from lerobot.policies.hvla.s1.protocol import S2_LATENT_KEY
+
+    h, w = resize_to if resize_to else (224, 224)
+    state_dim = policy.config.action_dim if s1_type == "flow" else 14
+    s2_latent_dim = getattr(policy.config, "s2_latent_dim", 2048) if s1_type == "flow" else 2048
+
+    logger.info("DRY RUN: image keys=%s, state_dim=%d, s2_latent_dim=%d, device=%s",
+                s1_image_keys, state_dim, s2_latent_dim, device)
+
+    policy.reset()
+    for step in range(n_steps):
+        t0 = _time.perf_counter()
+        batch = {}
+        for key in s1_image_keys:
+            batch[key] = torch.zeros(1, 3, h, w, device=device)
+        batch["observation.state"] = torch.zeros(1, state_dim, device=device)
+
+        # Try to read live S2 latent if available
+        if shared_cache is not None:
+            latent, age_s = shared_cache.read()
+            if latent is not None:
+                batch[S2_LATENT_KEY] = latent.unsqueeze(0).to(device)
+                batch["observation.s2_latent_age"] = torch.tensor([[min(age_s, 0.15)]], device=device)
+                logger.info("DRY RUN step %d: live S2 latent (age=%.1fms)", step, age_s * 1000)
+            else:
+                batch[S2_LATENT_KEY] = torch.zeros(1, s2_latent_dim, device=device)
+                batch["observation.s2_latent_age"] = torch.zeros(1, 1, device=device)
+                logger.info("DRY RUN step %d: zero S2 latent (S2 not ready)", step)
+        else:
+            logger.info("DRY RUN step %d: no S2 (zero_s2 mode)", step)
+
+        batch = preprocessor(batch)
+        with torch.no_grad():
+            if s1_type == "flow":
+                actions = policy.predict_action_chunk(batch)
+            else:
+                # ACT-VLM: use forward() and take the first action chunk
+                _, pred = policy.forward(batch)
+                actions = pred.get("action", pred.get("actions", torch.zeros(1, 1, 14)))
+
+        dt = _time.perf_counter() - t0
+        logger.info("DRY RUN step %d/%d: action shape=%s, inference=%.1fms",
+                    step + 1, n_steps, tuple(actions.shape), dt * 1000)
+        _time.sleep(0.05)
+
+    logger.info("DRY RUN: %d steps completed successfully", n_steps)
+
+
+def run_s1(
+    s1_checkpoint: str,
+    shared_cache: SharedLatentCache,
+    shared_images: SharedImageBuffer,
+    task: str,
+    s2_cam_key_map: dict[str, str] | None = None,
+    robot_config_path: str | None = None,
+    fps: int = 30,
+    device: str = "cuda",
+    resize_images: tuple[int, int] | None = (224, 224),
+    temporal_ensemble_coeff: float | None = None,
+    n_action_steps: int | None = None,
+    compile_s1: bool = False,
+    s1_type: str = "act",
+    stop_event=None,
+    osc_skip: bool = False,
+    query_interval_steps: int = 0,
+    num_denoise_steps: int | None = None,
+    max_step_delta: float | None = None,
+    grip_drop_save_dir: str | None = None,
+    record_dataset: str | None = None,
+    num_episodes: int = 1,
+    episode_time_s: float = 0,
+    reset_time_s: float = 20,
+    teleop_config_path: str | None = None,
+    intervention_dataset: str | None = None,
+    # RLT parameters
+    rlt_mode: bool = False,
+    rl_token_checkpoint: str | None = None,
+    rlt_checkpoint: str | None = None,
+    rlt_deploy: bool = False,
+    rl_chunk_length: int = 10,
+    rlt_output_dir: str = "outputs/rlt_online",
+    dry_run: bool = False,
+    dry_run_steps: int = 5,
+):
+    """S1 control loop with robot. Runs in main process."""
+    cam_map = s2_cam_key_map if s2_cam_key_map is not None else S2_CAM_KEY_MAP
+
+    # Main process logging should already be configured by launch.py,
+    # but ensure it works even if run standalone.
+    from lerobot.policies.hvla.logging_utils import setup_process_logging
+    if not logging.getLogger().handlers:
+        setup_process_logging()
+
+    import json
+    import draccus
+    from lerobot.policies.hvla.s1.protocol import S2_LATENT_KEY
+    from lerobot.robots import make_robot_from_config
+    from lerobot.robots.config import RobotConfig
+    # keyboard listener removed — Ctrl+C via stop_event is sufficient
+
+    # Register robot/camera/teleop types for draccus (side-effect imports; robot JSON uses these).
+    import lerobot.robots.bi_so_follower  # noqa: F401
+    import lerobot.robots.xlerobot  # noqa: F401
+    import lerobot.teleoperators.bi_so_leader  # noqa: F401
+    import lerobot.teleoperators.xlerobot_vr  # noqa: F401
+    from lerobot.cameras.opencv.configuration_opencv import OpenCVCameraConfig  # noqa: F401
+    from lerobot.cameras.realsense.configuration_realsense import RealSenseCameraConfig  # noqa: F401
+
+    device = torch.device(device)
+
+    # Load S1 policy based on type
+    logger.info("S1: Loading %s policy from %s", s1_type, s1_checkpoint)
+
+    if s1_type == "flow":
+        from lerobot.policies.hvla.s1.flow_matching import FlowMatchingS1Policy
+        # config=None → load action_dim, state_dim, image_features from checkpoint config.json
+        policy = FlowMatchingS1Policy.from_pretrained(s1_checkpoint, config=None)
+        preprocessor = lambda batch: batch  # flow matching handles its own normalization
+        postprocessor = lambda actions: actions
+        s1_image_keys = list(policy.config.image_features.keys())
+    else:
+        from lerobot.policies.act_vlm.modeling_act_vlm import ACTWithVLMPolicy
+        from lerobot.policies.factory import make_pre_post_processors
+        policy = ACTWithVLMPolicy.from_pretrained(pretrained_name_or_path=s1_checkpoint)
+
+        if temporal_ensemble_coeff is not None:
+            policy.config.temporal_ensemble_coeff = temporal_ensemble_coeff
+            policy.config.n_action_steps = 1
+            from lerobot.policies.act.modeling_act import ACTTemporalEnsembler
+            policy.temporal_ensembler = ACTTemporalEnsembler(temporal_ensemble_coeff, policy.config.chunk_size)
+            logger.info("S1: Temporal ensembling (coeff=%.3f)", temporal_ensemble_coeff)
+        elif n_action_steps is not None:
+            policy.config.n_action_steps = n_action_steps
+            logger.info("S1: n_action_steps=%d", n_action_steps)
+
+        s1_image_keys = list(policy.config.image_features.keys())
+        preprocessor, postprocessor = make_pre_post_processors(
+            policy_cfg=policy.config, pretrained_path=s1_checkpoint,
+        )
+
+    policy.to(device)
+    policy.eval()
+    policy.reset()
+
+    # Enable TF32 matmul for faster float32 ops on Ampere+ GPUs
+    torch.set_float32_matmul_precision("high")
+    torch.backends.cudnn.benchmark = True
+
+    logger.info("S1: Policy loaded (%s). Image keys: %s", s1_type, s1_image_keys)
+
+    # torch.compile is opt-in via --compile-s1 flag.
+    # DINOv2 attention layers are not compatible with torch.compile out of the box.
+    # TODO: investigate torch.compile with fullgraph=False or compiling only the
+    # ACT encoder/decoder (excluding DINOv2 backbone).
+    if compile_s1:
+        logger.info("S1: Compiling denoise_step with torch.compile...")
+        inner = policy.model if hasattr(policy, 'model') else policy
+        inner.denoise_step = torch.compile(inner.denoise_step, mode="default")
+        logger.info("S1: Warming up compiled model...")
+        _warmup_s1(policy, preprocessor, s1_image_keys, device, resize_images,
+                   state_dim=policy.config.action_dim if s1_type == "flow" else 14,
+                   s2_latent_dim=policy.config.s2_latent_dim if s1_type == "flow" else 2048,
+                   use_s2=shared_cache is not None)
+
+    # Load robot
+    config_path = _resolve_hvla_robot_config_path(robot_config_path)
+    logger.info("S1: Loading robot from %s", config_path)
+    with open(config_path) as f:
+        profile = json.load(f)
+    # Support both formats:
+    # - LeRobot profile: {type, name, fields: {ports...}, cameras, ...}
+    # - Flat config: {type, left_arm_port, ..., cameras, ...}
+    if "fields" in profile:
+        config_dict = {"type": profile["type"]}
+        for k, v in profile["fields"].items():
+            config_dict[k] = v
+        if "cameras" in profile:
+            config_dict["cameras"] = profile["cameras"]
+    else:
+        config_dict = profile
+    robot_cfg = draccus.decode(RobotConfig, config_dict)
+    logger.info("S1: Robot config decoded OK → type=%s", robot_cfg.type)
+
+    if dry_run:
+        # Validate config + policy without touching hardware SDKs at all.
+        logger.info("DRY RUN: Skipping robot instantiation and connect() — "
+                    "running %d synthetic inference steps", dry_run_steps)
+        _dry_run_inference(
+            policy=policy,
+            preprocessor=preprocessor,
+            s1_image_keys=s1_image_keys,
+            shared_cache=shared_cache,
+            device=device,
+            resize_to=resize_images,
+            s1_type=s1_type,
+            n_steps=dry_run_steps,
+        )
+        logger.info("DRY RUN complete — all systems OK")
+        return
+
+    robot = make_robot_from_config(robot_cfg)
+    logger.info("S1: Connecting to robot...")
+    robot.connect()
+    logger.info("S1: Robot connected")
+
+    # Derive joint names and camera keys from the robot (robot-agnostic)
+    joint_names = _joint_names_from_robot(robot)
+    camera_keys = _camera_keys_from_robot(robot)
+    action_dim = len(joint_names)
+    logger.info("S1: Robot joints (%d): %s", action_dim, joint_names)
+    logger.info("S1: Robot cameras: %s", camera_keys)
+
+    # Apply observation processor steps (e.g., depth edge overlay for RealSense)
+    obs_processor_steps = robot.get_observation_processor_steps() if hasattr(robot, "get_observation_processor_steps") else []
+
+    # Append obs stream writer as the last step (writes processed obs to shared memory for GUI)
+    from lerobot.robots.obs_stream import make_obs_stream_writer_step
+    obs_stream_step = make_obs_stream_writer_step()
+    if obs_stream_step is not None:
+        obs_processor_steps.append(obs_stream_step)
+
+    if obs_processor_steps:
+        logger.info("S1: Observation processors: %s", [type(s).__name__ for s in obs_processor_steps])
+
+    # Episode recording
+    dataset = None
+    if record_dataset:
+        dataset = _create_recording_dataset(record_dataset, fps, robot, task)
+
+    # Intervention recording dataset
+    int_dataset = None
+    if intervention_dataset:
+        int_dataset = _create_recording_dataset(intervention_dataset, fps, robot, task)
+        logger.info("S1: Intervention dataset '%s' created", intervention_dataset)
+
+    # Teleop (leader arm) for intervention / inverse follow
+    teleop = None
+    if teleop_config_path:
+        logger.info("S1: Loading teleop from %s", teleop_config_path)
+        with open(teleop_config_path) as f:
+            teleop_profile = json.load(f)
+        # Support LeRobot profile format: {type, fields: {...}}
+        if "fields" in teleop_profile:
+            teleop_config_dict = {"type": teleop_profile["type"]}
+            for k, v in teleop_profile["fields"].items():
+                teleop_config_dict[k] = v
+        else:
+            teleop_config_dict = teleop_profile
+        # Force intervention_enabled on
+        teleop_config_dict["intervention_enabled"] = True
+        from lerobot.teleoperators import TeleoperatorConfig
+        from lerobot.teleoperators.utils import make_teleoperator_from_config
+        teleop_cfg = draccus.decode(TeleoperatorConfig, teleop_config_dict)
+        teleop = make_teleoperator_from_config(teleop_cfg)
+        teleop.connect()
+        logger.info("S1: Teleop connected (intervention enabled, press SPACE to toggle)")
+
+    # Note: S2 wait happens after inference thread starts (below),
+    # because the inference thread publishes images that S2 needs.
+
+    # Log all runs to file (not just RLT) for post-analysis
+    import datetime
+    run_log_dir = Path("outputs/hvla_runs")
+    run_log_dir.mkdir(parents=True, exist_ok=True)
+    run_log_file = run_log_dir / f"run_{datetime.datetime.now().strftime('%Y%m%d_%H%M%S')}.log"
+    _run_fh = logging.FileHandler(str(run_log_file), mode="w")
+    _run_fh.setFormatter(logging.Formatter("%(asctime)s [%(levelname)s] %(name)s: %(message)s"))
+    logging.getLogger().addHandler(_run_fh)
+    logger.info("S1: Run log → %s", run_log_file)
+
+    logger.info("S1: Starting control loop at %d FPS", fps)
+
+    # --- RLT setup ---
+    rl_token_encoder = None
+    rlt_agent = None
+    rlt_replay = None
+    rlt_state = None
+
+    if rlt_mode:
+        from lerobot.policies.hvla.rlt.config import RLTConfig
+        from lerobot.policies.hvla.rlt.token import RLTokenEncoder
+        from lerobot.policies.hvla.rlt.actor_critic import TD3Agent
+        from lerobot.policies.hvla.rlt.replay_buffer import ReplayBuffer
+
+        rlt_config = RLTConfig(
+            rl_token_dim=policy.config.hidden_dim,
+            rl_chunk_length=rl_chunk_length,
+        )
+        rl_token_encoder = RLTokenEncoder(rlt_config).to(device)
+
+        # Resolve RL token encoder checkpoint:
+        # 1. Explicit --rl-token-checkpoint
+        # 2. Saved in training_state.pt of the RLT checkpoint
+        # 3. None (encoder stays random — won't work, but doesn't crash)
+        resolved_token_ckpt = rl_token_checkpoint
+        if not resolved_token_ckpt and rlt_checkpoint:
+            ts_path = Path(rlt_checkpoint) / "training_state.pt"
+            if ts_path.exists():
+                try:
+                    ts = torch.load(str(ts_path), weights_only=False, map_location=device)
+                    resolved_token_ckpt = ts.get("rlt_token_checkpoint")
+                    if resolved_token_ckpt:
+                        logger.info("RLT: Auto-discovered token encoder from checkpoint: %s", resolved_token_ckpt)
+                except Exception as e:
+                    logger.warning("RLT: Failed to read token path from training state: %s", e)
+
+        if resolved_token_ckpt:
+            ckpt_path = Path(resolved_token_ckpt)
+            enc_file = ckpt_path / "encoder.pt" if ckpt_path.is_dir() else ckpt_path
+            rl_token_encoder.load_state_dict(
+                torch.load(str(enc_file), weights_only=True, map_location=device)
+            )
+            logger.info("S1 RLT: Loaded RL token encoder from %s", enc_file)
+        else:
+            logger.warning("RLT: No RL token encoder checkpoint — z_rl will be random (unusable)")
+        rl_token_encoder.eval()
+        for p in rl_token_encoder.parameters():
+            p.requires_grad = False
+
+        action_dim = policy.config.action_dim
+        state_dim = policy.config.state_dim
+        rlt_agent = TD3Agent(rlt_config, state_dim, action_dim, device)
+
+        # Deploy mode: actor only, no critic/replay/training
+        if rlt_deploy:
+            assert rlt_checkpoint, "--rlt-deploy requires --rlt-checkpoint (which actor to deploy?)"
+            rlt_replay = None
+        else:
+            rlt_replay = ReplayBuffer(
+                rlt_config.replay_capacity, rlt_config.rl_token_dim,
+                state_dim, action_dim, rl_chunk_length, device,
+            )
+
+        rlt_state = {
+            "config": rlt_config, "episode": 0,
+            "total_updates": 0, "total_transitions": 0,
+            "successes": [], "reward_triggered": False,
+            "output_dir": Path(rlt_output_dir),
+            "deploy": rlt_deploy,
+        }
+        rlt_state["output_dir"].mkdir(parents=True, exist_ok=True)
+
+        # Log file
+        rlt_log_file = rlt_state["output_dir"] / ("deploy.log" if rlt_deploy else "train.log")
+        _rlt_fh = logging.FileHandler(str(rlt_log_file), mode="a")
+        _rlt_fh.setFormatter(logging.Formatter("%(asctime)s [%(levelname)s] %(name)s: %(message)s"))
+        logging.getLogger().addHandler(_rlt_fh)
+        logger.info("RLT: Logging to %s", rlt_log_file)
+
+        # Metrics file for GUI dashboard
+        from lerobot.policies.hvla.rlt.metrics import set_metrics_path
+        set_metrics_path(str(rlt_state["output_dir"] / "metrics.json"))
+
+        # Load checkpoint: explicit path (--rlt-checkpoint) or auto-resume from output_dir/latest
+        load_dir = None
+        if rlt_checkpoint:
+            load_dir = Path(rlt_checkpoint)
+        else:
+            latest_dir = rlt_state["output_dir"] / "latest"
+            if (latest_dir / "actor.pt").exists():
+                load_dir = latest_dir
+
+        if load_dir and (load_dir / "actor.pt").exists():
+            rlt_agent.actor.load_state_dict(
+                torch.load(str(load_dir / "actor.pt"), weights_only=True, map_location=device))
+            if not rlt_deploy:
+                # Training mode: load critic, optimizer, replay buffer
+                if (load_dir / "critic.pt").exists():
+                    rlt_agent.critic.load_state_dict(
+                        torch.load(str(load_dir / "critic.pt"), weights_only=True, map_location=device))
+                if (load_dir / "critic_target.pt").exists():
+                    rlt_agent.critic_target.load_state_dict(
+                        torch.load(str(load_dir / "critic_target.pt"), weights_only=True, map_location=device))
+                if (load_dir / "training_state.pt").exists():
+                    ts = torch.load(str(load_dir / "training_state.pt"), weights_only=True, map_location=device)
+                    rlt_agent.actor_opt.load_state_dict(ts["actor_opt"])
+                    rlt_agent.critic_opt.load_state_dict(ts["critic_opt"])
+                    rlt_state["episode"] = ts["episode"]
+                    rlt_state["total_transitions"] = ts["total_transitions"]
+                    rlt_state["total_updates"] = ts["total_updates"]
+                    rlt_state["successes"] = ts["successes"]
+                if rlt_replay and (load_dir / "replay_buffer.pt").exists():
+                    rlt_replay.load(str(load_dir / "replay_buffer.pt"))
+
+            # Restore metrics
+            import json, os
+            metrics_path = str(rlt_state["output_dir"] / "metrics.json")
+            if os.path.exists(metrics_path):
+                try:
+                    from lerobot.policies.hvla.rlt.metrics import get_metrics
+                    with open(metrics_path) as f:
+                        saved = json.load(f)
+                    m = get_metrics()
+                    m.episode = saved.get("episode", 0)
+                    s = saved.get("series", {})
+                    m.episode_successes = s.get("episode_successes", [])
+                    m.episode_autonomous = s.get("episode_autonomous", [])
+                    # HACK: backfill autonomous flags for old episodes that lack them.
+                    # Remove this once all old checkpoints are gone.
+                    if len(m.episode_autonomous) < len(m.episode_successes):
+                        missing = len(m.episode_successes) - len(m.episode_autonomous)
+                        m.episode_autonomous = [True] * missing + m.episode_autonomous
+                        logger.warning("RLT: HACK — backfilled %d missing autonomous flags as True", missing)
+                    m.episode_timestamps = s.get("episode_timestamps", [])
+                    m.episode_lengths_s = s.get("episode_lengths_s", [])
+                    if len(m.episode_timestamps) < len(m.episode_successes):
+                        missing = len(m.episode_successes) - len(m.episode_timestamps)
+                        m.episode_timestamps = [0.0] * missing + m.episode_timestamps
+                        m.episode_lengths_s = [30.0] * missing + m.episode_lengths_s
+                        logger.warning("RLT: HACK — backfilled %d missing timestamps/lengths", missing)
+                    m.critic_losses = s.get("critic_losses", [])
+                    m.actor_losses = s.get("actor_losses", [])
+                    m.actor_deltas = s.get("actor_deltas", [])
+                    m.q_values_mean = s.get("q_values_mean", [])
+                    m.q_values_min = s.get("q_values_min", [])
+                    m.q_values_max = s.get("q_values_max", [])
+                    logger.info("RLT: Restored metrics from %s", metrics_path)
+                except Exception as e:
+                    logger.warning("RLT: Failed to restore metrics: %s", e)
+
+            mode_str = "DEPLOY" if rlt_deploy else "TRAIN"
+            logger.info("RLT: %s mode — loaded from %s (ep=%d, updates=%d)",
+                        mode_str, load_dir, rlt_state["episode"],
+                        rlt_state["total_updates"])
+        else:
+            logger.info(
+                "S1 RLT: Online RL enabled — C=%d, UTD=%d, beta=%.2f, sigma=%.3f",
+                rl_chunk_length, rlt_config.utd_ratio, rlt_config.beta, rlt_config.actor_sigma,
+            )
+
+    # --- Pipelined inference thread ---
+    from lerobot.policies.hvla.s1_inference import InferenceThread
+
+    infer_thread = InferenceThread(
+        policy=policy,
+        preprocessor=preprocessor,
+        postprocessor=postprocessor,
+        shared_cache=shared_cache,
+        s2_latent_key=S2_LATENT_KEY,
+        s1_image_keys=s1_image_keys,
+        joint_names=joint_names,
+        device=device,
+        resize_to=resize_images,
+        fps=fps,
+        num_denoise_steps=num_denoise_steps,
+        query_interval_steps=query_interval_steps,
+        grip_drop_save_dir=grip_drop_save_dir,
+        rl_token_encoder=rl_token_encoder,
+        rlt_actor=rlt_agent.actor if rlt_agent else None,
+        rlt_agent=rlt_agent,
+        rlt_state=rlt_state,
+        rlt_replay=rlt_replay,
+    )
+
+    _supports_rtc = getattr(policy, "supports_rtc", False)
+    _needs_ensemble = getattr(policy, "needs_temporal_ensemble", True)
+    if _supports_rtc:
+        logger.info("S1: RTC enabled (max_delay=%d, dynamic prefix from prev chunk)",
+                    getattr(policy, "rtc_prefix_length", 5))
+    elif _needs_ensemble:
+        logger.info("S1: Using temporal ensembling (no RTC)")
+    if query_interval_steps > 0:
+        logger.info("S1: Query interval = %d steps (%.0fms)",
+                    query_interval_steps, query_interval_steps / fps * 1000)
+
+    infer_thread.start()
+
+    # Smoothness tracking
+    prev_action_np = None
+    action_deltas = []
+    loop_intervals = []
+    last_send_time = None
+
+    # Capture initial obs, publish to both S2 and inference thread
+    logger.info("S1: Capturing initial observation...")
+    init_obs = robot.get_observation()
+    if shared_images is not None:
+        shared_images.write_images(init_obs, cam_map, joint_names)
+    infer_thread.publish_obs(init_obs, time.perf_counter())
+
+    # Wait for S2 (skip if running without S2)
+    if shared_cache is not None:
+        logger.info("S1: Waiting for first S2 latent (up to 120s)...")
+        if not shared_cache.wait_for_first(timeout=120.0):
+            logger.warning("S1: No S2 latent after 120s, starting with zero latent")
+        else:
+            logger.info("S1: Got first S2 latent (count=%d)", shared_cache.count)
+    else:
+        logger.info("S1: Running without S2 conditioning")
+
+    # Wait for first chunk
+    logger.info("S1: Waiting for first action chunk...")
+    if not infer_thread.wait_for_first_chunk(timeout=60.0):
+        logger.error("S1: No action chunk in 60s, aborting")
+        infer_thread.stop()
+        return
+
+    logger.info("S1: First chunk ready, starting at %d FPS", fps)
+
+    # Multi-episode rollout support
+    # RLT always needs multi-episode mode
+    multi_episode = num_episodes > 1 or episode_time_s > 0 or rlt_mode
+    if multi_episode:
+        from lerobot.utils.control_utils import init_keyboard_listener
+        listener, events = init_keyboard_listener()
+        logger.info("S1: Rollout mode — %d episodes, %.0fs/episode, %.0fs reset",
+                    num_episodes, episode_time_s, reset_time_s)
+        logger.info("S1: Press RIGHT ARROW to advance, ESC to stop")
+    else:
+        events = {"exit_early": False, "stop_recording": False}
+        listener = None
+
+    # RLT: hook R key into existing keyboard listener for reward signal
+    if rlt_mode and rlt_state is not None and listener is not None:
+        _orig_on_press = listener.on_press
+
+        def _rlt_on_press(key, *args):
+            try:
+                if hasattr(key, 'char') and key.char == "r":
+                    rlt_state["reward_triggered"] = True
+                    events["exit_early"] = True
+                    logger.info("RLT: SUCCESS — reward +1, ending episode")
+                    # Play success sound
+                    try:
+                        import subprocess, numpy as _np
+                        sr = 16000
+                        t = _np.linspace(0, 0.3, int(sr * 0.3), dtype=_np.float32)
+                        tone = (_np.sin(2 * _np.pi * 800 * t) * 20000).astype(_np.int16)
+                        tone2 = (_np.sin(2 * _np.pi * 1200 * t[:len(t)//2]) * 20000).astype(_np.int16)
+                        sound = _np.concatenate([tone, tone2])
+                        proc = subprocess.Popen(
+                            ["aplay", "-f", "S16_LE", "-r", str(sr), "-c", "1", "-q"],
+                            stdin=subprocess.PIPE, stderr=subprocess.DEVNULL,
+                        )
+                        proc.stdin.write(sound.tobytes())
+                        proc.stdin.close()
+                    except Exception:
+                        pass
+                    return
+            except AttributeError:
+                pass
+            if _orig_on_press is not None:
+                _orig_on_press(key)
+
+        listener.on_press = _rlt_on_press
+        logger.info("RLT: Press 'r' = success (+1 reward, ends episode)")
+
+    recorded_episodes = 0
+
+    try:
+      while recorded_episodes < num_episodes and not events.get("stop_recording"):
+        # --- Reset phase ---
+        if multi_episode:
+            from lerobot.utils.utils import log_say
+
+            _soft_land(robot, duration_s=2.0, steps=10)
+            _disable_torque(robot)
+            # Also disable leader torque for manual reset
+            if teleop is not None and hasattr(teleop, "disable_torque"):
+                teleop.disable_torque()
+
+            if recorded_episodes > 0:
+                log_say(f"Reset the environment. Episode {recorded_episodes} of {num_episodes} done.")
+            else:
+                log_say("Reset the environment. Press right arrow to start.")
+
+            events["exit_early"] = False
+            reset_start = time.time()
+            while not events["exit_early"] and not events.get("stop_recording"):
+                if stop_event is not None and stop_event.is_set():
+                    break
+                # Only auto-advance on timeout for between-episode resets, not first
+                if recorded_episodes > 0 and reset_time_s > 0 and (time.time() - reset_start) >= reset_time_s:
+                    break
+
+                loop_start = time.perf_counter()
+
+                # Teleop during reset: read leader → send to follower
+                if teleop is not None:
+                    act = teleop.get_action()
+                    action_dict = {name: float(act.get(name, 0)) for name in joint_names}
+                    robot.send_action(action_dict)
+
+                # Keep obs stream alive for GUI camera preview
+                obs = robot.get_observation()
+                for step in obs_processor_steps:
+                    obs = step.observation(obs)
+
+                dt = time.perf_counter() - loop_start
+                time.sleep(max(1.0 / fps - dt, 0.0))
+            events["exit_early"] = False
+
+            if events.get("stop_recording") or (stop_event is not None and stop_event.is_set()):
+                break
+
+            _enable_torque(robot)
+
+        # --- Recording phase ---
+        from lerobot.utils.utils import log_say
+        log_say(f"Recording episode {recorded_episodes + 1} of {num_episodes}")
+        step_count = 0
+        episode_start = time.time()
+        policy.reset()
+        prev_action_np = None  # reset per episode to avoid stale delta checks
+
+        # RLT: activate collection for this episode
+        if rlt_mode:
+            infer_thread._rlt_active = True
+            infer_thread._rlt_prev = None
+            rlt_state["_episode_had_intervention"] = False
+            logger.info("RLT: collection RESUMED (episode start)")
+
+        # Ensure inference thread is running and has fresh data.
+        # May have been paused by intervention in previous episode.
+        if infer_thread.is_paused:
+            logger.info("S1: Resuming inference thread (was paused from previous episode)")
+            if teleop is not None and hasattr(teleop, "enable_torque"):
+                teleop.enable_torque()
+            infer_thread.resume()
+
+        # Publish fresh observation and wait for a chunk produced AFTER it.
+        # Clear the existing chunk first so we don't accept a stale one
+        # that was computed from a previous episode's observation.
+        fresh_obs = robot.get_observation()
+        for step in obs_processor_steps:
+            fresh_obs = step.observation(fresh_obs)
+        _t_publish = time.perf_counter()
+        # Invalidate current chunk so wait loop only accepts new ones
+        with infer_thread._chunk_lock:
+            infer_thread._chunk_data = None
+            infer_thread._chunk_t_origin = 0.0
+        infer_thread.publish_obs(fresh_obs, _t_publish)
+        logger.info("S1: Waiting for fresh chunk (published obs at t=%.3f)", _t_publish)
+        while True:
+            chunk, t_origin, _ = infer_thread.get_chunk()
+            # Only accept chunks produced AFTER we published the fresh obs
+            if chunk is not None and t_origin >= _t_publish - 0.1:
+                logger.info("S1: Got fresh chunk (age=%.3fs)", time.perf_counter() - t_origin)
+                break
+            if time.perf_counter() - _t_publish > 10.0:
+                logger.warning("S1: Timeout waiting for fresh chunk at episode start")
+                break
+            time.sleep(0.01)
+
+        # --- Episode start assertions ---
+        if infer_thread.is_paused:
+            raise RuntimeError("BUG: inference thread still paused at episode start")
+        if chunk is None:
+            raise RuntimeError("BUG: no chunk available at episode start")
+        _chunk_age = time.perf_counter() - t_origin
+        if _chunk_age > 5.0:
+            raise RuntimeError(f"BUG: chunk is stale at episode start (age={_chunk_age:.1f}s)")
+        if events.get("exit_early"):
+            raise RuntimeError("BUG: exit_early flag not cleared before episode start")
+
+        # Intervention tracking for this episode
+        was_intervening = False
+        last_follower_pos_sent: dict[str, float] = {}
+        pending_int_episodes: list[dict] = []
+        if teleop is not None and hasattr(teleop, "reset_intervention"):
+            teleop.reset_intervention()
+            logger.info("S1: Intervention flag reset for new episode")
+            # Verify it's actually off
+            if hasattr(teleop, "get_teleop_events"):
+                from lerobot.teleoperators.utils import TeleopEvents
+                _ev = teleop.get_teleop_events()
+                _is_int = _ev.get(TeleopEvents.IS_INTERVENTION, False)
+                if _is_int:
+                    raise RuntimeError("BUG: intervention still active after reset_intervention()")
+                logger.info("S1: Intervention state confirmed OFF")
+        if int_dataset is not None:
+            int_dataset.episode_buffer = int_dataset.create_episode_buffer()
+            # Restart video encoders for the new intervention episode.
+            # Discard any active encoder from previous episode first.
+            for enc in int_dataset.video_encoders.values():
+                if enc._episode_active:
+                    enc.discard()
+            if int_dataset.video_encoders:
+                int_dataset._start_video_encoders()
+            # Verify encoders are ready
+            for key, enc in int_dataset.video_encoders.items():
+                assert enc._episode_active, \
+                    f"BUG: int_dataset video encoder '{key}' not active at episode start"
+
+        _first_iter = True
+        while stop_event is None or not stop_event.is_set():
+            loop_start = time.perf_counter()
+
+            if _first_iter:
+                _first_iter = False
+                logger.info(
+                    "S1: Episode loop start — was_intervening=%s, infer_paused=%s, "
+                    "prev_action=%s, chunk_age=%.1fs",
+                    was_intervening, infer_thread.is_paused,
+                    "None" if prev_action_np is None else "set",
+                    time.perf_counter() - t_origin if chunk is not None else -1,
+                )
+
+            if stop_event is not None and stop_event.is_set():
+                logger.info("S1: Stop signal received")
+                break
+
+            # Check episode time limit
+            if episode_time_s > 0 and (time.time() - episode_start) >= episode_time_s:
+                logger.info("S1: Episode time limit (%.0fs) reached", episode_time_s)
+                break
+
+            # Check exit_early (right/left arrow or R key in RLT mode)
+            if events.get("exit_early"):
+                if rlt_mode and rlt_state and rlt_state.get("reward_triggered"):
+                    logger.info("S1: R key — episode SUCCESS, ending early")
+                elif events.get("rerecord_episode"):
+                    logger.info("S1: Left arrow — ending episode (will rerecord)")
+                else:
+                    logger.info("S1: Right arrow — ending episode early")
+                events["exit_early"] = False
+                break
+
+            # 1. Capture observation (main loop owns robot)
+            obs = robot.get_observation()
+            for step in obs_processor_steps:
+                obs = step.observation(obs)
+            t_now = time.perf_counter()
+
+            # 2. Deep-copy image arrays before publishing. Camera background
+            # threads continuously overwrite their frame buffers; without a
+            # copy, the inference thread may read a partially-updated frame
+            # (causing "Corrupt JPEG" artifacts and bad action predictions).
+            obs_copy = {}
+            for k, v in obs.items():
+                if isinstance(v, np.ndarray) and v.ndim == 3:  # image: HWC
+                    obs_copy[k] = v.copy()
+                else:
+                    obs_copy[k] = v  # scalars/strings are immutable, no copy needed
+
+            # Publish to inference thread + S2 (keep publishing even during
+            # intervention so S2 latent stays current for policy resume)
+            infer_thread.publish_obs(obs_copy, t_now)
+            if shared_images is not None:
+                shared_images.write_images(obs, cam_map, joint_names)
+
+            # Check intervention state
+            is_intervention = False
+            if teleop is not None and hasattr(teleop, "get_teleop_events"):
+                from lerobot.teleoperators.utils import TeleopEvents
+                teleop_events = teleop.get_teleop_events()
+                is_intervention = teleop_events.get(TeleopEvents.IS_INTERVENTION, False)
+
+            if is_intervention and teleop is not None:
+                # --- INTERVENTION MODE: human controls via leader arm ---
+                if not was_intervening:
+                    # Transition: policy → intervention
+                    if rlt_mode:
+                        # RLT: keep inference running (for z_rl) but stop actor + collection
+                        infer_thread._rlt_active = False
+                        infer_thread._rlt_prev = None
+                        logger.info("S1: INTERVENTION ON — inference continues (RLT), actor paused")
+                        rlt_state["_episode_had_intervention"] = True
+                        logger.info("RLT: collection PAUSED (intervention)")
+                        # Init human chunk accumulator
+                        rlt_state["_int_chunk_buf"] = []
+                        rlt_state["_int_chunk_z_rl"] = None
+                        rlt_state["_int_chunk_state"] = None
+                        rlt_state["_int_frame_count"] = 0
+                    else:
+                        logger.info("S1: INTERVENTION ON — pausing inference, human takes over")
+                        infer_thread.pause()
+
+                    # Measure initial leader-follower delta before any sync
+                    leader_pos_before = teleop.get_action()
+                    follower_pos_now = {k: v for k, v in obs.items() if k.endswith(".pos")}
+                    initial_deltas = {
+                        k: abs(leader_pos_before.get(k, 0) - follower_pos_now.get(k, 0))
+                        for k in follower_pos_now
+                    }
+                    max_initial_delta = max(initial_deltas.values()) if initial_deltas else 0
+                    worst_joint = max(initial_deltas, key=initial_deltas.get) if initial_deltas else "?"
+                    logger.info(
+                        "S1: Intervention start — leader-follower delta: max=%.1f° (%s), "
+                        "mean=%.1f°",
+                        max_initial_delta, worst_joint,
+                        sum(initial_deltas.values()) / max(len(initial_deltas), 1),
+                    )
+                    if max_initial_delta > 90:
+                        raise RuntimeError(
+                            f"BUG: leader-follower delta {max_initial_delta:.1f}° on {worst_joint} "
+                            f"is dangerously large — inverse follow may not be working"
+                        )
+
+                    # Compensate servo tracking error before releasing torque.
+                    # Uses the same logic as lerobot_record: iterative correction
+                    # with audio feedback (the beep sleep provides natural timing
+                    # that prevents divergence).
+                    if last_follower_pos_sent and hasattr(teleop, "send_feedback"):
+                        import subprocess as _sp
+                        target = last_follower_pos_sent
+                        goal = dict(target)
+                        settle_tolerance = 1.0
+                        sync_timeout = 5.0
+                        sync_start = time.perf_counter()
+                        beep_proc = None
+                        while True:
+                            pos = teleop.get_action()
+                            max_err = max(abs(pos.get(k, 0) - target[k]) for k in target)
+                            if max_err < settle_tolerance:
+                                if beep_proc is not None:
+                                    beep_proc.terminate()
+                                break
+                            if time.perf_counter() - sync_start > sync_timeout:
+                                logger.warning("S1: Servo sync timed out (max_err=%.2f)", max_err)
+                                if beep_proc is not None:
+                                    beep_proc.terminate()
+                                break
+                            for k in target:
+                                error = pos.get(k, 0) - target[k]
+                                goal[k] = goal[k] - error
+                            teleop.send_feedback(goal)
+                            almost_ready = max_err < settle_tolerance * 2
+                            if almost_ready:
+                                if beep_proc is None or beep_proc.poll() is not None:
+                                    sr = 8000
+                                    dur = 1.0
+                                    t_arr = np.linspace(0, dur, int(sr * dur), dtype=np.float32)
+                                    tone = (np.sin(2 * np.pi * 1000 * t_arr) * 16000).astype(np.int16)
+                                    beep_proc = _sp.Popen(
+                                        ["aplay", "-f", "S16_LE", "-r", str(sr), "-c", "1", "-q"],
+                                        stdin=_sp.PIPE, stderr=_sp.DEVNULL,
+                                    )
+                                    beep_proc.stdin.write(tone.tobytes())
+                                    beep_proc.stdin.close()
+                                time.sleep(0.05)
+                            else:
+                                if beep_proc is not None and beep_proc.poll() is None:
+                                    beep_proc.terminate()
+                                    beep_proc = None
+                                interval = min(0.5, max(0.05, 0.05 + 0.45 * (1 - max_err / 50)))
+                                if beep_proc is None or beep_proc.poll() is not None:
+                                    sr = 8000
+                                    dur = min(interval * 0.6, 0.08)
+                                    t_arr = np.linspace(0, dur, int(sr * dur), dtype=np.float32)
+                                    freq = 600 + min(max_err, 50) * 8
+                                    tone = (np.sin(2 * np.pi * freq * t_arr) * 16000).astype(np.int16)
+                                    beep_proc = _sp.Popen(
+                                        ["aplay", "-f", "S16_LE", "-r", str(sr), "-c", "1", "-q"],
+                                        stdin=_sp.PIPE, stderr=_sp.DEVNULL,
+                                    )
+                                    beep_proc.stdin.write(tone.tobytes())
+                                    beep_proc.stdin.close()
+                                time.sleep(interval)
+                        logger.info("S1: Servo sync done in %.0fms (max_err=%.2f)",
+                                    (time.perf_counter() - sync_start) * 1e3, max_err)
+                    else:
+                        logger.warning("S1: No last_follower_pos_sent — skipping servo sync")
+
+                    if hasattr(teleop, "disable_torque"):
+                        teleop.disable_torque()
+                    # NOTE: do NOT disable follower torque — it must hold position
+                    # while the human grabs the leader. The follower will be driven
+                    # by send_action() once the human starts moving the leader.
+                    log_say("Intervention")
+
+                # Read leader arm positions and send to robot
+                act = teleop.get_action()
+                action_np = np.array([float(act.get(j, 0)) for j in joint_names], dtype=np.float32)
+
+                # Safety guard: abort if leader position jumps too far from
+                # current follower position (indicates servo released badly)
+                if prev_action_np is not None:
+                    max_delta = np.abs(action_np - prev_action_np).max()
+                    if max_delta > 30.0:
+                        logger.warning(
+                            "S1: INTERVENTION SAFETY — leader jump %.1f° > 30° threshold, "
+                            "holding follower position. Leader pos: %s",
+                            max_delta,
+                            {joint_names[i]: f"{action_np[i]:.1f}" for i in range(min(4, len(action_np)))}
+                        )
+                        # Don't send this action — hold previous position
+                        action_np = prev_action_np.copy()
+
+                action_dict = {name: float(action_np[i]) for i, name in enumerate(joint_names) if i < len(action_np)}
+                robot.send_action(action_dict)
+                t_after_send = time.perf_counter()
+
+                # Record to intervention dataset
+                if int_dataset is not None:
+                    _add_frame_to_dataset(int_dataset, obs, action_np, joint_names, task)
+
+                # Record to main dataset too (so episode is continuous)
+                if dataset is not None:
+                    _add_frame_to_dataset(dataset, obs, action_np, joint_names, task)
+
+                # RLT: accumulate human actions into C-frame chunks for replay buffer
+                # Paper Alg 1 lines 9, 11, 12: a=a_human, ã=a_human, store transition
+                if rlt_mode and rlt_state is not None:
+                    C = rlt_state["config"].rl_chunk_length
+                    frame_idx = rlt_state["_int_frame_count"]
+
+                    # Snapshot z_rl + state at frame 0 of each C-step window
+                    if frame_idx % C == 0:
+                        # z_rl from inference thread (still running for z_rl extraction)
+                        prev = getattr(infer_thread, '_rlt_prev', None)
+                        rlt_state["_int_chunk_z_rl"] = prev["z_rl"] if prev is not None else None
+                        state_np_norm = np.array([float(obs[j]) for j in joint_names], dtype=np.float32)
+                        state_t = torch.from_numpy(state_np_norm).to(device)
+                        if policy._state_mean is not None:
+                            state_t = (state_t - policy._state_mean.to(device)) / policy._state_std.to(device)
+                        rlt_state["_int_chunk_state"] = state_t
+                        rlt_state["_int_chunk_buf"] = []
+
+                    # Normalize and accumulate human action
+                    a_t = torch.from_numpy(action_np).float()
+                    if policy._action_mean is not None:
+                        a_t = (a_t - policy._action_mean) / policy._action_std
+                    rlt_state["_int_chunk_buf"].append(a_t)
+                    rlt_state["_int_frame_count"] += 1
+
+                    # Store completed C-frame chunk
+                    if len(rlt_state["_int_chunk_buf"]) == C:
+                        human_chunk = torch.stack(rlt_state["_int_chunk_buf"])  # [C, A]
+                        z_rl_snap = rlt_state["_int_chunk_z_rl"]
+                        state_snap = rlt_state["_int_chunk_state"]
+
+                        if z_rl_snap is None:
+                            logger.warning("RLT: z_rl is None during intervention frame %d — skipping chunk", frame_idx)
+                        elif state_snap is None:
+                            logger.warning("RLT: state is None during intervention frame %d — skipping chunk", frame_idx)
+
+                        if z_rl_snap is not None and state_snap is not None:
+                            # Store previous chunk's transition
+                            prev_int = rlt_state.get("_int_prev")
+                            if prev_int is not None:
+                                rlt_replay.add(
+                                    z_rl=prev_int["z_rl"], state=prev_int["state"],
+                                    action_chunk=prev_int["action"], ref_chunk=prev_int["ref"],
+                                    reward=0.0,  # intermediate, not terminal
+                                    next_z_rl=z_rl_snap, next_state=state_snap,
+                                    next_ref_chunk=human_chunk, done=False,
+                                )
+                                rlt_state["total_transitions"] += 1
+
+                            # action = ref = human_chunk (Paper Alg 1 line 11)
+                            rlt_state["_int_prev"] = {
+                                "z_rl": z_rl_snap,
+                                "state": state_snap,
+                                "action": human_chunk,
+                                "ref": human_chunk,
+                            }
+                        rlt_state["_int_chunk_buf"] = []
+
+            else:
+                # --- POLICY MODE: S1 inference controls robot ---
+                if was_intervening:
+                    # Transition: intervention → policy
+                    logger.info("S1: INTERVENTION OFF — resuming inference")
+
+                    # Save pending intervention episode buffer
+                    if int_dataset is not None and int_dataset.episode_buffer is not None and int_dataset.episode_buffer.get("size", 0) > 0:
+                        import copy
+                        pending_int_episodes.append(copy.deepcopy(int_dataset.episode_buffer))
+                        int_dataset.episode_buffer = int_dataset.create_episode_buffer()
+                        for enc in int_dataset.video_encoders.values():
+                            if enc._episode_active:
+                                enc.discard()
+                        if int_dataset.video_encoders:
+                            int_dataset._start_video_encoders()
+                        for key, enc in int_dataset.video_encoders.items():
+                            assert enc._episode_active, \
+                                f"BUG: int_dataset encoder '{key}' not active after restart"
+
+                    _enable_torque(robot)
+                    if hasattr(teleop, "enable_torque"):
+                        try:
+                            teleop.enable_torque()
+                        except ConnectionError as e:
+                            logger.warning("S1: Failed to enable leader torque: %s", e)
+                    if rlt_mode:
+                        # Resume RLT collection — actor runs again
+                        infer_thread._rlt_active = True
+                        infer_thread._rlt_prev = None  # fresh start after intervention
+                        # Clear intervention chunk state
+                        rlt_state.pop("_int_prev", None)
+                        rlt_state.pop("_int_chunk_buf", None)
+                        logger.info("RLT: collection RESUMED (intervention ended)")
+                    else:
+                        infer_thread.resume()
+                        assert not infer_thread.is_paused, \
+                            "BUG: inference thread still paused after resume"
+                    log_say("Policy")
+
+                # 3. Read latest chunk
+                chunk, t_origin, t_obs = infer_thread.get_chunk()
+
+                if chunk is None:
+                    time.sleep(1.0 / fps)
+                    was_intervening = is_intervention
+                    continue
+
+                # Runtime check: chunk must not be stale (>5s = definitely a bug)
+                chunk_age_s = time.perf_counter() - t_origin
+                if chunk_age_s > 5.0:
+                    logger.error(
+                        "S1: STALE CHUNK — age %.1fs, inference paused=%s. "
+                        "Skipping action to avoid executing outdated commands.",
+                        chunk_age_s, infer_thread.is_paused,
+                    )
+                    time.sleep(1.0 / fps)
+                    was_intervening = is_intervention
+                    continue
+
+                # 4. Index chunk and send action
+                t_before_send = time.perf_counter()
+                idx = _compute_chunk_index(t_before_send, t_origin, fps, len(chunk))
+                if osc_skip:
+                    idx = _osc_skip(chunk, idx, step_count)
+
+                action_np = chunk[idx].copy()
+                if max_step_delta is not None and prev_action_np is not None:
+                    action_np = _apply_delta_filter(action_np, prev_action_np, max_step_delta)
+
+                # Sanity: actions must be finite
+                if not np.isfinite(action_np).all():
+                    logger.error("S1: NaN/Inf in action — holding previous position")
+                    if prev_action_np is not None:
+                        action_np = prev_action_np.copy()
+                    else:
+                        was_intervening = is_intervention
+                        continue
+
+                # Safety: clamp large jumps (>30° any joint) to prevent damage
+                if prev_action_np is not None:
+                    delta = action_np - prev_action_np
+                    max_delta = np.abs(delta).max()
+                    if max_delta > 30.0:
+                        worst_idx = int(np.abs(delta).argmax())
+                        logger.warning(
+                            "S1: POLICY JUMP CLAMP — %.1f° on %s (step %d idx %d), "
+                            "clamping to ±30°",
+                            max_delta, joint_names[worst_idx], step_count, idx,
+                        )
+                        action_np = prev_action_np + np.clip(delta, -30.0, 30.0)
+
+                action_dict = {name: float(action_np[i]) for i, name in enumerate(joint_names) if i < len(action_np)}
+                robot.send_action(action_dict)
+                t_after_send = time.perf_counter()
+
+                # Inverse follow: send follower position to leader so it mirrors
+                if teleop is not None and hasattr(teleop, "send_feedback"):
+                    follower_pos = {k: v for k, v in obs.items() if k.endswith(".pos")}
+                    leader_actual = teleop.get_action()
+                    compensated = {}
+                    correction_gain = 0.3
+                    for k, target in follower_pos.items():
+                        error = leader_actual.get(k, target) - target
+                        compensated[k] = target - correction_gain * error
+                    teleop.send_feedback(compensated)
+                    last_follower_pos_sent = follower_pos
+
+                # Record frame to dataset
+                if dataset is not None:
+                    _add_frame_to_dataset(dataset, obs, action_np, joint_names, task)
+
+                # Track chunk execution index for RTC prefix extraction
+                if _supports_rtc:
+                    infer_thread.update_exec_index(idx + 1)
+
+                # Smoothness tracking (after send, not on critical path)
+                if prev_action_np is not None:
+                    action_deltas.append(np.linalg.norm(action_np - prev_action_np))
+                    diag_chunk, _, _ = infer_thread.get_chunk()
+                    _state = np.array([float(obs.get(j, 0)) for j in joint_names])
+                    _imgs = {k: v for k, v in obs.items() if isinstance(v, np.ndarray) and v.ndim == 3}
+                    _log_joint_jump(
+                        action_np, prev_action_np, step_count, idx, diag_chunk,
+                        robot_state=_state,
+                        save_dir=grip_drop_save_dir,
+                        obs_images=_imgs,
+                        joint_names=joint_names,
+                    )
+
+            prev_action_np = action_np.copy()
+
+            if last_send_time is not None:
+                loop_intervals.append((t_after_send - last_send_time) * 1000)
+            last_send_time = t_after_send
+            step_count += 1
+            was_intervening = is_intervention
+
+            # Periodic logging
+            if step_count % 100 == 0:
+                mode_str = "INTERVENTION" if is_intervention else "POLICY"
+                smooth_str = ""
+                if action_deltas:
+                    r = action_deltas[-20:]
+                    smooth_str += f" | Δaction: {np.mean(r):.3f}/{np.max(r):.3f}"
+                smooth_str += f" | max_joint={np.max(np.abs(action_np)):.1f}"
+                if loop_intervals:
+                    r = loop_intervals[-20:]
+                    smooth_str += f" | interval: {np.mean(r):.1f}±{np.std(r):.1f}ms"
+                if infer_thread.infer_times:
+                    smooth_str += f" | infer: {np.mean(infer_thread.infer_times[-10:]):.0f}ms"
+                if not is_intervention:
+                    smooth_str += f" | chunk_age: {(t_before_send - t_origin)*1000:.0f}ms"
+
+                if shared_cache is not None:
+                    logger.info(
+                        "S1 step %d [%s] | S2 age: %.0fms | S2 #%d%s",
+                        step_count, mode_str,
+                        shared_cache.age_ms, shared_cache.count, smooth_str,
+                    )
+                else:
+                    logger.info(
+                        "S1 step %d [%s]%s",
+                        step_count, mode_str, smooth_str,
+                    )
+
+            # Fixed-rate sleep
+            dt = time.perf_counter() - loop_start
+            sleep_s = max(1.0 / fps - dt, 0.0)
+            if sleep_s > 0:
+                time.sleep(sleep_s)
+
+        # --- End of recording phase for this episode ---
+        # Collect any remaining intervention buffer
+        if int_dataset is not None:
+            if int_dataset.episode_buffer is not None and int_dataset.episode_buffer.get("size", 0) > 0:
+                import copy
+                pending_int_episodes.append(copy.deepcopy(int_dataset.episode_buffer))
+                int_dataset.episode_buffer = int_dataset.create_episode_buffer()
+
+        if dataset is not None and step_count > 0:
+            try:
+                dataset.save_episode()
+                logger.info("S1: Episode %d saved (%d frames, %.1fs)",
+                            recorded_episodes + 1, step_count, time.time() - episode_start)
+            except Exception as e:
+                logger.warning("S1: Failed to save episode %d: %s", recorded_episodes + 1, e)
+
+        # Save intervention episodes after main episode
+        if int_dataset is not None and pending_int_episodes:
+            for ep_buffer in pending_int_episodes:
+                try:
+                    int_dataset.save_episode(episode_data=ep_buffer)
+                    logger.info("S1: Saved intervention episode %d", int_dataset.num_episodes - 1)
+                except Exception as e:
+                    logger.warning("S1: Failed to save intervention episode: %s", e)
+
+        recorded_episodes += 1
+
+        # RLT: episode bookkeeping
+        if rlt_mode and rlt_state is not None:
+            # Pause collection during reset + clear all state
+            infer_thread._rlt_active = False
+            infer_thread._rlt_prev = None
+            rlt_state.pop("_int_chunk_buf", None)
+            rlt_state.pop("_int_chunk_z_rl", None)
+            rlt_state.pop("_int_chunk_state", None)
+            rlt_state.pop("_int_frame_count", None)
+            rlt_state.pop("_int_prev", None)
+            logger.info("RLT: collection PAUSED (episode end)")
+
+            success = rlt_state["reward_triggered"]
+            had_intervention = rlt_state.get("_episode_had_intervention", False)
+            autonomous = success and not had_intervention
+            ep_duration = time.time() - episode_start
+
+            rlt_state["successes"].append(success)
+            rlt_state["episode"] += 1
+            recent = rlt_state["successes"][-20:]
+
+            auto_label = "AUTONOMOUS" if autonomous else ("ASSISTED" if success else "FAIL")
+            logger.info(
+                "RLT ep%d: %s (intervention=%s) | transitions=%d updates=%d "
+                "success_rate(20)=%.0f%% | %.1fs",
+                rlt_state["episode"], auto_label,
+                "yes" if had_intervention else "no",
+                rlt_state["total_transitions"], rlt_state["total_updates"],
+                np.mean(recent) * 100 if recent else 0,
+                ep_duration,
+            )
+            from lerobot.policies.hvla.rlt.metrics import get_metrics, save_metrics_to_file
+            get_metrics().record_episode(
+                rlt_state["episode"], success,
+                autonomous=not had_intervention,
+                duration_s=ep_duration,
+            )
+            save_metrics_to_file()
+
+            rlt_state["reward_triggered"] = False
+
+            # Save checkpoint (training mode only)
+            if not rlt_state.get("deploy"):
+                try:
+                    save_dir = rlt_state["output_dir"] / "latest"
+                    save_dir.mkdir(parents=True, exist_ok=True)
+                    torch.save(rlt_agent.actor.state_dict(), save_dir / "actor.pt")
+                    torch.save(rlt_agent.critic.state_dict(), save_dir / "critic.pt")
+                    torch.save(rlt_agent.critic_target.state_dict(), save_dir / "critic_target.pt")
+                    torch.save({
+                        "actor_opt": rlt_agent.actor_opt.state_dict(),
+                        "critic_opt": rlt_agent.critic_opt.state_dict(),
+                        "episode": rlt_state["episode"],
+                        "total_transitions": rlt_state["total_transitions"],
+                        "total_updates": rlt_state["total_updates"],
+                        "successes": rlt_state["successes"],
+                        "rlt_token_checkpoint": rl_token_checkpoint,
+                    }, save_dir / "training_state.pt")
+                    rlt_replay.save(str(save_dir / "replay_buffer.pt"))
+                    logger.info("RLT: Saved checkpoint → %s (ep=%d, buf=%d, updates=%d)",
+                                save_dir, rlt_state["episode"], len(rlt_replay), rlt_state["total_updates"])
+                except Exception as e:
+                    logger.error("RLT: Failed to save checkpoint: %s", e)
+
+        # Reset tracking state for next episode
+        prev_action_np = None
+        action_deltas.clear()
+        loop_intervals.clear()
+        last_send_time = None
+
+    except KeyboardInterrupt:
+        logger.info("S1: Interrupted by user")
+    finally:
+        infer_thread.stop()
+        if infer_thread.infer_times:
+            s2_info = f" | S2 updates: {shared_cache.count}" if shared_cache is not None else ""
+            logger.info("S1: Done. %d episodes, avg infer: %.1fms%s",
+                        recorded_episodes, np.mean(infer_thread.infer_times), s2_info)
+        if dataset is not None:
+            try:
+                if dataset.episode_buffer is not None and dataset.episode_buffer.get("size", 0) > 0:
+                    dataset.save_episode()
+                    logger.info("S1: Final partial episode saved")
+                dataset.finalize()
+                logger.info("S1: Dataset '%s' finalized (%d episodes)", record_dataset, recorded_episodes)
+            except Exception as e:
+                logger.warning("S1: Failed to finalize dataset: %s", e)
+        if int_dataset is not None:
+            try:
+                int_dataset.finalize()
+                logger.info("S1: Intervention dataset finalized (%d episodes)", int_dataset.num_episodes)
+            except Exception as e:
+                logger.warning("S1: Failed to finalize intervention dataset: %s", e)
+        if listener is not None:
+            listener.stop()
+        # RLT: final save (training mode only)
+        if rlt_mode and rlt_agent is not None and not rlt_state.get("deploy"):
+            try:
+                save_dir = rlt_state["output_dir"] / "latest"
+                save_dir.mkdir(parents=True, exist_ok=True)
+                torch.save(rlt_agent.actor.state_dict(), save_dir / "actor.pt")
+                torch.save(rlt_agent.critic.state_dict(), save_dir / "critic.pt")
+                torch.save(rlt_agent.critic_target.state_dict(), save_dir / "critic_target.pt")
+                torch.save({
+                    "actor_opt": rlt_agent.actor_opt.state_dict(),
+                    "critic_opt": rlt_agent.critic_opt.state_dict(),
+                    "episode": rlt_state["episode"],
+                    "total_transitions": rlt_state["total_transitions"],
+                    "total_updates": rlt_state["total_updates"],
+                    "successes": rlt_state["successes"],
+                }, save_dir / "training_state.pt")
+                rlt_replay.save(str(save_dir / "replay_buffer.pt"))
+                from lerobot.policies.hvla.rlt.metrics import save_metrics_to_file
+                save_metrics_to_file()
+                logger.info("RLT: Final checkpoint → %s", save_dir)
+            except Exception as e:
+                logger.error("RLT: Failed to save final checkpoint: %s", e)
+        _soft_land(robot)
+        if teleop is not None:
+            try:
+                teleop.disconnect()
+            except Exception as e:
+                logger.warning("Teleop disconnect error (non-fatal): %s", e)
+        try:
+            robot.disconnect()
+        except Exception as e:
+            logger.warning("Robot disconnect error (non-fatal): %s", e)
+
+
+
+
+def _get_motor_buses(robot) -> list:
+    """Extract motor bus objects from any LeRobot robot."""
+    buses = []
+    for attr in ("left_arm", "right_arm", "arm"):
+        arm = getattr(robot, attr, None)
+        if arm is not None and hasattr(arm, "bus"):
+            buses.append(arm.bus)
+    return buses
+
+
+def _disable_torque(robot):
+    """Disable torque on all motors so the robot can be moved by hand."""
+    for bus in _get_motor_buses(robot):
+        try:
+            bus.disable_torque()
+        except Exception:
+            pass
+    logger.info("S1: Torque disabled (robot can be moved by hand)")
+
+
+def _enable_torque(robot):
+    """Re-enable torque on all motors."""
+    for bus in _get_motor_buses(robot):
+        try:
+            bus.enable_torque()
+        except Exception:
+            pass
+    logger.info("S1: Torque enabled")
+
+
+def _soft_land(robot, duration_s=4.0, steps=20):
+    """Gradually reduce torque so the robot lowers gently instead of dropping.
+
+    Uses Torque_Limit register for gradual reduction (Feetech/Dynamixel specific),
+    then bus.disable_torque() for clean shutdown.
+    """
+    if not robot.is_connected:
+        return
+
+    buses = _get_motor_buses(robot)
+    if not buses:
+        return
+
+    try:
+        # Hold current position first
+        obs = robot.get_observation()
+        hold_action = {k: v for k, v in obs.items() if k.endswith(".pos")}
+        if hold_action:
+            robot.send_action(hold_action)
+
+        # Gradually reduce torque limit (best-effort — not all motors support this)
+        step_delay = duration_s / steps
+        for i in range(steps):
+            torque_value = int(1000 * (1.0 - (i + 1) / steps))
+            for bus in buses:
+                for motor_name in bus.motors:
+                    try:
+                        bus.write("Torque_Limit", motor_name, torque_value, normalize=False)
+                    except Exception:
+                        pass
+            time.sleep(step_delay)
+
+        # Disable torque completely
+        for bus in buses:
+            try:
+                bus.disable_torque()
+            except Exception:
+                pass
+
+        # Restore torque limit so next enable isn't stuck at 0
+        for bus in buses:
+            for motor_name in bus.motors:
+                try:
+                    bus.write("Torque_Limit", motor_name, 1000, normalize=False)
+                except Exception:
+                    pass
+
+        logger.info("S1: Soft landing complete")
+    except Exception as e:
+        logger.warning("S1: Soft landing error: %s", e)
