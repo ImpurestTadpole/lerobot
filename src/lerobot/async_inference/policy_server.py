@@ -212,10 +212,28 @@ class PolicyServer(services_pb2_grpc.AsyncInferenceServicer):
             except Exception as e:
                 self.logger.warning(
                     "Failed to pre-load policy config for RTC setup (%s). "
-                    "Falling back to direct policy load.",
+                    "Falling back to direct policy load with post-load RTC injection.",
                     e,
                 )
                 self.policy = policy_class.from_pretrained(policy_specs.pretrained_name_or_path)
+                # Config pre-load failed (e.g. extra 'type' field in config.json), but
+                # the policy itself loaded fine.  Inject RTC now so it still runs.
+                if hasattr(self.policy, "init_rtc_processor") and hasattr(self.policy.config, "rtc_config"):
+                    if self.policy.config.rtc_config is None or not getattr(
+                        self.policy.config.rtc_config, "enabled", False
+                    ):
+                        self.logger.info(
+                            "Injecting RTC config post-load for %s (pre-load config parse failed).",
+                            self.policy_type,
+                        )
+                        self.policy.config.rtc_config = RTCConfig(
+                            enabled=True,
+                            execution_horizon=10,
+                            max_guidance_weight=10.0,
+                            prefix_attention_schedule=RTCAttentionSchedule.EXP,
+                            debug=False,
+                        )
+                        self.policy.init_rtc_processor()
         else:
             # For other policy types, load normally
             self.policy = policy_class.from_pretrained(policy_specs.pretrained_name_or_path)
