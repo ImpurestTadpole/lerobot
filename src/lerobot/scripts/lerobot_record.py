@@ -463,6 +463,7 @@ def record_loop(
                 act_processed_policy: RobotAction = make_robot_action(action_values, dataset.features)
                 # Applies a pipeline to the action, default is IdentityProcessor
                 robot_action_to_send = robot_action_processor((act_processed_policy, obs))
+                action_values = robot_action_to_send
 
         elif policy is None and isinstance(teleop, Teleoperator):
             # Update teleop's observation cache to avoid double reads (for VR teleop)
