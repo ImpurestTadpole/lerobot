@@ -60,7 +60,7 @@ class LiftAxisConfig:
     # Teleop vel path is uncapped so manual control keeps full speed.
     # 0.10 = 200 raw units max from policy (10% of v_max=2000).
     # Increase to 0.30 for tasks that need faster lift movement.
-    max_cmd_vel_frac: float = 0.10
+    max_cmd_vel_frac: float = 0.3
 
     # Freeze lift at home position after homing.
     # Set True for stationary tasks (tool_pickup, block_sorting).
