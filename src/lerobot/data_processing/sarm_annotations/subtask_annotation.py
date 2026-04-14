@@ -48,7 +48,7 @@ import torch
 from pydantic import BaseModel, Field
 from transformers import AutoConfig, AutoProcessor
 
-from lerobot.datasets.lerobot_dataset import LeRobotDataset
+from lerobot.datasets import LeRobotDataset
 
 
 def _device_map_arg(device: str) -> str | dict[str, int] | None:
@@ -1318,8 +1318,7 @@ def save_annotations_to_dataset(
     dataset_path: Path, annotations: dict[int, SubtaskAnnotation], fps: int, prefix: str = "sparse"
 ):
     """Save annotations to LeRobot dataset parquet format."""
-    from lerobot.datasets.io_utils import load_episodes
-    from lerobot.datasets.utils import DEFAULT_EPISODES_PATH
+    from lerobot.datasets import DEFAULT_EPISODES_PATH, load_episodes
 
     episodes_dataset = load_episodes(dataset_path)
     if not episodes_dataset or len(episodes_dataset) == 0:
@@ -1434,7 +1433,7 @@ def generate_auto_sparse_annotations(
 
 def load_annotations_from_dataset(dataset_path: Path, prefix: str = "sparse") -> dict[int, SubtaskAnnotation]:
     """Load annotations from LeRobot dataset parquet files."""
-    from lerobot.datasets.io_utils import load_episodes
+    from lerobot.datasets import load_episodes
 
     episodes_dataset = load_episodes(dataset_path)
     if not episodes_dataset or len(episodes_dataset) == 0:

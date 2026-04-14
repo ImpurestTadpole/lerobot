@@ -39,7 +39,7 @@ import grpc
 import torch
 
 from lerobot.configs.types import RTCAttentionSchedule
-from lerobot.policies.factory import get_policy_class, make_pre_post_processors
+from lerobot.policies import get_policy_class, make_pre_post_processors
 from lerobot.policies.rtc.configuration_rtc import RTCConfig
 from lerobot.policies.utils import populate_queues
 from lerobot.processor import (
