@@ -109,9 +109,9 @@ training = [
     "wandb>=0.24.0,<0.25.0",
 ]
 hardware = [
-    "pynput>=1.7.8,<1.9.0",
-    "pyserial>=3.5,<4.0",
-    "deepdiff>=7.0.1,<9.0.0",
+    "lerobot[pynput-dep]",
+    "lerobot[pyserial-dep]",
+    "lerobot[deepdiff-dep]",
 ]
 viz = [
     "rerun-sdk>=0.24.0,<0.27.0",
@@ -141,10 +141,14 @@ matplotlib-dep = [
     "contourpy>=1.3.0,<2.0.0",
     "pyparsing>=3.0.0,<4.0.0",
 ] # contourpy / pyparsing explicit for resolver + partial envs missing matplotlib deps
+pyserial-dep = ["pyserial>=3.5,<4.0"]
+deepdiff-dep = ["deepdiff>=7.0.1,<9.0.0"]
+pynput-dep = ["pynput>=1.7.8,<1.9.0"]
+pyzmq-dep = ["pyzmq>=26.2.1,<28.0.0"]
 
 # Motors
-feetech = ["feetech-servo-sdk>=1.0.0,<2.0.0"]
-dynamixel = ["dynamixel-sdk>=3.7.31,<3.9.0"]
+feetech = ["feetech-servo-sdk>=1.0.0,<2.0.0", "lerobot[pyserial-dep]", "lerobot[deepdiff-dep]"]
+dynamixel = ["dynamixel-sdk>=3.7.31,<3.9.0", "lerobot[pyserial-dep]", "lerobot[deepdiff-dep]"]
 damiao = ["lerobot[can-dep]"]
 robstride = ["lerobot[can-dep]"]
 
@@ -152,10 +156,11 @@ robstride = ["lerobot[can-dep]"]
 openarms = ["lerobot[damiao]"]
 gamepad = ["lerobot[pygame-dep]", "hidapi>=0.14.0,<0.15.0"]
 hopejr = ["lerobot[feetech]", "lerobot[pygame-dep]"]
-lekiwi = ["lerobot[feetech]", "pyzmq>=26.2.1,<28.0.0"]
+lekiwi = ["lerobot[feetech]", "lerobot[pyzmq-dep]"]
 unitree_g1 = [
     # "unitree-sdk2==1.0.1",
-    "pyzmq>=26.2.1,<28.0.0",
+    "lerobot[pyzmq-dep]",
+    "lerobot[pyserial-dep]",
     "onnxruntime>=1.16.0,<2.0.0",
     "onnx>=1.16.0,<2.0.0",
     "meshcat>=0.3.0,<0.4.0",
