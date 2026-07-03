@@ -150,8 +150,6 @@ pip3 install rerun-sdk
 #   --display_compressed_images=true   # Redundant but explicit; avoids raw frames if logic ever changes.
 
 
-
-
 # =============================================================================
 # HUGGINGFACE SETUP (ONE-TIME)
 # =============================================================================
@@ -194,8 +192,6 @@ lerobot-record \
     --display_data=true \
     --dataset.push_to_hub=true \
     --resume=true 
-
-
 
 
 lerobot-record \
@@ -663,15 +659,12 @@ python src/lerobot/data_processing/sarm_annotations/subtask_annotation.py \
     --output-dir ./trash_pickup_subtask_viz
 
 
-
 python src/lerobot/data_processing/sarm_annotations/subtask_annotation.py \
     --repo-id Odog16/tool_pickup\
     --visualize-type both \
     --num-visualizations 5 \
     --video-key observation.images.head \
     --output-dir ./tool_pickup_subtask_viz
-
-
 
 
 # Optional: inspect dataset-level priors (after Step 1):
@@ -761,7 +754,6 @@ python src/lerobot/policies/sarm/compute_rabc_weights.py \
     --num-visualizations 5 \
     --head-mode both \
     --output-dir ./block_sorting_single_sarm_predictions
-
 
 
 # -----------------------------------------------------------------------------
@@ -855,7 +847,6 @@ lerobot-train \
     --scheduler.num_decay_steps=18000 \
     --wandb.enable=true \
     --wandb.project=lerobot
-
 
 
 # Push SmolVLA checkpoint (import path is lerobot.policies.smolvla, not lerobot.common):
@@ -1275,8 +1266,6 @@ python src/lerobot/data_processing/co_training_utils.py \
     --push-to-hub false
 
 
-
-
 # Step B-2 (optional): Push aligned dataset to Hub for reuse across machines.
 # Requires huggingface-cli login and meta/tasks.parquet under root. push_to_hub()
 # uses the dataset repo_id from the constructor (no positional repo string).
@@ -1363,6 +1352,27 @@ lerobot-train \
     --seed=1000 \
     --wandb.enable=true \
     --wandb.project=lerobot
+
+unset PYTHONPATH
+
+lerobot-train \
+    --dataset.repo_id=Odog16/trash_pickup \
+    --dataset.root=$HOME/.cache/huggingface/lerobot/Odog16/trash_pickup \
+    --policy.type=act \
+    --policy.repo_id=Odog16/trash_pickup_ACT_scratch \
+    --policy.push_to_hub=false \
+    --policy.device=cuda \
+    --output_dir=outputs/train/trash_pickup_ACT_scratch \
+    --job_name=trash_pickup_ACT_scratch \
+    --batch_size=32 \
+    --steps=80000 \
+    --save_freq=20000 \
+    --log_freq=200 \
+    --num_workers=4 \
+    --seed=1000 \
+    --wandb.enable=true \
+    --wandb.project=lerobot
+
 
 # ── tool_pickup: generalist init + RA-BC ─────────────────────────────────────
 lerobot-train \
@@ -1476,7 +1486,6 @@ python -m lerobot.async_inference.policy_server \
   --obs_queue_timeout=1.0
 
 
-
 python -m lerobot.async_inference.robot_client \
     --server_address=10.249.44.71:8080 \
     --robot.type=xlerobot \
@@ -1488,7 +1497,6 @@ python -m lerobot.async_inference.robot_client \
     --chunk_size_threshold=0.5 \
     --aggregate_fn_name="weighted_average" \
     --fps=30
-
 
 
 # Diffusion example:
@@ -1537,7 +1545,6 @@ python -m lerobot.async_inference.robot_client \
     --robot.cameras="{head: {type: opencv, index_or_path: /dev/video4, width: 640, height: 480, fps: 30, fourcc: MJPG}, left_wrist: {type: opencv, index_or_path: /dev/video2, width: 640, height: 480, fps: 30, fourcc: MJPG}, right_wrist: {type: opencv, index_or_path: /dev/video0, width: 640, height: 480, fps: 30, fourcc: MJPG}}" \
 
 
-
 # OPTION 2: Direct evaluation (may hit CUDA OOM on Jetson)
 # 
 # MODEL SIZE LIMITS FOR JETSON ORIN NANO (8GB):
@@ -1579,8 +1586,6 @@ docker run --runtime nvidia --env NVIDIA_DRIVER_CAPABILITIES=compute,utility,gra
   -v /home/jetson/lerobot:/opt/lerobot -w /opt/lerobot \
   dustynv/lerobot:r36.4.0 \
   bash -c "set +H && cd /opt/lerobot && pip install --index-url https://pypi.org/simple --force-reinstall 'numpy<2' && pip install --index-url https://pypi.org/simple 'datasets>=4.0.0,<4.2.0' 'diffusers>=0.27.2,<0.36.0' 'huggingface-hub[hf-transfer,cli]>=0.34.2,<0.36.0' 'accelerate>=1.10.0,<2.0.0' 'setuptools>=71.0.0,<81.0.0' 'cmake>=3.29.0.1,<4.2.0' 'einops>=0.8.0,<0.9.0' 'opencv-python-headless>=4.9.0,<4.13.0' 'av>=15.0.0,<16.0.0' 'jsonlines>=4.0.0,<5.0.0' 'packaging>=24.2,<26.0' 'pynput>=1.7.7,<1.9.0' 'pyserial>=3.5,<4.0' 'wandb>=0.20.0,<0.22.0' 'draccus==0.10.0' 'gymnasium>=1.1.1,<2.0.0' 'rerun-sdk>=0.24.0,<0.27.0' 'deepdiff>=7.0.1,<9.0.0' 'imageio[ffmpeg]>=2.34.0,<3.0.0' 'termcolor>=2.4.0,<4.0.0' 'transformers>=4.53.0,<5.0.0' 'num2words>=0.5.14,<0.6.0' 'safetensors>=0.4.3,<1.0.0' 'feetech-servo-sdk>=1.0.0,<2.0.0' && pip install --index-url https://pypi.org/simple --no-deps -e . && pip install --index-url https://pypi.org/simple --force-reinstall 'numpy<2' && python -c 'import torch; torch.cuda.empty_cache(); assert torch.cuda.is_available(), \"CUDA not available\"; print(f\"CUDA: {torch.cuda.is_available()}, Device: {torch.cuda.get_device_name(0)}, Memory: {torch.cuda.get_device_properties(0).total_memory / 1e9:.1f}GB\")' && python -m lerobot.scripts.lerobot_record --robot.type=xlerobot --dataset.repo_id=Odog16/eval_ob15_packing_box --dataset.single_task=packing_box --dataset.num_episodes=5 --display_data=false --policy.path=Odog16/smolvla_ob15_packing_box_policy_1"
-
-
 
 
 # Split dataset and push to hub
@@ -1885,6 +1890,60 @@ python -m lerobot.policies.hvla.launch \
 # - JPEG quality 85 (default) gives ~200-400 KB per frame per camera at 360×640.
 #   Lower with --zmq-image-jpeg-quality 70 if bandwidth is tight (WiFi).
 # - Wired LAN strongly recommended; WiFi adds jitter that can stale the latent.
+
+# -----------------------------------------------------------------------------
+# Step 3 (OPTION D) — S1 + S2 + control loop on PC2; Jetson = ZMQ robot bridge only
+# -----------------------------------------------------------------------------
+# Use this when the Jetson should NOT run S1/S2 (saves GPU/RAM) and only forwards
+# observations + executes actions.  This is NOT the same as OPTION C:
+#   - OPTION C: --zmq-latent-host / --zmq-image-*  (S2 on PC, S1 on Jetson).
+#   - OPTION D: xlerobot_host (Jetson) + xlerobot_client JSON on PC2 for launch.
+#
+# Architecture:
+#   PC2  : python -m lerobot.policies.hvla.launch  — spawns S2 + runs S1; Robot is
+#          XLerobotClient (ZMQ REQ obs / sends cmds to Jetson).
+#   Jetson: python -m lerobot.robots.xlerobot.xlerobot_host — real USB xlerobot;
+#          binds ZMQ: 5555 commands (PC → Jetson), 5556 observations (Jetson → PC).
+#
+# PC2 must reach Jetson on those ports (firewall / same LAN).
+#
+# 1) Copy and edit the example client profile (set remote_ip to the Jetson):
+#      cp examples/xlerobot/xlerobot_client_pc2_remote.example.json \
+#         ~/.config/lerobot/robots/xlerobot_client_pc2.json
+#    Match cameras / lift_axis / resolutions to the host's ~/.config/.../xlerobot.json
+#    so observation.state matches what S1 was trained on (e.g. 18-DOF + lift).
+#
+# 2) Jetson — start the bridge FIRST (uses real robot JSON with local cameras/USB):
+
+# --- Jetson ---
+conda activate lerobot
+cd /home/jetson/lerobot
+python -m lerobot.robots.xlerobot.xlerobot_host \
+  --robot-config ~/.config/lerobot/robots/xlerobot.json \
+  --port-cmd 5555 --port-observations 5556
+
+# 3) PC2 — full HVLA (single process; or use persistent S2 from OPTION B on PC2 only).
+#    Ensure ~/.config/lerobot/robots/xlerobot_client_pc2.json has "remote_ip" = Jetson
+#    (copy from examples/xlerobot/xlerobot_client_pc2_remote.example.json).
+
+# --- PC2 ---
+conda activate lerobot
+unset PYTHONPATH
+cd /home/owen/lerobot
+
+python -m lerobot.policies.hvla.launch \
+    --hvla-preset xlerobot \
+    --s1-type flow \
+    --s1-checkpoint outputs/train/tool_pickup_hvla_flow_v1/checkpoints/last \
+    --s2-checkpoint ~/.cache/lerobot/converted/soarm-pi05-state-11997-pytorch/model.safetensors \
+    --robot-config ~/.config/lerobot/robots/xlerobot_client_pc2.json \
+    --task "pick up the tools from the table and place it in the red bin" \
+    --resize-images 224x224
+
+# Do NOT pass --zmq-latent-host here; that is OPTION C only.
+# S1 and S2 checkpoints live on PC2 only; Jetson host needs no policy weights.
+# ./scripts/sync_hvla_deploy.sh copies S2→PC2, S1→Jetson, robot JSON→Jetson — for OPTION D you
+# need S1+S2 on PC2 only; use the script for S2+JSON or rsync S1 to PC2 paths yourself.
 
 # =============================================================================
 # GIT WORKFLOW

@@ -18,22 +18,11 @@ from huggingface_hub import HfApi
 RUNS = [
     # (output_dir, hf_repo_prefix, steps_to_upload)
     # trash_pickup SmolVLA — upload 15k checkpoint (20k was auto-pushed at end of training)
-    (
-        "outputs/train/making_coffee_v1_SmolVLA_v1",
-        "Odog16/making_coffee_v1_SmolVLA_v1",
-        ["020000"],
+        (
+            "outputs/train/trash_pickup_ACT_scratch",
+        "Odog16/trash_pickup_ACT_scratch",
+        ["080000"]
     ),
-    # Uncomment to upload additional checkpoints:
-    # (
-    #     "outputs/train/trash_pickup_SmolVLA_v1",
-    #     "Odog16/trash_pickup_SmolVLA",
-    #     ["005000", "010000"],
-    # ),
-    # (
-    #     "outputs/train/trash_pickup_ACT_v1",
-    #     "Odog16/trash_pickup_ACT",
-    #     ["020000", "040000", "060000", "080000"],
-    # ),
     # (
     #     "outputs/train/multi_task_SmolVLA_v1",
     #     "Odog16/multi_task_SmolVLA",
