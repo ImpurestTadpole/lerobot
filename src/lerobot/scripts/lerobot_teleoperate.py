@@ -31,6 +31,22 @@ lerobot-teleoperate \
     --display_data=true
 ```
 
+To stream the data to Foxglove instead of Rerun, add ``--display_mode=foxglove``
+(then connect the Foxglove app to ``ws://127.0.0.1:8765``; override the port with ``--display_port=<port>``):
+
+```shell
+lerobot-teleoperate \
+    --robot.type=so101_follower \
+    --robot.port=/dev/tty.usbmodem58760431541 \
+    --robot.cameras="{ front: {type: opencv, index_or_path: 0, width: 1920, height: 1080, fps: 30}}" \
+    --robot.id=black \
+    --teleop.type=so101_leader \
+    --teleop.port=/dev/tty.usbmodem58760431551 \
+    --teleop.id=blue \
+    --display_data=true \
+    --display_mode=foxglove
+```
+
 Example teleoperation with bimanual so100:
 
 ```shell
@@ -84,12 +100,12 @@ from lerobot.robots import (  # noqa: F401
     rebot_b601_follower,
     so_follower,
     unitree_g1 as unitree_g1_robot,
-    xlerobot,
 )
 from lerobot.teleoperators import (  # noqa: F401
     Teleoperator,
     TeleoperatorConfig,
     bi_openarm_leader,
+    bi_openarm_mini,
     bi_rebot_102_leader,
     bi_so_leader,
     gamepad,
@@ -104,12 +120,15 @@ from lerobot.teleoperators import (  # noqa: F401
     rebot_102_leader,
     so_leader,
     unitree_g1,
-    xlerobot_vr,
 )
 from lerobot.utils.import_utils import register_third_party_plugins
 from lerobot.utils.robot_utils import precise_sleep
 from lerobot.utils.utils import init_logging, move_cursor_up
-from lerobot.utils.visualization_utils import init_rerun, log_rerun_data, shutdown_rerun, start_viz_thread, stop_viz_thread
+from lerobot.utils.visualization_utils import (
+    init_visualization,
+    log_visualization_data,
+    shutdown_visualization,
+)
 
 
 @dataclass
@@ -122,11 +141,14 @@ class TeleoperateConfig:
     teleop_time_s: float | None = None
     # Display all cameras on screen
     display_data: bool = False
-    # Display data on a remote Rerun server
+    # Visualization backend used when display_data is True: "rerun" or "foxglove".
+    display_mode: str = "rerun"
+    # For "rerun": IP of a remote server to send to. For "foxglove": interface to bind the WebSocket
+    # server to (127.0.0.1 for local only, 0.0.0.0 for all interfaces).
     display_ip: str | None = None
-    # Port of the remote Rerun server
+    # For "rerun": port of the remote server. For "foxglove": port to bind the WebSocket server to.
     display_port: int | None = None
-    # Whether to  display compressed images in Rerun
+    # Whether to display compressed (JPEG) images instead of raw frames
     display_compressed_images: bool = False
 
 
@@ -138,6 +160,7 @@ def teleop_loop(
     robot_action_processor: RobotProcessorPipeline[tuple[RobotAction, RobotObservation], RobotAction],
     robot_observation_processor: RobotProcessorPipeline[RobotObservation, RobotObservation],
     display_data: bool = False,
+    display_mode: str = "rerun",
     duration: float | None = None,
     display_compressed_images: bool = False,
 ):
@@ -150,8 +173,10 @@ def teleop_loop(
         teleop: The teleoperator device instance providing control actions.
         robot: The robot instance being controlled.
         fps: The target frequency for the control loop in frames per second.
-        display_data: If True, fetches robot observations and displays them in the console and Rerun.
-        display_compressed_images: If True, compresses images before sending them to Rerun for display.
+        display_data: If True, fetches robot observations and displays them in the console and the
+            visualization backend.
+        display_mode: Visualization backend to use when display_data is True ("rerun" or "foxglove").
+        display_compressed_images: If True, compresses images before sending them to the backend for display.
         duration: The maximum duration of the teleoperation loop in seconds. If None, the loop runs indefinitely.
         teleop_action_processor: An optional pipeline to process raw actions from the teleoperator.
         robot_action_processor: An optional pipeline to process actions before they are sent to the robot.
@@ -160,37 +185,19 @@ def teleop_loop(
 
     display_len = max(len(key) for key in robot.action_features)
     start = time.perf_counter()
-
-    # Frame counter for camera reads (read cameras every Nth frame for visualization)
-    frame_counter = 0
-    # When display_data=True, read cameras every frame so Rerun gets full FPS (30 Hz).
-    # When display_data=False, no need to read cameras for control.
-    camera_read_interval = 1 if display_data else 2
-    last_camera_obs = {}
-
     while True:
         loop_start = time.perf_counter()
 
-        # Get robot observation - skip cameras for control loop (faster) unless displaying
-        read_cameras_this_frame = (frame_counter % camera_read_interval == 0) if display_data else False
-        obs = robot.get_observation(skip_cameras=not read_cameras_this_frame, skip_depth=True)
-        
-        # Merge camera data from last read if we skipped cameras this frame
-        if not read_cameras_this_frame and last_camera_obs:
-            obs.update(last_camera_obs)
-        elif read_cameras_this_frame:
-            # Store camera data for next frames
-            last_camera_obs = {k: v for k, v in obs.items() if k in robot.cameras or k.endswith("_depth")}
-        
-        frame_counter += 1
-        
-        # Update teleop's observation cache to avoid double reads (for VR teleop)
-        if hasattr(teleop, 'update_observation_cache'):
-            teleop.update_observation_cache(obs)
+        # Get robot observation
+        # Not really needed for now other than for visualization
+        # teleop_action_processor can take None as an observation
+        # given that it is the identity processor as default
+        obs = robot.get_observation()
+
         if robot.name == "unitree_g1":
             teleop.send_feedback(obs)
 
-        # Get teleop action (will use cached observation if available)
+        # Get teleop action
         raw_action = teleop.get_action()
 
         # Process teleop action through pipeline
@@ -206,8 +213,8 @@ def teleop_loop(
             # Process robot observation through pipeline
             obs_transition = robot_observation_processor(obs)
 
-            # Log to Rerun (will respect RERUN_LOG_FREQUENCY env var for reduced frequency)
-            log_rerun_data(
+            log_visualization_data(
+                display_mode,
                 observation=obs_transition,
                 action=teleop_action,
                 compress_images=display_compressed_images,
@@ -235,8 +242,9 @@ def teleoperate(cfg: TeleoperateConfig):
     init_logging()
     logging.info(pformat(asdict(cfg)))
     if cfg.display_data:
-        init_rerun(session_name="teleoperation", ip=cfg.display_ip, port=cfg.display_port)
-        start_viz_thread()
+        init_visualization(
+            cfg.display_mode, session_name="teleoperation", ip=cfg.display_ip, port=cfg.display_port
+        )
     display_compressed_images = (
         True
         if (cfg.display_data and cfg.display_ip is not None and cfg.display_port is not None)
@@ -247,8 +255,8 @@ def teleoperate(cfg: TeleoperateConfig):
     robot = make_robot_from_config(cfg.robot)
     teleop_action_processor, robot_action_processor, robot_observation_processor = make_default_processors()
 
+    teleop.connect()
     robot.connect()
-    teleop.connect(robot=robot)
 
     try:
         teleop_loop(
@@ -256,6 +264,7 @@ def teleoperate(cfg: TeleoperateConfig):
             robot=robot,
             fps=cfg.fps,
             display_data=cfg.display_data,
+            display_mode=cfg.display_mode,
             duration=cfg.teleop_time_s,
             teleop_action_processor=teleop_action_processor,
             robot_action_processor=robot_action_processor,
@@ -266,8 +275,7 @@ def teleoperate(cfg: TeleoperateConfig):
         pass
     finally:
         if cfg.display_data:
-            stop_viz_thread()
-            shutdown_rerun()
+            shutdown_visualization(cfg.display_mode)
         teleop.disconnect()
         robot.disconnect()
 
