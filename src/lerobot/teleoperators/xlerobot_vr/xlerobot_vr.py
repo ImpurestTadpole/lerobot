@@ -766,7 +766,10 @@ class XLerobotVRTeleop(Teleoperator):
         self._obs_cache_duration = 0.01  # Cache for 10ms (faster than camera refresh)
         # Lift velocity smoothing state (smoothed_y, smoothed_vel) for get_vr_lift_action
         self._lift_state = {}
-        
+
+        # Intervention state — toggled by RIGHT A button, read by s1_process via get_teleop_events()
+        self._intervention_active = False
+
         self.logs = {}
 
     @property
@@ -1125,32 +1128,42 @@ class XLerobotVRTeleop(Teleoperator):
         except Exception as e:
             logger.debug(f"Low frequency event update failed: {e}")  # Downgrade to debug to avoid disrupting main flow
 
-    def send_feedback(self) -> None:
-        """Send feedback - optimized version, reduce blocking wait"""
-        if not self.vr_monitor:
-            logger.warning("VR monitor not available for feedback")
-            return
+    def send_feedback(self, feedback: dict | None = None) -> None:
+        """Accept inverse-follow position feedback from s1_process.py.
 
-        max_attempts = 200  # Maximum 200 attempts
+        For a physical leader arm this would drive the leader motors to mirror
+        the follower. VR has no physical leader, so the position dict is ignored.
+        The original startup-wait behaviour (polling for first VR packet) has been
+        moved to _wait_for_vr_data() and is called once during connect().
+        """
+        pass  # VR controller — no haptic or inverse-follow feedback path
+
+    def _wait_for_vr_data(self, timeout_s: float = 100.0) -> bool:
+        """Block until at least one VR packet with position data is received.
+
+        Called once during connect() to confirm the VR headset is streaming.
+        Returns True if data arrived within timeout, False otherwise.
+        """
+        if not self.vr_monitor:
+            return False
+        deadline = time.monotonic() + timeout_s
         attempt = 0
-        
-        while attempt < max_attempts:
+        while time.monotonic() < deadline:
             try:
                 dual_goals = self.vr_monitor.get_latest_goal_nowait()
                 right_goal = dual_goals.get("right") if isinstance(dual_goals, dict) else None
                 meta = _safe_metadata(right_goal) if right_goal else {}
                 vr_pos = meta.get("vr_position")
                 if isinstance(vr_pos, (list, tuple)) and len(vr_pos) >= 3 and sum(vr_pos) != 0:
-                    logger.info("VR controller data received")
-                    return
+                    logger.info("VR controller data received (attempt %d)", attempt + 1)
+                    return True
             except Exception as e:
-                logger.warning(f"Error getting VR data: {e}")
-            
+                logger.warning("Error getting VR data: %s", e)
             attempt += 1
-            logger.info(f'Waiting for VR controller data (attempt {attempt}/{max_attempts})')
-            time.sleep(0.5)  # Reduce wait time from 8 seconds to 0.5 seconds
-        
+            logger.info("Waiting for VR controller data (attempt %d)", attempt)
+            time.sleep(0.5)
         logger.warning("Timeout waiting for VR controller data")
+        return False
 
     def configure(self) -> None:
         pass
@@ -1187,6 +1200,70 @@ class XLerobotVRTeleop(Teleoperator):
 
         return action
     
+    # ------------------------------------------------------------------
+    # s1_process.py intervention interface
+    # ------------------------------------------------------------------
+
+    def get_teleop_events(self) -> dict:
+        """Return TeleopEvents dict consumed by s1_process.py each control loop.
+
+        IS_INTERVENTION reflects the toggle state driven by RIGHT A button.
+        Refresh VR goals first so the state is never more than one frame stale.
+        """
+        from lerobot.teleoperators.utils import TeleopEvents
+
+        # Refresh button state from latest VR packet (same pattern as get_vr_events)
+        if self.vr_event_handler is not None and self.vr_monitor is not None:
+            try:
+                dual_goals = self.vr_monitor.get_latest_goal_nowait()
+                if isinstance(dual_goals, dict):
+                    self._update_events_inline(dual_goals.get("left"), dual_goals.get("right"))
+            except Exception as e:
+                logger.debug("get_teleop_events VR refresh failed (non-critical): %s", e)
+
+        # Sync top-level flag from the event handler's toggle state
+        old_active = self._intervention_active
+        if self.vr_event_handler is not None:
+            self._intervention_active = self.vr_event_handler._intervention_active
+
+        # On intervention start: snap IK targets to current robot joint positions.
+        # s1_process.py runs a servo-sync loop that calls teleop.get_action() and
+        # compares it to the follower's last position. Without recalibration the VR
+        # IK targets may have drifted, causing a 5-second timeout on every handover.
+        if self._intervention_active and not old_active and self.robot is not None:
+            try:
+                robot_obs = self.robot.get_observation()
+                self.calibrate(robot_obs)
+                logger.info("[VR] Arm controllers recalibrated to robot position (intervention start)")
+            except Exception as e:
+                logger.warning("[VR] Arm recalibration on intervention start failed: %s", e)
+
+        return {TeleopEvents.IS_INTERVENTION: self._intervention_active}
+
+    def reset_intervention(self) -> None:
+        """Clear intervention state at the start of each episode."""
+        self._intervention_active = False
+        if self.vr_event_handler is not None:
+            self.vr_event_handler._intervention_active = False
+            # Also clear the A-button prev state so first press in new episode is a clean edge
+            self.vr_event_handler.prev_states['right_button_a'] = False
+            self.vr_event_handler.prev_states['right_a_last_press_ts'] = 0.0
+        logger.debug("[VR] Intervention state reset for new episode")
+
+    def enable_torque(self) -> None:
+        """No-op: VR has no physical leader arm whose torque needs managing.
+        The follower robot keeps its own torque on; s1_process calls this when
+        returning from intervention — safe to ignore for VR."""
+        pass
+
+    def disable_torque(self) -> None:
+        """No-op: VR has no physical leader arm whose torque needs managing.
+        s1_process calls this at intervention start so the human can grab the
+        leader arm without fighting it — not applicable for VR."""
+        pass
+
+    # ------------------------------------------------------------------
+
     def get_vr_events(self):
         """Get VR event status.
 
@@ -1309,11 +1386,15 @@ class VREventHandler:
             # Right controller buttons
             'right_button_b': False,
             'right_b_last_press_ts': 0.0,
+            'right_button_a': False,
+            'right_a_last_press_ts': 0.0,
             # Snapshots for debug
             'buttons_snapshot': {},
             'right_buttons_snapshot': {},
         }
         self.threshold = 0.7  # Thumbstick trigger threshold
+        # Intervention toggle state (RIGHT A button toggles human/policy mode)
+        self._intervention_active = False
         
     def update_events(self):
         """Update VR event status"""
@@ -1424,6 +1505,24 @@ class VREventHandler:
         if "b" in buttons:
             self.prev_states['right_button_b'] = button_b
         self.prev_states['right_buttons_snapshot'] = buttons
+
+        # RIGHT A button: toggle intervention mode (human takes over / policy resumes)
+        # Uses same missing-packet guard as B button above.
+        prev_button_a = bool(self.prev_states.get('right_button_a', False))
+        if "a" in buttons:
+            button_a = bool(buttons.get('a', False))
+        else:
+            button_a = prev_button_a
+
+        last_a_ts = float(self.prev_states.get("right_a_last_press_ts", 0.0) or 0.0)
+        if button_a and (not prev_button_a) and (now - last_a_ts) > cooldown_s:
+            self._intervention_active = not self._intervention_active
+            state_str = "ON (human)" if self._intervention_active else "OFF (policy)"
+            logger.info("🎮 VR RIGHT A button pressed -> Intervention %s", state_str)
+            self.prev_states["right_a_last_press_ts"] = now
+
+        if "a" in buttons:
+            self.prev_states['right_button_a'] = button_a
     
     def reset_events(self):
         """Reset all event status"""
@@ -1459,6 +1558,12 @@ class VREventHandler:
         ║  ├─ RIGHT B button: Finish episode early (save & next)        ║
         ║  ├─ LEFT Menu button: Stop recording                          ║
         ║  └─ LEFT Thumbstick click: Reset robot                        ║
+        ╠══════════════════════════════════════════════════════════════╣
+        ║  INTERVENTION / RLT (HVLA s1_process):                       ║
+        ║  ├─ RIGHT A button: Toggle intervention ON/OFF               ║
+        ║  │    ON  → VR controls robot, policy paused, data recorded  ║
+        ║  │    OFF → Policy resumes, inference thread unpaused        ║
+        ║  └─ Keyboard R (on Jetson): Signal success (+1 reward, RLT) ║
         ╚══════════════════════════════════════════════════════════════╝
         """
         logger.info(guide)
