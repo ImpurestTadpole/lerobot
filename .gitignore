@@ -177,3 +177,10 @@ outputs/
 *.xml
 *.part
 patched_preprocessor.json
+
+# Local analysis artifacts (SARM/subtask visualizations, prediction plots)
+*subtask_viz/
+*_sarm_predictions/
+
+# Editor settings
+.cursor/
