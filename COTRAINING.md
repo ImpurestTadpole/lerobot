@@ -275,7 +275,37 @@ HIL-SERL-style training typically reaches near-100 % success on a scoped task
 within 1–3 hours of real-robot interaction, and every transition it collects is
 also valid BC data for the next generalist merge.
 
-### 3d. Which to use when
+### 3d. UMI-style datasets (FastUMI-100K)
+
+UMI data (e.g. `IPEC-COMMUNITY/FastUMI_100k_lerobot`: 100k+ handheld-gripper
+trajectories, 54 tasks, LeRobot v2.1) stores **relative end-effector poses**,
+not joints, so `lerobot-cotrain-align` alone can't ingest it. Use
+`lerobot-umi-retarget` (`src/lerobot/data_processing/umi_retarget.py`):
+
+```bash
+huggingface-cli download IPEC-COMMUNITY/FastUMI_100k_lerobot \
+    --repo-type dataset --include "dual_arm/Clean_Desktop/*" --local-dir ~/fastumi
+
+lerobot-umi-retarget \
+    --source-root ~/fastumi/dual_arm/Clean_Desktop \
+    --target-repo-id Odog16/umi_clean_desktop \
+    --action-space joint \
+    --match-features-from Odog16/tool_pickup \
+    --max-episodes 200
+```
+
+`--action-space joint` (Option A) bakes the EE trajectories into 18-dim joint
+space with the same decomposed IK the VR teleop uses; the output schema matches
+your task repos and merges via `lerobot-cotrain-align`. `--action-space ee`
+(Option B) keeps robot-frame EE vectors for a future EE-space policy — both
+modes share the same Stage-1 extraction, so A-datasets and B-datasets stay
+consistent. Defaults (`--scale 0.3`, mid-workspace anchor) keep FastUMI human
+motions inside the SO-100 workspace; episodes exceeding `--max-clamp-frac` are
+skipped. UMI has no head camera — it's black-filled by default so merges keep
+the 3-camera schema. Expect the visual gap (fisheye, handheld gripper in frame)
+to limit this to a pretraining prior; pick tasks close to yours first.
+
+### 3e. Which to use when
 
 | Situation | Tool |
 |---|---|

@@ -535,8 +535,15 @@ class LeRobotDataset(torch.utils.data.Dataset):
         )
 
     def set_image_transforms(self, image_transforms: Callable | None) -> None:
-        """Replace the transform applied to visual observations."""
-        self._ensure_reader().set_image_transforms(image_transforms)
+        """Replace the transform applied to visual observations.
+
+        When no reader exists yet (early in ``__init__``, or write-only datasets),
+        only the attribute is updated — a lazily created reader picks it up in
+        ``_ensure_reader()``. Forcing reader creation here would crash before
+        ``self.meta`` is assigned.
+        """
+        if self.reader is not None:
+            self.reader.set_image_transforms(image_transforms)
         self.image_transforms = image_transforms
 
     def clear_image_transforms(self) -> None:

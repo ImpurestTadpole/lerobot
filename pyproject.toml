@@ -363,6 +363,7 @@ lerobot-setup-can="lerobot.scripts.lerobot_setup_can:main"
 lerobot-annotate="lerobot.scripts.lerobot_annotate:main"
 lerobot-rollout="lerobot.scripts.lerobot_rollout:main"
 lerobot-cotrain-align="lerobot.data_processing.co_training_utils:main"
+lerobot-umi-retarget="lerobot.data_processing.umi_retarget:main"
 
 # ---------------- Tool Configurations ----------------
 

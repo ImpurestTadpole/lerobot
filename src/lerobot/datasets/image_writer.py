@@ -125,7 +125,9 @@ def save_kwargs_for_path(fpath: Path, compress_level: int) -> dict:
         raise ValueError(f"Unsupported image file extension: {suffix}")
 
 
-def write_image(image: np.ndarray | PIL.Image.Image, fpath: Path, compress_level: int = 1):
+def write_image(
+    image: np.ndarray | PIL.Image.Image, fpath: Path, compress_level: int = 1, is_depth: bool = False
+):
     """
     Saves a NumPy array or PIL Image to a file.
 
@@ -228,8 +230,14 @@ class AsyncImageWriter:
                 self.processes.append(p)
 
     def save_image(
-        self, image: torch.Tensor | np.ndarray | PIL.Image.Image, fpath: Path, compress_level: int = 1
+        self,
+        image: torch.Tensor | np.ndarray | PIL.Image.Image,
+        fpath: Path,
+        compress_level: int = 1,
+        is_depth: bool = False,
     ):
+        # ``is_depth`` is accepted for API compatibility with DatasetWriter._save_image;
+        # depth is auto-detected from dtype/shape in image_array_to_pil_image.
         if isinstance(image, torch.Tensor):
             # Convert tensor to numpy array to minimize main process time
             image = image.cpu().numpy()
