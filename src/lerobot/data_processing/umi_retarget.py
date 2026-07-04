@@ -34,7 +34,7 @@ Two output modes (``--action-space``):
 Both modes share Stage 1 (EE extraction + axis mapping + workspace anchoring),
 so switching A -> B later does not change the data conventions.
 
-Usage:
+Usage (single task, already downloaded):
     lerobot-umi-retarget \\
         --source-root ~/fastumi/dual_arm/Clean_Desktop \\
         --target-repo-id Odog16/umi_clean_desktop_joint \\
@@ -42,10 +42,20 @@ Usage:
         --match-features-from Odog16/tool_pickup \\
         --max-episodes 50
 
-    # Download a task subset first:
-    huggingface-cli download IPEC-COMMUNITY/FastUMI_100k_lerobot \\
-        --repo-type dataset --include "dual_arm/Clean_Desktop/*" \\
-        --local-dir ~/fastumi
+Usage (batch: download + retarget several tasks at 30 fps, ready to merge):
+    lerobot-umi-retarget \\
+        --source-root ~/fastumi \\
+        --tasks dual_arm/Clean_Desktop dual_arm/Dispose_of_Desktop_Debris \\
+        --download-repo IPEC-COMMUNITY/FastUMI_100k_lerobot \\
+        --target-repo-id Odog16/umi_pretrain \\
+        --target-fps 30 \\
+        --match-features-from Odog16/tool_pickup \\
+        --max-episodes 200
+
+    Batch mode writes one dataset per task (``<target-repo-id>_<task>``) and
+    prints the ``lerobot-cotrain-align`` command that merges them with your
+    xlerobot task repos. Existing complete outputs are reused, so the command
+    is resumable.
 """
 
 from __future__ import annotations
@@ -65,7 +75,9 @@ from tqdm import tqdm
 
 from lerobot.model.SO101Robot import SO101Kinematics
 
-logging.basicConfig(level=logging.INFO, format="%(levelname)s  %(message)s")
+# force=True: the lerobot import chain above already configures the root
+# logger, which would make a plain basicConfig a silent no-op (INFO dropped).
+logging.basicConfig(level=logging.INFO, format="%(levelname)s  %(message)s", force=True)
 logger = logging.getLogger(__name__)
 
 # Episode-start EE anchor (planar reach / height, meters). The VR teleop rest
@@ -262,6 +274,52 @@ def read_video_frames(path: Path, target_hw: tuple[int, int]):
         cap.release()
 
 
+class FrameCursor:
+    """Random-ish access over a sequential frame generator.
+
+    ``get(i)`` requires non-decreasing ``i`` (repeats allowed) — exactly the
+    access pattern of nearest-frame fps resampling — and returns the cached
+    frame without re-decoding when ``i`` repeats.
+    """
+
+    def __init__(self, gen):
+        self._gen = gen
+        self._idx = -1
+        self._frame: np.ndarray | None = None
+
+    def get(self, target_idx: int) -> np.ndarray | None:
+        while self._idx < target_idx:
+            nxt = next(self._gen, None)
+            if nxt is None:
+                return None
+            self._idx += 1
+            self._frame = nxt
+        return self._frame
+
+
+def resample_trajectory(vecs: np.ndarray, src_fps: int, dst_fps: int) -> tuple[np.ndarray, np.ndarray]:
+    """Resample a (T, D) trajectory from src_fps to dst_fps.
+
+    Vector channels are linearly interpolated at the output timestamps (valid
+    for EE poses: positions in meters, small inter-frame Euler deltas, gripper
+    width). Returns ``(resampled (T', D), video_indices (T',))`` where
+    ``video_indices[k]`` is the nearest source frame for output step ``k``
+    (non-decreasing, so it composes with :class:`FrameCursor`).
+    """
+    n_src = len(vecs)
+    if src_fps == dst_fps or n_src < 2:
+        return vecs, np.arange(n_src)
+    duration = (n_src - 1) / src_fps
+    n_out = int(round(duration * dst_fps)) + 1
+    t_out = np.arange(n_out) / dst_fps
+    t_src = np.arange(n_src) / src_fps
+    out = np.stack([np.interp(t_out, t_src, vecs[:, c]) for c in range(vecs.shape[1])], axis=1).astype(
+        np.float32
+    )
+    video_indices = np.clip(np.round(t_out * src_fps).astype(int), 0, n_src - 1)
+    return out, video_indices
+
+
 # ---------------------------------------------------------------------------
 # Output schema
 # ---------------------------------------------------------------------------
@@ -346,6 +404,7 @@ def retarget_umi_task(
     max_episodes: int | None = None,
     max_clamp_frac: float = 0.25,
     force_rebuild: bool = False,
+    target_fps: int | None = None,
 ) -> Path:
     from lerobot.datasets.lerobot_dataset import LeRobotDataset
 
@@ -354,12 +413,14 @@ def retarget_umi_task(
 
     src = UmiSource.load(source_root)
     th, tw = target_image_size
+    eff_fps = target_fps if target_fps is not None else src.fps
     logger.info(
-        "Source: %s (%s-arm, %d eps, %d fps, cams=%s)",
+        "Source: %s (%s-arm, %d eps, %d fps -> %d fps, cams=%s)",
         source_root,
         "dual" if src.dual_arm else "single",
         len(src.episodes),
         src.fps,
+        eff_fps,
         src.camera_keys,
     )
 
@@ -386,21 +447,29 @@ def retarget_umi_task(
         if match_features_from is None:
             raise ValueError("--match-features-from is required for --action-space joint")
         features, names = build_joint_features(
-            match_features_from, match_features_root, all_cam_keys, th, tw, src.fps
+            match_features_from, match_features_root, all_cam_keys, th, tw, eff_fps
         )
     elif action_space == "ee":
-        features, names = build_ee_features(src.dual_arm, all_cam_keys, th, tw, src.fps)
+        features, names = build_ee_features(src.dual_arm, all_cam_keys, th, tw, eff_fps)
     else:
         raise ValueError(f"--action-space must be 'joint' or 'ee', got {action_space!r}")
 
     if output_root.exists():
-        if not force_rebuild:
-            raise FileExistsError(f"{output_root} exists. Pass --force-rebuild to overwrite.")
-        shutil.rmtree(output_root)
+        if force_rebuild:
+            shutil.rmtree(output_root)
+        elif (output_root / "meta" / "info.json").is_file():
+            logger.info(
+                "Reusing existing retargeted dataset at %s (pass --force-rebuild to redo).", output_root
+            )
+            return output_root
+        else:
+            raise FileExistsError(
+                f"{output_root} exists but is incomplete. Pass --force-rebuild to overwrite."
+            )
 
     dataset = LeRobotDataset.create(
         repo_id=target_repo_id,
-        fps=src.fps,
+        fps=eff_fps,
         robot_type="xlerobot",
         features=features,
         root=output_root,
@@ -429,17 +498,23 @@ def retarget_umi_task(
         ep_idx = ep["episode_index"]
         df = pd.read_parquet(src.parquet_path(ep_idx))
         state = np.stack(df["observation.state"].values).astype(np.float32)
-        action = np.stack(df["action"].values).astype(np.float32)
         task_idx = int(df["task_index"].iloc[0]) if "task_index" in df else 0
         task = src.tasks.get(task_idx, source_root.name.replace("_", " "))
 
-        # ---- Stage 1: per-arm robot-frame EE
+        # ---- Stage 1: per-arm robot-frame EE, resampled to eff_fps.
+        # Source actions satisfy action[t] == state[t+1], so we only resample
+        # the state trajectory and re-derive actions as the one-step shift —
+        # this keeps the convention exact at any output fps.
         arms = ["left", "right"] if src.dual_arm else [target_arm]
         ee_state, ee_action = {}, {}
+        video_indices = np.arange(len(state))
         for i, arm in enumerate(arms):
             sl = slice(i * 7, i * 7 + 7)
-            ee_state[arm] = umi_to_robot_ee(state[:, sl], axis_map, scale, anchor_fwd, anchor_up)
-            ee_action[arm] = umi_to_robot_ee(action[:, sl], axis_map, scale, anchor_fwd, anchor_up)
+            ee = umi_to_robot_ee(state[:, sl], axis_map, scale, anchor_fwd, anchor_up)
+            ee, video_indices = resample_trajectory(ee, src.fps, eff_fps)
+            ee_state[arm] = ee
+            ee_action[arm] = np.vstack([ee[1:], ee[-1:]])
+        n_out = len(video_indices)
 
         # ---- Stage 2: vectors in the chosen action space
         if action_space == "joint":
@@ -449,28 +524,28 @@ def retarget_umi_task(
             if rt.clamp_fraction > max_clamp_frac:
                 skipped.append((ep_idx, rt.clamp_fraction))
                 continue
-            vec_state = [assemble_joint_vec(joints_state, t) for t in range(len(state))]
-            vec_action = [assemble_joint_vec(joints_action, t) for t in range(len(state))]
+            vec_state = [assemble_joint_vec(joints_state, t) for t in range(n_out)]
+            vec_action = [assemble_joint_vec(joints_action, t) for t in range(n_out)]
         else:
             order = ["left", "right"] if src.dual_arm else [target_arm]
             vec_state = [
-                np.concatenate([ee_state[a][t] for a in order]).astype(np.float32) for t in range(len(state))
+                np.concatenate([ee_state[a][t] for a in order]).astype(np.float32) for t in range(n_out)
             ]
             vec_action = [
-                np.concatenate([ee_action[a][t] for a in order]).astype(np.float32) for t in range(len(state))
+                np.concatenate([ee_action[a][t] for a in order]).astype(np.float32) for t in range(n_out)
             ]
 
-        # ---- Videos
-        readers = {
-            cam_remap[k]: read_video_frames(src.video_path(ep_idx, k), (th, tw)) for k in src.camera_keys
+        # ---- Videos (nearest source frame per output step via FrameCursor)
+        cursors = {
+            cam_remap[k]: FrameCursor(read_video_frames(src.video_path(ep_idx, k), (th, tw)))
+            for k in src.camera_keys
         }
-        n_frames = len(state)
         wrote = 0
-        for t in range(n_frames):
+        for t in range(n_out):
             frame = {"observation.state": vec_state[t], "action": vec_action[t], "task": task}
             missing_video = False
-            for cam_key, reader in readers.items():
-                img = next(reader, None)
+            for cam_key, cursor in cursors.items():
+                img = cursor.get(int(video_indices[t]))
                 if img is None:
                     missing_video = True
                     break
@@ -500,6 +575,46 @@ def retarget_umi_task(
     return output_root
 
 
+def _resolve_task_runs(args) -> list[tuple[Path, str, Path]]:
+    """Resolve (source_root, target_repo_id, output_root) per task.
+
+    Single-task mode: ``--source-root`` points at one task dir.
+    Batch mode: ``--source-root`` is the collection root and ``--tasks`` lists
+    task subpaths (optionally downloaded first via ``--download-repo``).
+    """
+    base_out = args.output_root
+    if base_out is None:
+        base_out = Path("~/.cache/huggingface/lerobot").expanduser() / args.target_repo_id
+    base_out = base_out.expanduser()
+    source_root = args.source_root.expanduser()
+
+    if not args.tasks:
+        return [(source_root, args.target_repo_id, base_out)]
+
+    if args.download_repo:
+        from huggingface_hub import snapshot_download
+
+        logger.info("Downloading %d task(s) from %s ...", len(args.tasks), args.download_repo)
+        snapshot_download(
+            repo_id=args.download_repo,
+            repo_type="dataset",
+            allow_patterns=[f"{t}/*" for t in args.tasks],
+            local_dir=source_root,
+        )
+
+    runs = []
+    for t in args.tasks:
+        task_dir = source_root / t
+        if not (task_dir / "meta" / "info.json").is_file():
+            raise FileNotFoundError(
+                f"Task {t!r} not found under {source_root} (expected {task_dir}/meta/info.json). "
+                "Pass --download-repo to fetch it from the Hub."
+            )
+        safe = t.split("/")[-1].lower()
+        runs.append((task_dir, f"{args.target_repo_id}_{safe}", base_out.parent / f"{base_out.name}_{safe}"))
+    return runs
+
+
 def main() -> None:
     p = argparse.ArgumentParser(
         description="Retarget FastUMI (UMI-style EE) tasks to xlerobot joint or EE space.",
@@ -510,7 +625,30 @@ def main() -> None:
         "--source-root",
         type=Path,
         required=True,
-        help="Local root of ONE task, e.g. ~/fastumi/dual_arm/Clean_Desktop",
+        help=(
+            "Single-task mode: root of ONE task (e.g. ~/fastumi/dual_arm/Clean_Desktop). "
+            "Batch mode (--tasks given): the collection root (e.g. ~/fastumi)."
+        ),
+    )
+    p.add_argument(
+        "--tasks",
+        nargs="*",
+        default=None,
+        help="Task subpaths for batch mode, e.g. dual_arm/Clean_Desktop single_arm/pour_water_into_cup",
+    )
+    p.add_argument(
+        "--download-repo",
+        default=None,
+        help="Hub dataset repo to download --tasks from (e.g. IPEC-COMMUNITY/FastUMI_100k_lerobot)",
+    )
+    p.add_argument(
+        "--target-fps",
+        type=int,
+        default=None,
+        help=(
+            "Resample to this fps (e.g. 30 to match xlerobot repos): EE vectors are linearly "
+            "interpolated, video uses the nearest source frame. Default: keep source fps (20)."
+        ),
     )
     p.add_argument("--target-repo-id", required=True)
     p.add_argument(
@@ -574,31 +712,48 @@ def main() -> None:
 
     h, w = (int(x) for x in args.target_image_size.lower().split("x"))
     gmin, gmax = (float(x) for x in args.gripper_range.split(","))
-    output_root = args.output_root
-    if output_root is None:
-        output_root = Path("~/.cache/huggingface/lerobot").expanduser() / args.target_repo_id
 
-    retarget_umi_task(
-        source_root=args.source_root.expanduser(),
-        target_repo_id=args.target_repo_id,
-        output_root=output_root.expanduser(),
-        action_space=args.action_space,
-        match_features_from=args.match_features_from,
-        match_features_root=args.match_features_root,
-        target_arm=args.target_arm,
-        axis_map=AxisMap.parse(args.axis_map),
-        scale=args.scale,
-        anchor_fwd=args.anchor_fwd,
-        anchor_up=args.anchor_up,
-        gripper_range=(gmin, gmax),
-        gantry_mm=args.gantry_mm,
-        target_image_size=(h, w),
-        head_fill=args.head_fill,
-        missing_wrist_fill=args.missing_wrist_fill,
-        max_episodes=args.max_episodes,
-        max_clamp_frac=args.max_clamp_frac,
-        force_rebuild=args.force_rebuild,
-    )
+    runs = _resolve_task_runs(args)
+    produced: list[tuple[str, Path]] = []
+    for source_root, repo_id, output_root in runs:
+        root = retarget_umi_task(
+            source_root=source_root,
+            target_repo_id=repo_id,
+            output_root=output_root,
+            action_space=args.action_space,
+            match_features_from=args.match_features_from,
+            match_features_root=args.match_features_root,
+            target_arm=args.target_arm,
+            axis_map=AxisMap.parse(args.axis_map),
+            scale=args.scale,
+            anchor_fwd=args.anchor_fwd,
+            anchor_up=args.anchor_up,
+            gripper_range=(gmin, gmax),
+            gantry_mm=args.gantry_mm,
+            target_image_size=(h, w),
+            head_fill=args.head_fill,
+            missing_wrist_fill=args.missing_wrist_fill,
+            max_episodes=args.max_episodes,
+            max_clamp_frac=args.max_clamp_frac,
+            force_rebuild=args.force_rebuild,
+            target_fps=args.target_fps,
+        )
+        produced.append((repo_id, root))
+
+    if len(produced) > 1 and args.action_space == "joint":
+        fps = args.target_fps or 20
+        srcs = " ".join(r for r, _ in produced)
+        ref = args.match_features_from or "<your_task_repo>"
+        print(
+            "\nAll tasks retargeted. To merge with your xlerobot task repos for co-training:\n\n"
+            f"lerobot-cotrain-align \\\n"
+            f"    --source-repos <your_task_repos...> {srcs} \\\n"
+            f"    --target-repo-id {args.target_repo_id}_cotrain \\\n"
+            f"    --target-fps {fps} --target-image-size {args.target_image_size} \\\n"
+            f"    --target-state-dim 18 --target-action-dim 18 \\\n"
+            f"    --match-features-from {ref} \\\n"
+            f"    --push-to-hub false\n"
+        )
 
 
 if __name__ == "__main__":

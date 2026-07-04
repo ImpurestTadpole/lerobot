@@ -1,113 +1,40 @@
-# Co-Training XLerobot with External Datasets
+# Co-Training XLerobot
 
-How to leverage external datasets (ALOHA, Open-X-Embodiment, other LeRobot-format
-repos) to improve policies for the **xlerobot** embodiment (18-dim state/action,
-cameras `head` / `left_wrist` / `right_wrist`, 30 fps, 360×640), and how to keep
-improving them with human-in-the-loop (HIL) and RL data flywheels.
-
-Companion files:
-- `src/lerobot/data_processing/co_training_utils.py` — alignment + merge tool
-  (also installed as `lerobot-cotrain-align`).
-- `Guide.sh` — full copy-pasteable training commands (sections B-3, B-4, RA-BC).
-
----
-
-## 1. The method in one picture
+How to train xlerobot policies on more than one dataset: merge your task
+repos with converted external data, pre-train a generalist, fine-tune
+specialists. Converting external data into the xlerobot schema →
+[`DATA_CONVERSION.md`](./DATA_CONVERSION.md). Improving deployed policies
+with human feedback → [`DAGGER_HIL.md`](./DAGGER_HIL.md). Full training
+commands with all flags → `Guide.sh`.
 
 ```
- external repos          your task repos              deployment
- (ALOHA / Open-X)        (trash_pickup, tool_pickup, …)
-      │                        │
-      ▼                        │
- [1] lerobot-cotrain-align     │        ← resample fps, remap cameras,
-      │  (align + merge) ◄─────┘          remap joints by name, resize,
-      ▼                                   re-encode to one schema
- merged co-train dataset
-      │
-      ▼
+ external data                  your task repos
+ (ALOHA / Open-X / FastUMI)     (trash_pickup, tool_pickup, …)
+      │                              │
+      ▼  DATA_CONVERSION.md          │
+ converted to xlerobot schema        │
+      └──────────────┬───────────────┘
+                     ▼
+ [1] lerobot-cotrain-align  → one merged co-train dataset
+                     ▼
  [2] generalist pre-train (SmolVLA, ~60k steps)
-      │
-      ▼
- [3] per-task fine-tune (lower LR, ~20k steps)      ┌──────────────┐
-      │           └── optional: RA-BC weighting     │  more data   │
-      ▼                                             │  (HIL / RL)  │
- [4] deploy → run policy with VR intervention ──────►              │
-      ▲                                             └──────┬───────┘
-      └────────────── retrain on grown dataset ◄───────────┘
+                     ▼
+ [3] per-task specialist fine-tune (~20k steps, lower LR)
+                     ▼            └── optional RA-BC weighting
+ [4] deploy → DAgger corrections (DAGGER_HIL.md) → retrain
 ```
 
-**Why a physical merge?** In this fork `MultiLeRobotDataset` is disabled
-(`src/lerobot/datasets/factory.py` raises `NotImplementedError`), so passing a
-JSON list of repo ids to `--dataset.repo_id` does **not** work. Instead,
-external data is *aligned* to the exact xlerobot schema and *physically merged*
-into one `LeRobotDataset` with `aggregate_datasets()`. This also guarantees a
-single set of normalization statistics — critical when mixing embodiments.
-
-What alignment does per source (see module docstring for details):
-1. Temporal resample to a common fps (nearest-neighbour when downsampling).
-2. State/action remapped **by joint name** against a reference xlerobot repo
-   (`--match-features-from`), zero-padding missing joints and dropping extras.
-3. Camera keys renamed (`top`/`cam_high` → `head`, wrist cams → `left_wrist` /
-   `right_wrist`, …) and frames resized to one resolution.
-4. Everything re-encoded so all shards have *identical* `features` dicts —
-   `aggregate_datasets()` compares full feature dicts, not just shapes.
+**Why a physical merge?** `MultiLeRobotDataset` is disabled in this fork
+(`datasets/factory.py` raises `NotImplementedError`), so JSON-list
+`--dataset.repo_id` does **not** work. `lerobot-cotrain-align` merges
+schema-identical datasets with `aggregate_datasets()` and yields one set of
+normalization statistics — critical when mixing embodiments.
 
 ---
 
-## 2. Step-by-step
+## 1. Merge
 
-### Step 0 — Inspect compatibility
-
-```bash
-lerobot-cotrain-align \
-    --source-repos Odog16/trash_pickup Odog16/tool_pickup lerobot/aloha_mobile_cabinet \
-    --target-repo-id dummy --inspect-only
-```
-
-Prints action/state dims, fps, and camera keys per repo so you can pick the
-camera remap and confirm the reference schema.
-
-### Step 1 — Align the external repos
-
-```bash
-lerobot-cotrain-align \
-    --source-repos \
-        lerobot/aloha_sim_insertion_human \
-        lerobot/aloha_sim_transfer_cube_human \
-        lerobot/aloha_mobile_cabinet \
-        lerobot/aloha_static_battery \
-    --target-repo-id Odog16/aloha_aligned_for_cotrain \
-    --target-fps 30 \
-    --target-image-size 360x640 \
-    --target-state-dim 18 \
-    --target-action-dim 18 \
-    --match-features-from Odog16/tool_pickup \
-    --camera-remap "top:head,cam_high:head,cam_left_wrist:left_wrist,cam_right_wrist:right_wrist" \
-    --output-root ~/.cache/huggingface/lerobot/Odog16/aloha_aligned_for_cotrain \
-    --push-to-hub false
-```
-
-Notes:
-- **Always pass `--match-features-from <one of your xlerobot repos>`** so the
-  state/action `names` lists match; the merge fails without it.
-- Aligned shards are cached under `_align_tmp_*`; re-runs are incremental.
-  `--force-rebuild` wipes stale caches, `--skip-missing-sources` tolerates 404s.
-
-### Step 2 — Verify
-
-```bash
-cat ~/.cache/huggingface/lerobot/Odog16/aloha_aligned_for_cotrain/meta/info.json
-# expect: fps 30, robot_type xlerobot, action/state shape [18],
-#         video.height 360, video.width 640
-```
-
-Then re-run the Step 0 inspect with your task repos + the aligned repo — every
-row should now show identical dims/fps/cameras.
-
-### Step 3 — Merge with your task data (one co-train dataset)
-
-Run the same tool once more with *all* sources — your xlerobot repos are
-passed through in place (their metadata already matches), only the merge runs:
+After converting external sources (see DATA_CONVERSION.md), merge everything:
 
 ```bash
 lerobot-cotrain-align \
@@ -115,21 +42,21 @@ lerobot-cotrain-align \
         Odog16/trash_pickup Odog16/tool_pickup \
         Odog16/block_sorting_single Odog16/block_transfer \
         Odog16/aloha_aligned_for_cotrain \
+        Odog16/umi_pretrain_clean_desktop \
     --target-repo-id Odog16/xlerobot_cotrain_v1 \
     --target-fps 30 --target-image-size 360x640 \
     --target-state-dim 18 --target-action-dim 18 \
     --match-features-from Odog16/tool_pickup \
-    --output-root ~/.cache/huggingface/lerobot/Odog16/xlerobot_cotrain_v1 \
     --push-to-hub false
 ```
 
-**Mixing ratio matters.** ALOHA repos contain far more episodes than your task
-repos; if external data dominates, the policy drifts from your embodiment's
-action distribution. Rules of thumb: keep external data ≤ 50–70 % of merged
-frames for the generalist phase, and control the ratio by choosing *which*
-external repos to include (there is no per-source weighting in the BC trainer).
+Sources already matching the merge schema are passed through in place; only
+the merge runs. **Mixing ratio matters**: keep external data ≤ 50–70 % of
+merged frames so the policy doesn't drift from your embodiment's action
+distribution — control the ratio by choosing which external repos (and
+`--max-episodes` during conversion) to include.
 
-### Step 4 — Phase 1: generalist pre-train
+## 2. Phase 1 — generalist pre-train
 
 ```bash
 lerobot-train \
@@ -137,22 +64,28 @@ lerobot-train \
     --dataset.root=$HOME/.cache/huggingface/lerobot/Odog16/xlerobot_cotrain_v1 \
     --policy.type=smolvla \
     --policy.pretrained_path=lerobot/smolvla_base \
-    --policy.train_state_proj=true \
-    --policy.use_amp=true \
+    --policy.train_state_proj=true --policy.use_amp=true \
     --batch_size=16 --steps=60000 --save_freq=10000 \
     --output_dir=outputs/train/xlerobot_generalist_v1 \
-    --job_name=xlerobot_generalist_v1 \
     --wandb.enable=true --wandb.project=lerobot
 ```
 
-Language conditioning (SmolVLA) is what lets one policy absorb many tasks —
-each merged episode keeps its own task string. The generalist checkpoint is
-the reusable artifact: redo this step only when you add major new data.
+Language conditioning is what lets one policy absorb many tasks — each merged
+episode keeps its own task string. The generalist checkpoint is the reusable
+artifact; redo this phase only when you add major new data.
 
-### Step 5 — Phase 2: per-task specialist fine-tune
+**UMI as a pretraining option.** With FastUMI retargeted at `--target-fps 30`
+(DATA_CONVERSION.md §2), UMI tasks join this merge like any other source. If
+you want a *UMI-heavy* pretrain instead (e.g. 10+ FastUMI tasks dwarfing your
+own data), split Phase 1 in two: first train on the UMI-heavy merge, then
+continue on an xlerobot-only merge before per-task fine-tuning — that keeps
+the final action distribution native while still inheriting the manipulation
+prior.
 
-Fine-tune *from the generalist* on each single-task repo with lower LR and
-fewer steps (full commands: `Guide.sh` step B-4):
+## 3. Phase 2 — per-task specialists (+ RA-BC)
+
+Fine-tune from the generalist on each single-task repo with lower LR and
+fewer steps (full commands: `Guide.sh` B-4 / RA-BC sections):
 
 ```bash
 lerobot-train \
@@ -164,158 +97,68 @@ lerobot-train \
     --output_dir=outputs/train/trash_pickup_cotrain_v1
 ```
 
-### Step 6 (optional but recommended) — RA-BC fine-tune
+Add `--use_rabc=true --rabc_head_mode=sparse --rabc_kappa=0.01` to weight
+training toward high-quality demonstrations (see DAGGER_HIL.md §2).
 
-Reward-Aligned BC re-weights samples toward high-quality demonstrations
-instead of treating all frames equally:
+## 4. Close the loop
 
-```bash
-lerobot-train \
-    --dataset.repo_id=Odog16/trash_pickup \
-    --policy.type=smolvla \
-    --policy.pretrained_path=outputs/train/xlerobot_generalist_v1/checkpoints/last/pretrained_model \
-    --use_rabc=true --rabc_head_mode=sparse --rabc_kappa=0.01 \
-    --batch_size=16 --steps=20000 \
-    --output_dir=outputs/train/trash_pickup_cotrain_rabc_v1
-```
-
-(`--use_rabc` & friends are legacy aliases auto-migrated to
-`--sample_weighting.type=rabc`; see `src/lerobot/configs/train.py`.)
-Progress/subtask annotations come from the SARM tooling in
-`src/lerobot/data_processing/sarm_annotations/`.
+Deploy the specialist and collect DAgger corrections with the VR teleop
+(DAGGER_HIL.md §1); merge the correction episodes back into the task repo and
+re-run Phase 2. This loop is where success rates actually climb.
 
 ---
 
-## 3. Human-in-the-loop and RL: improving the policy *and* the data
+## 5. Getting large amounts of valid xlerobot data
 
-Co-trained BC gets you a competent baseline. The gap to reliable performance is
-closed by collecting the *right* new data — data from the states the policy
-actually visits, labelled by what the human had to fix. This fork already has
-the pieces:
+Ranked by **value per hour of your time** for this embodiment:
 
-### 3a. Intervention recording (DAgger-style flywheel)
+1. **DAgger corrections (highest value per frame).** Once any specialist
+   runs, stop recording full demos — deploy and correct
+   (`lerobot-rollout --strategy.type=dagger`). Corrections are on-policy
+   states with expert actions, targeting exactly what the policy gets wrong.
+   20 correction episodes routinely beat 100 fresh demos for improving an
+   existing policy. Cost: ~30–60 min per iteration.
 
-Two runtimes support VR intervention (**RIGHT A** toggles human takeover):
+2. **VR teleop demonstrations (the gold standard for new tasks).** Native
+   embodiment, native cameras, native action distribution — nothing converted
+   data can match. Throughput is the limit (~40–60 episodes/hour with the
+   Quest 3). Maximize *validity* while recording: vary object positions every
+   episode, vary lighting/background every session, use RIGHT B to cut failed
+   episodes early, and write distinct task strings — language variety is what
+   the generalist feeds on. 50+ episodes/task is the floor; diminishing
+   returns typically start ~150–200 without distribution shifts.
 
-**Any policy (SmolVLA/ACT specialists)** — `lerobot-rollout` DAgger strategy
-with the teleop input device:
+3. **Autonomous rollout harvesting (free data while you do something else).**
+   Run specialists with `lerobot-rollout --strategy.type=sentry` (continuous
+   recording with episode rotation) or `dagger --strategy.record_autonomous=true`.
+   Raw autonomous data is mixed-quality by definition — make it valid by
+   filtering: SARM-annotate and RA-BC-weight it, or keep only
+   success-classified episodes. Scales with robot uptime, not human time.
 
-```bash
-lerobot-rollout \
-    --strategy.type=dagger \
-    --strategy.input_device=teleop \
-    --strategy.num_episodes=20 \
-    --policy.path=outputs/train/trash_pickup_cotrain_v1/checkpoints/last/pretrained_model \
-    --robot.type=xlerobot \
-    --teleop.type=xlerobot_vr \
-    --dataset.repo_id=Odog16/rollout_trash_pickup_dagger \
-    --dataset.single_task="Pick up the trash and place it in the bin"
-```
+4. **Mine the data you already have (SARM + RA-BC).** Old mixed-quality
+   recordings, aborted sessions, superseded datasets: annotate and re-weight
+   instead of deleting (DAGGER_HIL.md §2). Zero collection cost.
 
-The policy runs autonomously; RIGHT A pauses it and hands control to VR (the
-teleop recalibrates its IK targets to the robot's current joints on takeover);
-each correction window is saved as one episode tagged `intervention=True`.
-Toggle RIGHT A again to resume the policy. ESC stops; the dataset repo id must
-start with `rollout_`. Add `--strategy.record_autonomous=true` to also record
-the policy's own frames (tagged `intervention=False`).
+5. **Retargeted UMI data (scale, with an asterisk).** FastUMI-100K offers
+   100k+ trajectories — 3 orders of magnitude above your per-task counts —
+   via `lerobot-umi-retarget` (DATA_CONVERSION.md §2). The visual and
+   workspace gaps make it a pretraining prior rather than in-domain data:
+   expect it to improve the generalist's manipulation priors and language
+   grounding, not to teach xlerobot-specific control. Start with the 5–10
+   tasks closest to yours; keep it a minority of merged frames or use the
+   two-stage pretrain (§2 above).
 
-No separate XLeVR process is needed: `--teleop.type=xlerobot_vr` starts the
-whole XLeVR stack (HTTPS WebXR page on :8443, WSS controller stream on :8442)
-inside the rollout process. Put on the Quest 3, open
-`https://<rollout-host-ip>:8443` in its browser, accept the self-signed cert,
-and enter VR. The XLeVR checkout is auto-located (`~/XLeRobot/XLeVR`); override
-with the `XLEVR_PATH` env var or `--teleop.xlevr_path=...`. Don't run the
-standalone `vr_monitor.py`/XLeVR app at the same time — the ports would clash.
+6. **Aligned ALOHA / Open-X (bimanual priors).** Real-robot joint-space data
+   with a smaller domain gap than UMI on the action side (joints → joints),
+   but a bigger camera/embodiment mismatch. Useful in the generalist merge at
+   modest fractions; already wired via `lerobot-cotrain-align`.
 
-**HVLA** — the S1 runtime (`s1_process.py`) has the same loop built in via its
-`record_dataset` / `intervention_dataset` options.
+7. **HIL-SERL transitions (small but perfect).** Online RL on a scoped
+   single-arm task (DAGGER_HIL.md §3) produces on-policy, reward-labelled
+   transitions that double as BC data. Use for the last mile on critical
+   tasks, not for bulk collection.
 
-Loop:
-1. Deploy the current specialist checkpoint.
-2. Run episodes; intervene only when the policy goes wrong.
-3. The recorded episodes are gold: they cover exactly the failure states of the
-   current policy (on-policy states, expert corrections) — far more valuable
-   per-frame than fresh full demonstrations.
-4. Merge the new episodes into the task repo and re-run the Phase-2 (or RA-BC)
-   fine-tune. 10–30 intervention episodes per iteration is typically enough to
-   see a measurable success-rate jump.
-
-Note: DAgger datasets carry an extra boolean `intervention` feature. Training
-on them directly works (unused keys are ignored); to physically merge them
-into an existing task repo with `lerobot-cotrain-align`, the align pass drops
-the extra feature automatically.
-
-### 3b. Reward-weighted data reuse (RA-BC + SARM)
-
-Not all demos are equal. SARM subtask/progress annotation
-(`data_processing/sarm_annotations/subtask_annotation.py`) scores episodes;
-RA-BC (`--sample_weighting.type=rabc`) then up-weights smooth, successful
-segments and down-weights hesitation and recovery noise. This *creates more
-usable data* out of what you already have — old mediocre recordings still
-contribute their good segments instead of being deleted.
-
-### 3c. HIL-SERL: online RL with human oversight (`src/lerobot/rl/`)
-
-For a single high-value task, run the actor/learner pair:
-
-- `lerobot.rl.gym_manipulator` wraps the real robot as a gym env with
-  intervention support, time limits, and ROI cropping (`crop_dataset_roi.py`).
-- A **reward classifier** (configured via `processor.reward_classifier`,
-  trained from success/failure frames you label) provides the sparse reward,
-  so no hand-coded reward function is needed.
-- `rl/actor.py` runs on the robot host collecting transitions (human can
-  intervene at any time — interventions go into the replay buffer as
-  high-quality actions); `rl/learner.py` trains SAC (`rl/algorithms/sac/`)
-  off-policy on a GPU machine; `rl/data_sources/data_mixer.py` mixes offline
-  demos with online transitions.
-- Warm-start the buffer with your existing demonstrations so RL starts from
-  the BC baseline instead of exploring from scratch.
-
-HIL-SERL-style training typically reaches near-100 % success on a scoped task
-within 1–3 hours of real-robot interaction, and every transition it collects is
-also valid BC data for the next generalist merge.
-
-### 3d. UMI-style datasets (FastUMI-100K)
-
-UMI data (e.g. `IPEC-COMMUNITY/FastUMI_100k_lerobot`: 100k+ handheld-gripper
-trajectories, 54 tasks, LeRobot v2.1) stores **relative end-effector poses**,
-not joints, so `lerobot-cotrain-align` alone can't ingest it. Use
-`lerobot-umi-retarget` (`src/lerobot/data_processing/umi_retarget.py`):
-
-```bash
-huggingface-cli download IPEC-COMMUNITY/FastUMI_100k_lerobot \
-    --repo-type dataset --include "dual_arm/Clean_Desktop/*" --local-dir ~/fastumi
-
-lerobot-umi-retarget \
-    --source-root ~/fastumi/dual_arm/Clean_Desktop \
-    --target-repo-id Odog16/umi_clean_desktop \
-    --action-space joint \
-    --match-features-from Odog16/tool_pickup \
-    --max-episodes 200
-```
-
-`--action-space joint` (Option A) bakes the EE trajectories into 18-dim joint
-space with the same decomposed IK the VR teleop uses; the output schema matches
-your task repos and merges via `lerobot-cotrain-align`. `--action-space ee`
-(Option B) keeps robot-frame EE vectors for a future EE-space policy — both
-modes share the same Stage-1 extraction, so A-datasets and B-datasets stay
-consistent. Defaults (`--scale 0.3`, mid-workspace anchor) keep FastUMI human
-motions inside the SO-100 workspace; episodes exceeding `--max-clamp-frac` are
-skipped. UMI has no head camera — it's black-filled by default so merges keep
-the 3-camera schema. Expect the visual gap (fisheye, handheld gripper in frame)
-to limit this to a pretraining prior; pick tasks close to yours first.
-
-### 3e. Which to use when
-
-| Situation | Tool |
-|---|---|
-| New task, no data | Record 50+ demos → co-train (this doc §2) |
-| Policy ~60–80 % success, fails in specific states | Intervention recording (§3a) → RA-BC fine-tune |
-| Plenty of mixed-quality demos | SARM annotate + RA-BC (§3b) |
-| One critical task needs near-perfect reliability | HIL-SERL online RL (§3c) |
-| Many tasks, plateauing generalist | Add aligned external data, re-merge, redo Phase 1 |
-
-The compounding loop: **deploy → intervene → annotate → re-weight → retrain →
-deploy**. Each pass both improves the policy and grows a dataset that is
-increasingly concentrated on hard states — which is exactly the data the next
-generalist merge benefits from most.
+The multiplier across all of these is the flywheel: every deployment session
+should *record* (sentry/DAgger), every recording should get *scored*
+(SARM/reward classifier), and every training round should *re-weight*
+(RA-BC). Data that only sits on disk is the only invalid data.
