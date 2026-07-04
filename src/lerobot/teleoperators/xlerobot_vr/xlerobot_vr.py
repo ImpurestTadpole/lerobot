@@ -45,15 +45,17 @@ logger = logging.getLogger(__name__)
 # Check VR Monitor availability
 VR_AVAILABLE = True
 try:
-    # Dynamically import VR Monitor 
-    from .vr_monitor import VRMonitor
+    # Dynamically import VR Monitor
+    from .vr_monitor import VRMonitor, set_xlevr_path
 except ImportError as e:
     VR_AVAILABLE = False
     VRMonitor = None
+    set_xlevr_path = None
     logging.warning(f"VR Monitor not available: {e}")
 except Exception as e:
     VR_AVAILABLE = False
     VRMonitor = None
+    set_xlevr_path = None
     logging.warning(f"Could not import VR Monitor: {e}")
 
 
@@ -826,6 +828,8 @@ class XLerobotVRTeleop(Teleoperator):
 
         try:
             logger.info("🔧 Initializing VR monitor...")
+            if getattr(self.config, "xlevr_path", None) and set_xlevr_path is not None:
+                set_xlevr_path(self.config.xlevr_path)
             self.vr_monitor = VRMonitor()
             
             # Use timeout mechanism to avoid infinite waiting

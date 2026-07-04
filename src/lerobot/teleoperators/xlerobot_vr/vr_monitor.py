@@ -16,19 +16,51 @@ import socket
 from pathlib import Path
 from typing import Optional
 
-# Set the absolute path to the xlevr folder
-XLEVR_PATH = "/home/jetson/XLeRobot/XLeVR"
+def _resolve_xlevr_path() -> str:
+    """Locate the XLeVR checkout (serves web-ui + certs, provides the xlevr package).
+
+    Resolution order: XLEVR_PATH environment variable, then well-known install
+    locations. ``XLerobotVRTeleopConfig.xlevr_path`` overrides both via
+    :func:`set_xlevr_path` before the monitor is created.
+    """
+    env = os.environ.get("XLEVR_PATH")
+    if env:
+        return env
+    candidates = [
+        Path.home() / "XLeRobot" / "XLeVR",
+        Path("/home/jetson/XLeRobot/XLeVR"),
+        Path("/home/owen/XLeRobot/XLeVR"),
+    ]
+    for c in candidates:
+        if c.is_dir():
+            return str(c)
+    # Legacy default (original hardcoded Jetson path); initialize() will
+    # print a clear error if it doesn't exist.
+    return "/home/jetson/XLeRobot/XLeVR"
+
+
+XLEVR_PATH = _resolve_xlevr_path()
+
+
+def set_xlevr_path(path: str) -> None:
+    """Override the XLeVR checkout location (call before creating VRMonitor)."""
+    global XLEVR_PATH
+    XLEVR_PATH = str(Path(path).expanduser())
+
 
 def setup_xlevr_environment():
-    """Setup xlevr environment"""
+    """Make the xlevr package importable.
+
+    Note: the working directory is NOT changed here. xlevr reads its
+    ``config.yaml`` relative to the CWD at first import, so the import in
+    :func:`import_xlevr_modules` happens inside a temporary chdir; runtime
+    file access (certs, web-ui) uses absolute paths under ``XLEVR_PATH``.
+    """
     # Add xlevr path to Python path
     if XLEVR_PATH not in sys.path:
         sys.path.insert(0, XLEVR_PATH)
-    
-    # Set working directory
-    os.chdir(XLEVR_PATH)
-    
-    # Set environment variables
+
+    # Set environment variables (for any child processes)
     os.environ['PYTHONPATH'] = f"{XLEVR_PATH}:{os.environ.get('PYTHONPATH', '')}"
 
 def get_local_ip():
@@ -47,16 +79,27 @@ def get_local_ip():
             return "localhost"
 
 def import_xlevr_modules():
-    """Import xlevr modules"""
+    """Import xlevr modules.
+
+    ``xlevr.config`` reads ``config.yaml`` relative to the CWD at first import,
+    so we chdir into XLEVR_PATH just for the import and restore afterwards
+    (a permanent chdir would silently break relative paths elsewhere in the
+    host process, e.g. --policy.path=outputs/... in lerobot-rollout).
+    """
+    prev_cwd = os.getcwd()
     try:
+        os.chdir(XLEVR_PATH)
         from xlevr.config import XLeVRConfig
-        from xlevr.inputs.vr_ws_server import VRWebSocketServer
         from xlevr.inputs.base import ControlGoal, ControlMode
+        from xlevr.inputs.vr_ws_server import VRWebSocketServer
         return XLeVRConfig, VRWebSocketServer, ControlGoal, ControlMode
-    except ImportError as e:
+    except (ImportError, OSError) as e:
         print(f"Error importing xlevr modules: {e}")
         print(f"Make sure XLEVR_PATH is correct: {XLEVR_PATH}")
+        print("Set the XLEVR_PATH env var or --teleop.xlevr_path to your XLeVR checkout.")
         return None, None, None, None
+    finally:
+        os.chdir(prev_cwd)
 
 class SimpleAPIHandler(http.server.BaseHTTPRequestHandler):
     """Simplified HTTP request handler, only provides basic web services"""
@@ -139,9 +182,12 @@ class SimpleHTTPSServer:
             # Set web root path for file serving
             self.httpd.web_root_path = self.web_root_path
             
-            # Setup SSL
+            # Setup SSL (certs live in the XLeVR checkout, not the CWD)
             context = ssl.SSLContext(ssl.PROTOCOL_TLS_SERVER)
-            context.load_cert_chain('cert.pem', 'key.pem')
+            context.load_cert_chain(
+                os.path.join(XLEVR_PATH, 'cert.pem'),
+                os.path.join(XLEVR_PATH, 'key.pem'),
+            )
             self.httpd.socket = context.wrap_socket(self.httpd.socket, server_side=True)
             
             # Start server in a separate thread
@@ -177,23 +223,31 @@ class VRMonitor:
         self._goal_lock = threading.Lock()  # Add thread lock
     
     def initialize(self):
-        """Initialize VR monitor"""
+        """Initialize VR monitor (idempotent — safe to call again after success)"""
+        if getattr(self, "_initialized", False):
+            return True
         print("🔧 Initializing XLeVR Monitor...")
-        
+
         # Setup environment
         setup_xlevr_environment()
-        
+
         # Import modules
         XLeVRConfig, VRWebSocketServer, ControlGoal, ControlMode = import_xlevr_modules()
         if XLeVRConfig is None:
             print("❌ Failed to import xlevr modules")
             return False
-        
+
         # Create configuration
         self.config = XLeVRConfig()
         self.config.enable_vr = True
         self.config.enable_keyboard = False
         self.config.enable_https = True  # Enable HTTPS server, VR requires web interface
+        # The WSS server loads (and may auto-generate) certs via these paths at
+        # runtime; anchor them to the checkout so the CWD doesn't matter.
+        if not os.path.isabs(self.config.certfile):
+            self.config.certfile = os.path.join(XLEVR_PATH, self.config.certfile)
+        if not os.path.isabs(self.config.keyfile):
+            self.config.keyfile = os.path.join(XLEVR_PATH, self.config.keyfile)
         
         # Create command queue
         self.command_queue = asyncio.Queue()
@@ -217,7 +271,8 @@ class VRMonitor:
             return False
         
         print("✅ XLeVR Monitor initialized successfully")
-        
+
+        self._initialized = True
         return True
     
     async def start_monitoring(self):

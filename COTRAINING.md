@@ -219,6 +219,14 @@ Toggle RIGHT A again to resume the policy. ESC stops; the dataset repo id must
 start with `rollout_`. Add `--strategy.record_autonomous=true` to also record
 the policy's own frames (tagged `intervention=False`).
 
+No separate XLeVR process is needed: `--teleop.type=xlerobot_vr` starts the
+whole XLeVR stack (HTTPS WebXR page on :8443, WSS controller stream on :8442)
+inside the rollout process. Put on the Quest 3, open
+`https://<rollout-host-ip>:8443` in its browser, accept the self-signed cert,
+and enter VR. The XLeVR checkout is auto-located (`~/XLeRobot/XLeVR`); override
+with the `XLEVR_PATH` env var or `--teleop.xlevr_path=...`. Don't run the
+standalone `vr_monitor.py`/XLeVR app at the same time — the ports would clash.
+
 **HVLA** — the S1 runtime (`s1_process.py`) has the same loop built in via its
 `record_dataset` / `intervention_dataset` options.
 

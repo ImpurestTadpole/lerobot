@@ -32,4 +32,7 @@ class XLerobotVRTeleopConfig(TeleoperatorConfig):
 
     kp : float = 1.0  # Proportional gain for arm control
 
-    xlevr_path: Optional[str] = "/home/jetson/XLeRobot/XLeVR" # need to be modified
+    # XLeVR checkout (serves the WebXR page + certs, provides the xlevr package).
+    # None = auto-resolve: XLEVR_PATH env var, then ~/XLeRobot/XLeVR and other
+    # well-known locations (see vr_monitor._resolve_xlevr_path).
+    xlevr_path: Optional[str] = None
