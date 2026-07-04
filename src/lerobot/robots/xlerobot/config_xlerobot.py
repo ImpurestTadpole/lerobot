@@ -42,6 +42,12 @@ def xlerobot_cameras_config() -> dict[str, CameraConfig]:
         # camera1: Top/overhead view (head) - Intel RealSense D435i
         # MUST be opened FIRST to avoid resource conflicts
         # Using RealSense SDK for efficient native compression (better than OpenCV/V4L2)
+        # use_depth=True records observation.images.head_depth (H, W, 1) uint16 mm alongside
+        # RGB — the "master dataset" strategy: capture 18 DOF + RGB-D once, then derive
+        # RGB-only / reduced-DOF subsets for co-training with lerobot-extract-subset
+        # (see RGBD_IMPLEMENTATION_GUIDE.md and COTRAINING.md). Costs ~20-30 ms per frame
+        # on the RealSense read; set skip_depth=True in get_observation() for latency-
+        # critical teleop without recording.
         "head": RealSenseCameraConfig(
             serial_number_or_name="342222071125",
             fps=30,
@@ -49,7 +55,7 @@ def xlerobot_cameras_config() -> dict[str, CameraConfig]:
             height=360,
             color_mode=ColorMode.RGB,
             rotation=Cv2Rotation.NO_ROTATION,
-            use_depth=False,
+            use_depth=True,
         ),
     
         # IMAGE SIZE RECOMMENDATION:

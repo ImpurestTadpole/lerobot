@@ -7,6 +7,45 @@ specialists. Converting external data into the xlerobot schema →
 with human feedback → [`DAGGER_HIL.md`](./DAGGER_HIL.md). Full training
 commands with all flags → `Guide.sh`.
 
+**Workflow UI:** the whole pipeline below (and variations of it) can be laid
+out, script-generated, and run stage-by-stage from a local web UI:
+
+```bash
+uv run python scripts/workflow_ui/app.py        # → http://127.0.0.1:7799
+```
+
+Three tabs: **Workflow** (compose stages — merge / train / extract / SARM /
+custom — with variables, generate standalone `.sh` scripts under
+`workflows/<name>/scripts/`, run sequentially with live logs), **Compare
+datasets** (preflight any external repo against your reference schema:
+per-joint padding report, zero-fill severity in σ, camera/fps checks,
+side-by-side [HF dataset visualizer](https://github.com/huggingface/lerobot-dataset-visualizer)
+embeds, one-click apply of recommended mitigation flags), and **Guide**
+(this document as color-coded phases). Two presets: **Home-tasks** (merge →
+generalist → per-task fine-tunes) and **Master RGB-D / UMI** (§0/§2 below).
+
+## 0. Record once: the master dataset
+
+Record teleop sessions with **all 18 DOF and RGB-D active**
+(`use_depth=True` on the head RealSense is now the xlerobot default —
+recordings gain `observation.images.head_depth`). That master dataset is the
+future-proof source of truth; derive per-run training views instead of
+re-collecting:
+
+```bash
+lerobot-extract-subset \
+    --source-repo Odog16/master_home_v1 \
+    --target-repo-id Odog16/master_home_v1_bimanual12 \
+    --profile bimanual12          # both 6-DOF arms, depth dropped
+```
+
+Profiles: `bimanual12` (12 arm dims — tensor shapes match open-source
+bimanual datasets exactly, so those dims never need padding), `arms_head14`,
+`full18`, or an explicit `--keep-names` list; optional `--target-fps` /
+`--target-image-size` / `--keep-depth`. The subset keeps task strings and
+drops straight into `lerobot-cotrain-align` as a source (or as the
+`--match-features-from` reference for a 12-DOF merge).
+
 ```
  external data                  your task repos
  (ALOHA / Open-X / FastUMI)     (trash_pickup, tool_pickup, …)
@@ -47,6 +86,7 @@ lerobot-cotrain-align \
     --target-fps 30 --target-image-size 360x640 \
     --target-state-dim 18 --target-action-dim 18 \
     --match-features-from Odog16/tool_pickup \
+    --pad-fill-mode ref-mean --override-padded-stats \
     --push-to-hub false
 ```
 
@@ -55,6 +95,32 @@ the merge runs. **Mixing ratio matters**: keep external data ≤ 50–70 % of
 merged frames so the policy doesn't drift from your embodiment's action
 distribution — control the ratio by choosing which external repos (and
 `--max-episodes` during conversion) to include.
+
+### Padding-bias mitigation
+
+External sources cannot supply every xlerobot dim (a single-arm repo pads 11
+of 18 joints). Padding those dims with **0** teaches the generalist a "frozen
+joints" bias *and* pollutes the merged normalization stats. Three mitigations
+are built in — the first two happen at merge time:
+
+- `--pad-fill-mode ref-mean` — padded dims take the reference repo's per-joint
+  **mean** instead of 0, so they sit at the centre of your real distribution.
+  Velocity dims (`x.vel`, `y.vel`, `theta.vel`) stay 0 ("stopped" is correct).
+  `state-copy` goes further: padded non-velocity *action* dims copy the
+  same-name state value — an identity "hold position" action.
+- `--override-padded-stats` — after merging, `meta/stats.json` entries for the
+  padded dims are rewritten with the reference repo's mean/std/min/max, so
+  your real base/lift/head motion isn't normalized into the tails.
+- **Source down-weighting at train time** — the merge always writes
+  `meta/cotrain_sources.json` (episode ranges + padded dims per source). Add
+  `--sample_weighting.type=source` to `lerobot-train` and episodes from padded
+  external sources get `--sample_weighting.external_weight` (default 0.3)
+  instead of 1.0, shrinking the supervised-to-constant gradient without
+  discarding their visual/language diversity. Requires the merged dataset to
+  be local (`--dataset.root` or the HF cache).
+
+Changing `--pad-fill-mode` invalidates the per-source `_align_tmp_*` caches
+automatically (a `meta/cotrain_align_options.json` marker is compared).
 
 ## 2. Phase 1 — generalist pre-train
 
@@ -66,9 +132,14 @@ lerobot-train \
     --policy.pretrained_path=lerobot/smolvla_base \
     --policy.train_state_proj=true --policy.use_amp=true \
     --batch_size=16 --steps=60000 --save_freq=10000 \
+    --sample_weighting.type=source --sample_weighting.external_weight=0.3 \
     --output_dir=outputs/train/xlerobot_generalist_v1 \
     --wandb.enable=true --wandb.project=lerobot
 ```
+
+The `sample_weighting` lines down-weight padded external episodes (see
+*Padding-bias mitigation* above); drop them for an all-native merge.
+Per-repo overrides: `--sample_weighting.source_weights='{"lerobot/aloha_mobile_cabinet": 0.5}'`.
 
 Language conditioning is what lets one policy absorb many tasks — each merged
 episode keeps its own task string. The generalist checkpoint is the reusable
@@ -81,6 +152,16 @@ own data), split Phase 1 in two: first train on the UMI-heavy merge, then
 continue on an xlerobot-only merge before per-task fine-tuning — that keeps
 the final action distribution native while still inheriting the manipulation
 prior.
+
+**UMI at scale (the Master RGB-D / UMI preset).** The two-stage split works
+best in *12-DOF space*: stage 1 merges your `bimanual12` master subset (§0)
+with UMI and bimanual sources — 12 names all match, so UMI can dominate the
+mix without padding bias — and trains from `smolvla_base` with source
+weighting; stage 2 continues that checkpoint on a native 18-DOF merge so the
+final action distribution is yours. SmolVLA pads state/action internally, so
+the 12→18 change is safe with `--policy.train_state_proj=true`. Start with
+the 5–10 UMI tasks closest to your home tasks, and preflight every retargeted
+repo in the UI's *Compare datasets* tab before spending encode time on it.
 
 ## 3. Phase 2 — per-task specialists (+ RA-BC)
 
@@ -98,7 +179,18 @@ lerobot-train \
 ```
 
 Add `--use_rabc=true --rabc_head_mode=sparse --rabc_kappa=0.01` to weight
-training toward high-quality demonstrations (see DAGGER_HIL.md §2).
+training toward high-quality demonstrations (see DAGGER_HIL.md §2). Generate
+the required `sarm_progress.parquet` first — the workflow UI's **sarm** stage
+runs it, or directly:
+
+```bash
+uv run python -m lerobot.rewards.sarm.compute_rabc_weights \
+    --dataset-repo-id Odog16/trash_pickup \
+    --reward-model-path Odog16/sarm_xlerobot --head-mode sparse --device cuda
+```
+
+Annotate *after* any merge/extract (frame indices must match the dataset you
+train on), and keep `--head-mode` consistent with `--rabc_head_mode`.
 
 ## 4. Close the loop
 

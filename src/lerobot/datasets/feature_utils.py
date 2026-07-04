@@ -133,9 +133,15 @@ def features_equal_for_merge(features_a: dict[str, dict], features_b: dict[str, 
         filtered = dict(feature)
         filtered_info = filtered.get("info")
         if isinstance(filtered_info, dict):
+            # Normalize is_depth_map key: old recordings store "video.is_depth_map",
+            # new video_utils.py writes bare "is_depth_map". Canonicalize to the
+            # prefixed form before comparison so both formats compare equal.
+            normalized_info = dict(filtered_info)
+            if "is_depth_map" in normalized_info and "video.is_depth_map" not in normalized_info:
+                normalized_info["video.is_depth_map"] = normalized_info.pop("is_depth_map")
             filtered["info"] = {
                 info_key: info_value
-                for info_key, info_value in filtered_info.items()
+                for info_key, info_value in normalized_info.items()
                 if info_key not in VIDEO_ENCODER_INFO_KEYS
             }
         return filtered

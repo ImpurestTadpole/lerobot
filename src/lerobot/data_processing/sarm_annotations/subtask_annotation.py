@@ -1630,8 +1630,8 @@ def main():
     parser.add_argument(
         "--output-dir",
         type=str,
-        default="./subtask_viz",
-        help="Output directory for visualizations (default: ./subtask_viz)",
+        default="outputs/subtask_viz",
+        help="Output directory for visualizations (default: outputs/subtask_viz)",
     )
 
     args = parser.parse_args()

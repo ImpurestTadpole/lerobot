@@ -25,6 +25,11 @@ RUNS = [
     ),
     # Uncomment to upload additional checkpoints:
     # (
+    #     "outputs/train/trash_pickup_ACT_scratch",   # was in the (removed) repo-root copy
+    #     "Odog16/trash_pickup_ACT_scratch",
+    #     ["080000"],
+    # ),
+    # (
     #     "outputs/train/trash_pickup_SmolVLA_v1",
     #     "Odog16/trash_pickup_SmolVLA",
     #     ["005000", "010000"],

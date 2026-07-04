@@ -1,0 +1,1153 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>LeRobot Co-training Workflows</title>
+<style>
+  /* ---- teenage-engineering-inspired faceplate: warm gray chassis, ink lines,
+         chunky keys with hard drop shadows, orange accent, LED status dots ---- */
+  :root {
+    --bg: #d7d4cd; --panel: #edebe6; --panel2: #f7f6f2; --line: #b9b6ae;
+    --ink: #16150f; --text: #16150f; --muted: #716e66; --accent: #ff4a00;
+    --ok: #2fae3e; --bad: #e02d10; --warn: #e8a200; --run: #ff4a00;
+    /* phase colors — shared by stage chips and guide sections */
+    --c-merge: #0060df; --c-train: #7a49ff; --c-finetune: #1f9d4d;
+    --c-deploy: #e8720c; --c-mitigate: #e02d10; --c-data: #008f7a;
+    --c-custom: #b98a00; --c-extract: #008f7a; --c-sarm: #d6248f;
+    --screen: #191813; --screen-text: #e8e6df;
+    font-size: 15px;
+  }
+  * { box-sizing: border-box; }
+  body { margin: 0; background: var(--bg); color: var(--text);
+         background-image: radial-gradient(#c4c1b9 1px, transparent 1px);
+         background-size: 22px 22px;
+         font-family: "Helvetica Neue", Helvetica, Arial, system-ui, sans-serif;
+         height: 100vh; display: flex; flex-direction: column; }
+  ::selection { background: var(--accent); color: #fff; }
+  header { display: flex; align-items: center; gap: .6rem; padding: .6rem 1rem;
+           background: var(--panel); border-bottom: 2px solid var(--ink); flex-wrap: wrap; }
+  header h1 { font-size: .85rem; margin: 0 .6rem 0 0; font-weight: 700;
+              text-transform: uppercase; letter-spacing: .14em; display: flex;
+              align-items: center; gap: .5rem; }
+  header h1::before { content: ""; width: 11px; height: 11px; border-radius: 50%;
+                      background: var(--accent); border: 1.5px solid var(--ink);
+                      display: inline-block; }
+  nav.tabs { display: flex; gap: 0; margin-right: 1rem; border: 1.5px solid var(--ink);
+             border-radius: 9px; overflow: hidden; background: var(--panel2); }
+  nav.tabs button { border: none; background: none; color: var(--ink); border-radius: 0;
+                    padding: .35rem .9rem; font-size: .72rem; font-weight: 700;
+                    text-transform: uppercase; letter-spacing: .08em; box-shadow: none; }
+  nav.tabs button + button { border-left: 1.5px solid var(--ink); }
+  nav.tabs button.active { background: var(--ink); color: #fff; }
+  #wf-title { font-family: ui-monospace, "SF Mono", monospace; font-size: .8rem; }
+  main { flex: 1; display: flex; min-height: 0; }
+  .view { flex: 1; display: none; min-height: 0; }
+  .view.active { display: flex; }
+  /* ---------- controls: chunky keys ---------- */
+  button { background: var(--panel2); color: var(--ink); border: 1.5px solid var(--ink);
+           border-radius: 9px; padding: .38rem .85rem; cursor: pointer; font-size: .78rem;
+           font-weight: 600; text-transform: uppercase; letter-spacing: .05em;
+           box-shadow: 0 2px 0 var(--ink); }
+  button:hover { background: #fff; }
+  button:active { transform: translateY(2px); box-shadow: 0 0 0 var(--ink); }
+  button.primary { background: var(--accent); color: #fff; }
+  button.primary:hover { background: #ff5c18; }
+  button.danger:hover { background: var(--bad); color: #fff; }
+  button.small { padding: .12rem .5rem; font-size: .68rem; box-shadow: 0 1.5px 0 var(--ink); }
+  input, select, textarea { background: #fff; color: var(--ink); border: 1.5px solid var(--line);
+           border-radius: 8px; padding: .35rem .55rem; font-size: .85rem; width: 100%;
+           font-family: ui-monospace, "SF Mono", monospace; }
+  textarea { resize: vertical; }
+  input:focus, select:focus, textarea:focus { outline: none; border-color: var(--ink);
+           box-shadow: 0 0 0 2px rgba(255, 74, 0, .35); }
+  input[type="checkbox"] { width: auto; accent-color: var(--accent); transform: scale(1.15); }
+  ::placeholder { color: #b3b0a8; }
+  /* ---------- workflow view ---------- */
+  #sidebar { width: 225px; background: var(--panel); border-right: 2px solid var(--ink);
+             padding: .8rem; display: flex; flex-direction: column; gap: .55rem; }
+  #wf-list { flex: 1; overflow-y: auto; display: flex; flex-direction: column; gap: .3rem;
+             margin-top: .3rem; }
+  .wf-item { padding: .45rem .6rem; border-radius: 8px; cursor: pointer; color: var(--ink);
+             border: 1.5px solid var(--line); background: var(--panel2);
+             font-family: ui-monospace, monospace; font-size: .78rem;
+             overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+  .wf-item:hover { border-color: var(--ink); }
+  .wf-item.active { border-color: var(--ink); box-shadow: inset 3px 0 0 var(--accent); font-weight: 700; }
+  #editor { flex: 1; overflow-y: auto; padding: 1rem 1.25rem; min-width: 0; }
+  /* log pane = the device screen */
+  #logpane { width: 36%; max-width: 600px; border-left: 2px solid var(--ink);
+             background: var(--screen); display: flex; flex-direction: column; }
+  #logpane .bar { display: flex; gap: .5rem; align-items: center; padding: .5rem .75rem;
+                  background: var(--panel); border-bottom: 2px solid var(--ink); }
+  #logpane .bar .check { color: var(--ink); }
+  #logview { flex: 1; overflow: auto; margin: 0; padding: .8rem; font: 12px/1.55 ui-monospace,
+             monospace; white-space: pre-wrap; word-break: break-word; color: var(--screen-text); }
+  /* ---------- panels ---------- */
+  .section { background: var(--panel); border: 1.5px solid var(--ink); border-radius: 12px;
+             padding: .9rem 1rem; margin-bottom: 1rem; box-shadow: 0 3px 0 rgba(22,21,15,.25); }
+  .section h2 { font-size: .68rem; letter-spacing: .12em; text-transform: uppercase;
+                color: var(--muted); margin: 0 0 .7rem; display: flex; align-items: center; gap: .5rem; }
+  .section h2::before { content: ""; width: 7px; height: 7px; border-radius: 50%;
+                        background: var(--ink); display: inline-block; }
+  .var-row { display: grid; grid-template-columns: 1fr 2fr auto; gap: .5rem; margin-bottom: .4rem; }
+  .field-grid { display: grid; gap: .6rem .75rem;
+                grid-template-columns: repeat(auto-fill, minmax(215px, 1fr)); }
+  .field label { display: flex; align-items: center; gap: .35rem; font-size: .62rem;
+                 color: var(--muted); margin-bottom: .2rem;
+                 text-transform: uppercase; letter-spacing: .08em; font-weight: 700; }
+  .field.wide { grid-column: 1 / -1; }
+  .check { display: flex; align-items: center; gap: .45rem; font-size: .78rem;
+           color: var(--ink); padding-top: 1.1rem; }
+  /* ---------- info popovers (the "?" keys) ---------- */
+  .field, .check, .typewrap { position: relative; }
+  .info-btn { width: 16px; height: 16px; border-radius: 50%; padding: 0; flex: none;
+              font-size: .6rem; line-height: 1; font-weight: 700; text-transform: none;
+              letter-spacing: 0; box-shadow: 0 1.5px 0 var(--ink); }
+  .pop { position: absolute; top: calc(100% + 6px); left: 0; z-index: 60; width: 272px;
+         background: var(--panel2); border: 1.5px solid var(--ink); border-radius: 10px;
+         padding: .55rem .65rem; box-shadow: 0 4px 0 rgba(22,21,15,.35); cursor: default;
+         text-transform: none; letter-spacing: 0; font-weight: 400; }
+  .pop p { margin: 0; font-size: .74rem; line-height: 1.5; color: var(--ink); }
+  .pop pre.pic { background: var(--screen); color: var(--screen-text); border-radius: 6px;
+                 padding: .45rem .55rem; margin: 0 0 .45rem; white-space: pre;
+                 font: 11px/1.5 ui-monospace, "SF Mono", monospace; overflow-x: auto; }
+  /* ---------- stages ---------- */
+  .stage { border: 1.5px solid var(--ink); border-left: 6px solid var(--line);
+           border-radius: 12px; background: var(--panel2); margin-bottom: .7rem;
+           box-shadow: 0 2px 0 rgba(22,21,15,.3); }
+  .stage.t-merge { border-left-color: var(--c-merge); }
+  .stage.t-train { border-left-color: var(--c-train); }
+  .stage.t-custom { border-left-color: var(--c-custom); }
+  .stage.t-extract { border-left-color: var(--c-extract); }
+  .stage.t-sarm { border-left-color: var(--c-sarm); }
+  .stage.disabled { opacity: .5; }
+  .stage .head { display: flex; align-items: center; gap: .5rem; padding: .55rem .8rem;
+                 flex-wrap: wrap; cursor: pointer; }
+  .stage.open .head { border-bottom: 1.5px solid var(--line); }
+  .stage .head input.name { width: 230px; font-weight: 700; background: transparent;
+                            border-color: transparent; }
+  .stage .head input.name:hover, .stage .head input.name:focus { background: #fff;
+                            border-color: var(--line); }
+  .stage .summary { font-size: .72rem; color: var(--muted); overflow: hidden;
+                    font-family: ui-monospace, monospace;
+                    text-overflow: ellipsis; white-space: nowrap; max-width: 34ch; }
+  .stage .body { padding: .85rem; display: none; }
+  .stage.open .body { display: block; }
+  .stage pre.preview { background: var(--screen); color: var(--screen-text);
+                       border: 1.5px solid var(--ink); border-radius: 8px;
+                       padding: .65rem; font-size: 12px; overflow-x: auto; margin: .6rem 0 0; }
+  .chev { color: var(--muted); font-size: .7rem; width: 1em; display: inline-block; }
+  /* LED status chips */
+  .chip { font-size: .62rem; padding: .14rem .55rem .14rem .4rem; border-radius: 99px;
+          border: 1.5px solid var(--ink); color: var(--ink); background: var(--panel2);
+          font-weight: 700; text-transform: uppercase; letter-spacing: .07em;
+          display: inline-flex; align-items: center; gap: .35rem; }
+  .chip::before { content: ""; width: 8px; height: 8px; border-radius: 50%;
+                  background: var(--muted); display: inline-block; }
+  .chip.running::before { background: var(--run); animation: led 1s infinite; }
+  .chip.done::before { background: var(--ok); }
+  .chip.failed::before, .chip.stopped::before { background: var(--bad); }
+  .chip.pending::before { background: var(--warn); }
+  @keyframes led { 50% { opacity: .25; } }
+  .typechip { font-size: .58rem; text-transform: uppercase; letter-spacing: .09em;
+              border-radius: 5px; padding: .12rem .4rem; border: 1.5px solid; font-weight: 700;
+              color: #fff; }
+  .t-merge .typechip { background: var(--c-merge); border-color: var(--c-merge); }
+  .t-train .typechip { background: var(--c-train); border-color: var(--c-train); }
+  .t-custom .typechip { background: var(--c-custom); border-color: var(--c-custom); }
+  .t-extract .typechip { background: var(--c-extract); border-color: var(--c-extract); }
+  .t-sarm .typechip { background: var(--c-sarm); border-color: var(--c-sarm); }
+  .spacer { flex: 1; }
+  #toast { position: fixed; bottom: 1.1rem; left: 50%; transform: translateX(-50%);
+           background: var(--ink); color: #fff; border: 1.5px solid var(--ink);
+           padding: .55rem 1.1rem; border-radius: 10px; display: none; z-index: 10;
+           max-width: 70ch; font-size: .82rem; box-shadow: 0 3px 0 rgba(22,21,15,.4); }
+  #toast.error { background: var(--bad); }
+  .hint { font-size: .74rem; color: var(--muted); margin: .2rem 0 0; }
+  a { color: var(--accent); }
+  /* ---------- guide view ---------- */
+  #view-guide { overflow-y: auto; padding: 1.2rem clamp(1rem, 6vw, 4rem); }
+  #view-guide.active, #view-compare.active { display: block; }
+  .gsec { border: 1.5px solid var(--ink); border-left: 6px solid var(--gc, var(--line));
+          border-radius: 12px; background: var(--panel); padding: 1rem 1.2rem;
+          margin: 0 auto 1rem; max-width: 60rem; box-shadow: 0 3px 0 rgba(22,21,15,.25); }
+  .gsec h3 { margin: 0 0 .5rem; font-size: .95rem; color: var(--ink);
+             text-transform: uppercase; letter-spacing: .05em;
+             display: flex; align-items: center; gap: .6rem; }
+  .gsec .gstep { font-size: .6rem; background: var(--gc); color: #fff; font-weight: 700;
+                 letter-spacing: .1em; border-radius: 99px; padding: .18rem .65rem; }
+  .gsec p, .gsec li { font-size: .87rem; color: var(--ink); line-height: 1.55; }
+  .gsec ul, .gsec ol { margin: .4rem 0; padding-left: 1.2rem; }
+  .gsec code { background: var(--screen); color: var(--screen-text); border-radius: 5px;
+               padding: .08rem .38rem; font-size: .78rem; }
+  .gsec .muted { color: var(--muted); }
+  #guide-flow { display: flex; gap: .4rem; flex-wrap: wrap; max-width: 60rem;
+                margin: 0 auto 1.2rem; align-items: center; }
+  #guide-flow .fnode { border: 1.5px solid var(--ink); border-radius: 9px; padding: .3rem .7rem;
+                       font-size: .68rem; font-weight: 700; text-transform: uppercase;
+                       letter-spacing: .06em; cursor: pointer; background: var(--panel2);
+                       color: var(--ink) !important; box-shadow: 0 2px 0 var(--ink);
+                       display: inline-flex; align-items: center; gap: .4rem; }
+  #guide-flow .fnode::before { content: ""; width: 8px; height: 8px; border-radius: 50%;
+                       background: currentColor; }
+  #guide-flow .fnode:active { transform: translateY(2px); box-shadow: none; }
+  #guide-flow .farrow { color: var(--muted); }
+  /* ---------- compare view ---------- */
+  #view-compare { overflow-y: auto; padding: 1rem 1.25rem; }
+  #cmp-form { display: flex; gap: .6rem; align-items: end; flex-wrap: wrap;
+              max-width: 75rem; margin: 0 auto .9rem; }
+  #cmp-form .field { min-width: 240px; flex: 1; }
+  #cmp-results { max-width: 75rem; margin: 0 auto; }
+  .cmp-cols { display: grid; grid-template-columns: 1fr 1fr; gap: 1rem; }
+  @media (max-width: 1100px) { .cmp-cols { grid-template-columns: 1fr; } }
+  .issue { border: 1.5px solid var(--ink); border-left: 6px solid var(--line);
+           border-radius: 10px; padding: .55rem .8rem; margin-bottom: .5rem;
+           background: var(--panel2); }
+  .issue.high { border-left-color: var(--bad); }
+  .issue.warn { border-left-color: var(--warn); }
+  .issue.ok   { border-left-color: var(--ok); }
+  .issue b { font-size: .85rem; }
+  .issue p { margin: .25rem 0 0; font-size: .8rem; color: var(--muted); }
+  table.map { width: 100%; border-collapse: collapse; font-size: .76rem; background: #fff; }
+  table.map th { text-align: left; color: var(--muted); font-weight: 700; padding: .3rem .5rem;
+                 font-size: .62rem; text-transform: uppercase; letter-spacing: .07em;
+                 border-bottom: 1.5px solid var(--ink); position: sticky; top: 0;
+                 background: var(--panel); }
+  table.map td { padding: .24rem .5rem; border-bottom: 1px solid #e4e2dc;
+                 font-family: ui-monospace, monospace; }
+  td.m-ok { color: var(--ok); font-weight: 700; }
+  td.m-pad { color: var(--bad); font-weight: 700; }
+  td.m-vel { color: var(--warn); font-weight: 700; }
+  .map-wrap { max-height: 330px; overflow-y: auto; border: 1.5px solid var(--ink);
+              border-radius: 10px; }
+  .sumline { font-size: .8rem; color: var(--muted); margin: .18rem 0;
+             font-family: ui-monospace, monospace; }
+  .sumline b { color: var(--ink); font-family: "Helvetica Neue", sans-serif;
+               font-size: .68rem; text-transform: uppercase; letter-spacing: .07em; }
+  iframe.viz { width: 100%; height: 560px; border: 1.5px solid var(--ink); border-radius: 12px;
+               background: var(--screen); }
+</style>
+</head>
+<body>
+<header>
+  <h1>xlerobot cotrain</h1>
+  <nav class="tabs">
+    <button data-view="workflow" class="active">Workflow</button>
+    <button data-view="compare">Compare datasets</button>
+    <button data-view="guide">Guide</button>
+  </nav>
+  <span id="wf-title" style="color:var(--muted)">no workflow selected</span>
+  <span id="run-chip" class="chip" style="display:none"></span>
+  <div class="spacer"></div>
+  <span id="wf-actions">
+    <button id="btn-save">Save</button>
+    <button id="btn-generate">Generate scripts</button>
+    <button id="btn-run" class="primary">Run all</button>
+    <button id="btn-stop" class="danger">Stop</button>
+  </span>
+</header>
+<main>
+  <!-- ============================ WORKFLOW ============================ -->
+  <div class="view active" id="view-workflow">
+    <div id="sidebar">
+      <button id="btn-new">+ New workflow</button>
+      <button id="btn-preset" data-preset="home_tasks">+ Home-tasks preset</button>
+      <button id="btn-preset-master" data-preset="master_umi">+ Master RGB-D / UMI preset</button>
+      <div id="wf-list"></div>
+      <button id="btn-delete" class="danger">Delete workflow</button>
+    </div>
+    <div id="editor"><div class="section" style="margin:2rem;max-width:46rem">
+      <h2>Quick start</h2>
+      <p class="hint" style="font-size:.85rem;line-height:1.6">
+      Pick a workflow on the left, or create one from a preset: <b>Home-tasks</b> (merge →
+      generalist → fine-tunes) or <b>Master RGB-D / UMI</b> (record once → extract subsets →
+      two-stage pre-train). Before adding an external dataset, preflight it in
+      <b>Compare datasets</b>; the full recipe lives in the <b>Guide</b> tab and GUIDE.md.</p>
+      <p class="hint" style="font-size:.85rem;line-height:1.6;margin-top:.6rem">
+      <b>Run</b> and <b>Run all</b> execute stages directly on this machine — no copy-pasting.
+      Every stage is also written to <code style="font-family:ui-monospace">workflows/&lt;name&gt;/scripts/*.sh</code>
+      when you hit <b>Generate scripts</b>, so anything can be re-run by hand or on another box.</p>
+    </div></div>
+    <div id="logpane">
+      <div class="bar">
+        <span style="font-size:.8rem;color:var(--muted)">Log:</span>
+        <select id="log-select" style="width:auto;flex:1"></select>
+        <label class="check" style="padding:0"><input type="checkbox" id="log-follow" checked>follow</label>
+      </div>
+      <pre id="logview"></pre>
+    </div>
+  </div>
+
+  <!-- ============================ COMPARE ============================ -->
+  <div class="view" id="view-compare">
+    <div style="width:100%">
+      <div id="cmp-form">
+        <div class="field"><label>Reference (your 18-DOF xlerobot task repo)</label>
+          <input id="cmp-ref" placeholder="Odog16/tool_pickup" value="Odog16/tool_pickup"></div>
+        <div class="field"><label>Candidate (dataset to align / co-train with)</label>
+          <input id="cmp-cand" placeholder="lerobot/aloha_mobile_cabinet"></div>
+        <div class="field" style="min-width:110px;max-width:110px"><label>Episode</label>
+          <input id="cmp-ep" type="number" min="0" value="0"></div>
+        <button id="btn-compare" class="primary">Compare</button>
+      </div>
+      <div id="cmp-results"><p class="hint" style="max-width:75rem;margin:0 auto">
+        Enter your reference task repo and the external dataset you want to merge. The report
+        shows exactly which joints <code>lerobot-cotrain-align</code> would pad, how far a
+        zero-fill lands from your real motion range, camera/fps compatibility, and the
+        recommended mitigation flags — with side-by-side
+        <a href="https://github.com/huggingface/lerobot-dataset-visualizer" target="_blank"
+           style="color:var(--accent)">HF dataset visualizer</a> embeds to eyeball both datasets.
+      </p></div>
+    </div>
+  </div>
+
+  <!-- ============================ GUIDE ============================ -->
+  <div class="view" id="view-guide"></div>
+</main>
+<div id="toast"></div>
+
+<script>
+"use strict";
+const $ = (s) => document.querySelector(s);
+let wf = null;
+let dirty = false;
+let logOffset = 0, logPath = null;
+let openStages = new Set();      // indices of expanded stage cards
+let lastCompare = null;
+const VIZ_BASE = "https://lerobot-visualize-dataset.hf.space";
+
+/* ------------------------------ field schemas ------------------------------ */
+/* Every option carries a short dense `info` + tiny `pic` depiction, shown by
+   the "?" key next to its label. Keep additions terse — one glance, one idea. */
+const STAGE_FIELDS = {
+  merge: [
+    {k:"source_repos", label:"Source repos (space/newline separated)", type:"textarea", wide:true,
+     ph:"Odog16/trash_pickup Odog16/tool_pickup lerobot/aloha_mobile_cabinet",
+     info:"Datasets to combine. Each is aligned to the shared schema, then merged; episode order follows this list.",
+     pic:"A ▮▮  B ▮▮▮  C ▮\n └────┴─────┴──▶ ▮▮▮▮▮▮"},
+    {k:"target_repo_id", label:"Target repo id", ph:"Odog16/xlerobot_cotrain_v1",
+     info:"Name of the merged output (user/name). Lands in ~/.cache/huggingface/lerobot/."},
+    {k:"match_features_from", label:"Match features from (reference)", ph:"Odog16/tool_pickup",
+     info:"Repo whose joint NAMES define the schema. Sources map dims by name to it; required for non-zero fill modes.",
+     pic:"ref: [l.pan l.lift … gantry]\nsrc:  l.pan→0  l.lift→1  ?→fill"},
+    {k:"target_fps", label:"Target fps", ph:"30",
+     info:"Sources above this rate are downsampled (nearest-neighbour). Merge runs at the LOWEST source fps ≤ this.",
+     pic:"50fps ▮▯▮▯▮▯ → 30fps ▮▮▮"},
+    {k:"target_image_size", label:"Image size HxW", ph:"360x640",
+     info:"All cameras resized to this. Blank = smallest H×W across sources.",
+     pic:"640×480 ▭ → 360×640 ▬"},
+    {k:"target_state_dim", label:"State dim", ph:"18",
+     info:"Output vector length = len(reference names). 18 for xlerobot, 12 for bimanual subsets."},
+    {k:"target_action_dim", label:"Action dim", ph:"18",
+     info:"Same as state dim in this fork's schemas."},
+    {k:"pad_fill_mode", label:"Pad fill mode", type:"select",
+     opts:["zero","ref-mean","state-copy"],
+     info:"Value written into dims a source can't supply. zero teaches 'frozen joints'; ref-mean sits at your robot's mean pose; state-copy also makes actions 'hold position'. Velocity dims always stay 0.",
+     pic:"missing dim ─▶ fill\n zero       0.0\n ref-mean   x̄  (your mean)\n state-copy a[i] = s[i]"},
+    {k:"override_padded_stats", label:"Override padded stats with reference", type:"check",
+     info:"After merging, padded dims keep YOUR mean/std/min/max instead of fill-diluted ones — your real motion stops normalizing into outliers.",
+     pic:"stats[padded] ◀── reference\nstats[real]   = merged"},
+    {k:"force_rebuild", label:"Force rebuild caches", type:"check",
+     info:"Delete _align_tmp_* caches and re-encode every source. Slow; stale caches are usually auto-detected."},
+    {k:"skip_missing_sources", label:"Skip missing sources", type:"check",
+     info:"A 404/missing repo logs a warning and is skipped instead of aborting the merge."},
+    {k:"push_to_hub", label:"Push merged dataset to Hub", type:"check",
+     info:"Upload the merged dataset to target repo id after merging (needs huggingface-cli login)."},
+    {k:"extra_args", label:"Extra CLI args", wide:true, ph:"--camera-remap top:head,...",
+     info:"Raw flags appended verbatim to lerobot-cotrain-align — e.g. a custom --camera-remap.",
+     pic:"--camera-remap top:head,\n  wrist_image:left_wrist"},
+  ],
+  train: [
+    {k:"dataset_repo_id", label:"Dataset repo id", ph:"Odog16/xlerobot_cotrain_v1",
+     info:"Training data: a merged co-train dataset (pre-train) or a single task repo (fine-tune)."},
+    {k:"dataset_root", label:"Dataset root (optional)", ph:"$HOME/.cache/huggingface/lerobot/...",
+     info:"Local path override. Source weighting reads meta/cotrain_sources.json from here (or the HF cache)."},
+    {k:"policy_type", label:"Policy type", ph:"smolvla",
+     info:"smolvla / act / diffusion / pi0 … — the policy architecture to train."},
+    {k:"pretrained_path", label:"Pretrained path", wide:true,
+     ph:"lerobot/smolvla_base or outputs/train/.../checkpoints/last/pretrained_model",
+     info:"Starting weights: a base model for pre-training, or a previous stage's checkpoint to continue from.",
+     pic:"smolvla_base ─▶ stage1 ─▶\nstage2 ─▶ specialist"},
+    {k:"steps", label:"Steps", ph:"60000",
+     info:"Optimizer steps. Rules of thumb: 60k generalist, 40k+30k two-stage, 20k fine-tune."},
+    {k:"batch_size", label:"Batch size", ph:"16",
+     info:"Per-GPU batch. 16 fits SmolVLA on a 24 GB card with AMP."},
+    {k:"save_freq", label:"Save freq", ph:"10000",
+     info:"Checkpoint every N steps → output_dir/checkpoints/."},
+    {k:"peak_lr", label:"Peak LR", ph:"5e-5",
+     info:"Scheduler peak. Fine-tunes want a LOW peak (5e-5) so the generalist isn't wiped."},
+    {k:"scheduler_type", label:"Scheduler", ph:"cosine_decay_with_warmup",
+     info:"LR curve. cosine_decay_with_warmup is the fine-tune default; blank = policy default.",
+     pic:"lr ▁▄█▇▅▃▂▁  warmup→decay"},
+    {k:"output_dir", label:"Output dir", ph:"outputs/train/my_run",
+     info:"Checkpoints + logs land here. Later stages point pretrained_path at .../checkpoints/last/pretrained_model."},
+    {k:"weighting", label:"Sample weighting", type:"select", opts:["none","source","rabc"],
+     info:"Per-sample loss weights. source: shrink padded external episodes' gradient. rabc: weight by SARM progress (needs sarm stage first).",
+     pic:"none   ● ● ●  all 1.0\nsource ●1.0 native ◌0.3 ext\nrabc   ●∝ demo quality"},
+    {k:"external_weight", label:"External source weight", ph:"0.3",
+     show:(p)=>p.weighting==="source",
+     info:"Loss weight (0–1) for episodes from padded external sources; native episodes stay 1.0. More padding → lower weight.",
+     pic:"11/18 padded → 0.2–0.3\n 4/18 padded → 0.5"},
+    {k:"rabc_head_mode", label:"RA-BC head mode", ph:"sparse", show:(p)=>p.weighting==="rabc",
+     info:"Must match the head used at SARM annotation time (sparse = milestones, dense = per-frame)."},
+    {k:"rabc_kappa", label:"RA-BC kappa", ph:"0.01", show:(p)=>p.weighting==="rabc",
+     info:"Progress threshold for 'high-quality' samples. Smaller = stricter."},
+    {k:"train_state_proj", label:"Train state projection", type:"check",
+     info:"Re-learn the state/action projection layers. REQUIRED when input dims change between stages (12→18).",
+     pic:"12-dim ─▶ [proj] ─▶ model\n18-dim ─▶ [proj*] re-init"},
+    {k:"use_amp", label:"Use AMP", type:"check",
+     info:"Mixed precision: ~2× faster, less VRAM, same quality for these policies."},
+    {k:"wandb_enable", label:"Weights & Biases", type:"check",
+     info:"Stream loss curves + sample-weight stats to wandb.ai."},
+    {k:"wandb_project", label:"W&B project", ph:"lerobot", show:(p)=>!!p.wandb_enable,
+     info:"Project name runs are grouped under."},
+    {k:"resume", label:"Resume from output dir", type:"check",
+     info:"Continue an interrupted run from the last checkpoint in output_dir."},
+    {k:"extra_args", label:"Extra CLI args", wide:true, ph:"--policy.chunk_size=50",
+     info:"Raw flags appended verbatim to lerobot-train."},
+  ],
+  extract: [
+    {k:"source_repo", label:"Master dataset repo", ph:"Odog16/master_home_v1",
+     info:"The full recording — e.g. 18 DOF + RGB-D. Never modified; the subset is a new dataset."},
+    {k:"target_repo_id", label:"Subset repo id", ph:"Odog16/master_home_v1_bimanual12",
+     info:"Name for the derived dataset."},
+    {k:"profile", label:"Joint profile", type:"select",
+     opts:["bimanual12","arms_head14","full18"],
+     info:"Named dim subsets, selected by joint NAME. bimanual12 = both arms only — shapes match open-source bimanual data, zero padding needed. Ignored if keep-names is set.",
+     pic:"18-DOF master\n├ bimanual12   arms (12)\n├ arms_head14  +head (14)\n└ full18       everything"},
+    {k:"keep_names", label:"Keep names (overrides profile)", wide:true,
+     ph:"left_arm_shoulder_pan.pos right_arm_gripper.pos ...",
+     info:"Explicit joint list; order here = dim order in the subset."},
+    {k:"cameras", label:"Cameras to keep (blank = all RGB)", ph:"head left_wrist right_wrist",
+     info:"Short camera names to keep. Blank keeps every non-depth camera."},
+    {k:"target_fps", label:"Target fps (blank = source)", ph:"30",
+     info:"Optional downsample while extracting (nearest-neighbour; never upsamples)."},
+    {k:"target_image_size", label:"Image size HxW", ph:"360x640",
+     info:"Optional resize of RGB frames during extraction."},
+    {k:"robot_type", label:"Robot type override", ph:"xlerobot",
+     info:"Metadata label for the subset. Blank keeps the source's."},
+    {k:"keep_depth", label:"Keep depth streams", type:"check",
+     info:"OFF (default) strips *_depth — 18-DOF RGB-D master → RGB-only subset that shape-matches external data. ON keeps depth for depth-aware training.",
+     pic:"head ▣ + head_depth ▨\n  └─▶ head ▣   (default)"},
+    {k:"force_rebuild", label:"Overwrite existing output", type:"check",
+     info:"Delete an existing subset at the output path and re-extract."},
+    {k:"push_to_hub", label:"Push subset to Hub", type:"check",
+     info:"Upload the subset after extraction."},
+    {k:"extra_args", label:"Extra CLI args", wide:true,
+     info:"Raw flags appended verbatim to lerobot-extract-subset."},
+  ],
+  sarm: [
+    {k:"dataset_repo_id", label:"Dataset repo to annotate", ph:"Odog16/trash_pickup",
+     info:"Every frame gets a task-progress score. Run AFTER merges/extracts — indices must match the training dataset.",
+     pic:"frames ▁▂▄▅▇█ progress 0→1"},
+    {k:"reward_model_path", label:"SARM reward model", ph:"Odog16/sarm_xlerobot",
+     info:"A trained SARM checkpoint (Hub id or local path). Scores are only as good as this model."},
+    {k:"output_path", label:"Output path", ph:"auto = <root>/sarm_progress.parquet",
+     info:"Where scores land. RA-BC training auto-finds the default location."},
+    {k:"head_mode", label:"Head mode", type:"select", opts:["sparse","dense"],
+     info:"sparse = milestone-based progress, dense = per-frame. Must equal rabc_head_mode at train time."},
+    {k:"device", label:"Device", ph:"cuda",
+     info:"cuda strongly recommended — it's a VLM forward pass per frame."},
+    {k:"stride", label:"Stride (frames)", ph:"1",
+     info:"Score every Nth frame; others interpolate. Higher = faster, coarser."},
+    {k:"tolerance_s", label:"Timestamp tolerance (s)", ph:"0.05",
+     info:"Allowed video/metadata timestamp drift when decoding frames."},
+    {k:"push_to_hub", label:"Push annotations to Hub", type:"check",
+     info:"Upload the parquet next to the dataset repo."},
+    {k:"extra_args", label:"Extra CLI args", wide:true,
+     info:"Raw flags appended verbatim to compute_rabc_weights."},
+  ],
+  custom: [
+    {k:"script", label:"Bash script body", type:"textarea", rows:8, wide:true,
+     ph:"uv run lerobot-eval ...",
+     info:"Runs from the repo root with set -euo pipefail and a cleared PYTHONPATH. {{VARS}} are substituted. Use for eval, rollout, uploads — anything without a dedicated stage.",
+     pic:"#!/bin/bash  cd repo root\nset -euo pipefail\n<your lines>"},
+  ],
+};
+
+/* stage-type explainers — shown by clicking the colored type badge */
+const STAGE_TYPE_INFO = {
+  merge:   {info:"lerobot-cotrain-align: aligns every source (fps, size, joint names) and merges them into ONE dataset with one set of normalization stats.",
+            pic:"A ▮▮ B ▮▮▮ C ▮ ─▶ ▮▮▮▮▮▮\n     one schema, one stats"},
+  train:   {info:"lerobot-train: pre-train a generalist on a merge, or fine-tune a specialist from a checkpoint. Weighting options plug in here.",
+            pic:"data ▮▮▮ + weights ●◌●\n   └─▶ checkpoint ⬒"},
+  extract: {info:"lerobot-extract-subset: derive a reduced view from a master recording — fewer joints (by name), no depth, other fps/size. Master is untouched.",
+            pic:"master 18DOF+depth ▣▨\n  └─▶ subset 12DOF RGB ▣"},
+  sarm:    {info:"SARM annotation: score every frame's task progress into sarm_progress.parquet, consumed by RA-BC weighting at train time.",
+            pic:"video ▶ SARM ▶ ▁▃▅▇ 0→1"},
+  custom:  {info:"Any bash you want in the sequence — eval, rollout, dataset upload. Same variables, logs, and fail-fast behaviour as other stages.",
+            pic:"$ <anything> …"},
+};
+const STAGE_TEMPLATES = {
+  merge:   {name:"Merge datasets", type:"merge", enabled:true,
+            params:{target_fps:"30", target_state_dim:"18", target_action_dim:"18",
+                    pad_fill_mode:"ref-mean", override_padded_stats:true}},
+  pretrain:{name:"Generalist pre-train", type:"train", enabled:true,
+            params:{policy_type:"smolvla", pretrained_path:"lerobot/smolvla_base",
+                    steps:"60000", batch_size:"16", save_freq:"10000",
+                    train_state_proj:true, use_amp:true, weighting:"source",
+                    external_weight:"0.3"}},
+  finetune:{name:"Fine-tune specialist", type:"train", enabled:true,
+            params:{policy_type:"smolvla", steps:"20000", batch_size:"16",
+                    scheduler_type:"cosine_decay_with_warmup", peak_lr:"5e-5",
+                    weighting:"none"}},
+  extract: {name:"Extract subset from master", type:"extract", enabled:true,
+            params:{profile:"bimanual12", target_image_size:"360x640"}},
+  sarm:    {name:"SARM annotate (→ RA-BC)", type:"sarm", enabled:true,
+            params:{head_mode:"sparse", device:"cuda"}},
+  custom:  {name:"Custom script", type:"custom", enabled:true, params:{script:""}},
+};
+
+/* ------------------------------ api helpers ------------------------------ */
+async function api(path, body) {
+  const res = await fetch(path, body === undefined ? {} :
+    {method:"POST", headers:{"Content-Type":"application/json"}, body:JSON.stringify(body)});
+  const data = await res.json().catch(() => ({}));
+  if (!res.ok) throw new Error(data.error || res.statusText);
+  return data;
+}
+function toast(msg, isError) {
+  const t = $("#toast");
+  t.textContent = msg; t.className = isError ? "error" : ""; t.style.display = "block";
+  clearTimeout(t._h); t._h = setTimeout(() => t.style.display = "none", isError ? 6000 : 2800);
+}
+function el(tag, attrs = {}, ...children) {
+  const e = document.createElement(tag);
+  for (const [k, v] of Object.entries(attrs)) {
+    if (k === "class") e.className = v;
+    else if (k.startsWith("on")) e[k] = v;
+    else if (k === "text") e.textContent = v;
+    else e.setAttribute(k, v);
+  }
+  e.append(...children);
+  return e;
+}
+
+/* ------------------------------ info popovers ------------------------------ */
+function closePops() { document.querySelectorAll(".pop").forEach(p => p.remove()); }
+function togglePop(host, entry) {
+  const existing = host.querySelector(".pop");
+  closePops();
+  if (existing) return;                              // second click closes
+  const pop = el("div", {class: "pop", onclick: (e) => e.stopPropagation()});
+  if (entry.pic) pop.appendChild(el("pre", {class: "pic", text: entry.pic}));
+  if (entry.info) pop.appendChild(el("p", {text: entry.info}));
+  host.appendChild(pop);
+  const r = pop.getBoundingClientRect();             // keep on-screen
+  if (r.right > innerWidth - 8) { pop.style.left = "auto"; pop.style.right = "0"; }
+}
+function infoBtn(entry) {
+  const b = el("button", {class: "small info-btn", text: "?", title: "What does this do?"});
+  b.onclick = (ev) => {
+    ev.stopPropagation(); ev.preventDefault();
+    togglePop(b.closest(".field, .check, .typewrap"), entry);
+  };
+  return b;
+}
+document.addEventListener("click", () => closePops());
+
+/* ------------------------------ tabs ------------------------------ */
+document.querySelectorAll("nav.tabs button").forEach(b => b.onclick = () => {
+  document.querySelectorAll("nav.tabs button").forEach(x => x.classList.toggle("active", x === b));
+  document.querySelectorAll(".view").forEach(v =>
+    v.classList.toggle("active", v.id === "view-" + b.dataset.view));
+  $("#wf-actions").style.visibility = b.dataset.view === "workflow" ? "visible" : "hidden";
+});
+
+/* ------------------------------ sidebar ------------------------------ */
+async function refreshList(selectName) {
+  const {workflows} = await api("/api/workflows");
+  const list = $("#wf-list"); list.innerHTML = "";
+  for (const name of workflows) {
+    list.appendChild(el("div", {class: "wf-item" + (wf && wf.name === name ? " active" : ""),
+                               text: name, onclick: () => loadWorkflow(name)}));
+  }
+  if (selectName) await loadWorkflow(selectName);
+}
+async function loadWorkflow(name) {
+  if (dirty && !confirm("Discard unsaved changes?")) return;
+  wf = await api("/api/workflow?name=" + encodeURIComponent(name));
+  dirty = false; logPath = null; logOffset = 0; openStages = new Set();
+  $("#logview").textContent = "";
+  render(); refreshListHighlight(); pollStatus(true);
+}
+function refreshListHighlight() {
+  document.querySelectorAll(".wf-item").forEach(e =>
+    e.classList.toggle("active", wf && e.textContent === wf.name));
+}
+
+/* ------------------------------ workflow rendering ------------------------------ */
+function markDirty() { dirty = true; }
+
+function render() {
+  $("#wf-title").textContent = wf ? wf.name : "no workflow selected";
+  const ed = $("#editor"); ed.innerHTML = "";
+  if (!wf) return;
+
+  const varSec = el("div", {class: "section"});
+  varSec.appendChild(el("h2", {text: "Variables — use {{NAME}} in any stage field"}));
+  const vars = wf.variables || (wf.variables = {});
+  for (const key of Object.keys(vars)) {
+    const ki = el("input", {value: key});
+    const vi = el("input", {value: vars[key]});
+    ki.onchange = () => { const v = vars[key]; delete vars[key]; vars[ki.value] = v; markDirty(); render(); };
+    vi.oninput = () => { vars[key] = vi.value; markDirty(); };
+    varSec.appendChild(el("div", {class: "var-row"}, ki, vi,
+      el("button", {class: "small danger", text: "✕",
+                    onclick: () => { delete vars[key]; markDirty(); render(); }})));
+  }
+  varSec.appendChild(el("button", {class: "small", text: "+ variable",
+    onclick: () => { vars["NEW_VAR"] = ""; markDirty(); render(); }}));
+  ed.appendChild(varSec);
+
+  const stSec = el("div", {class: "section"});
+  stSec.appendChild(el("h2", {text: "Stages — run top to bottom (click a stage to edit)"}));
+  (wf.stages || (wf.stages = [])).forEach((stage, i) => stSec.appendChild(renderStage(stage, i)));
+  const addBar = el("div", {style: "display:flex;gap:.5rem;flex-wrap:wrap"});
+  for (const [tpl, label] of [["merge","+ Merge"],["pretrain","+ Pre-train"],
+                              ["finetune","+ Fine-tune"],["extract","+ Extract subset"],
+                              ["sarm","+ SARM annotate"],["custom","+ Custom"]]) {
+    addBar.appendChild(el("button", {class: "small", text: label, onclick: () => {
+      wf.stages.push(structuredClone(STAGE_TEMPLATES[tpl]));
+      openStages.add(wf.stages.length - 1); markDirty(); render();
+    }}));
+  }
+  stSec.appendChild(addBar);
+  ed.appendChild(stSec);
+}
+
+function stageSummary(stage) {
+  const p = stage.params || {};
+  if (stage.type === "merge")
+    return `${(p.source_repos || "").trim().split(/\s+/).filter(Boolean).length} sources → ${p.target_repo_id || "?"} · fill=${p.pad_fill_mode || "zero"}`;
+  if (stage.type === "train")
+    return `${p.dataset_repo_id || "?"} · ${p.steps || "?"} steps → ${p.output_dir || "?"}`;
+  if (stage.type === "extract")
+    return `${p.source_repo || "?"} → ${p.target_repo_id || "?"} · ${p.keep_names ? "custom dims" : (p.profile || "bimanual12")}${p.keep_depth ? " +depth" : " RGB-only"}`;
+  if (stage.type === "sarm")
+    return `${p.dataset_repo_id || "?"} · ${p.head_mode || "sparse"} head → sarm_progress.parquet`;
+  return (p.script || "").split("\n")[0].slice(0, 40) || "(empty)";
+}
+
+function renderStage(stage, i) {
+  const open = openStages.has(i);
+  const card = el("div", {class: `stage t-${stage.type}` +
+    (stage.enabled === false ? " disabled" : "") + (open ? " open" : "")});
+  const head = el("div", {class: "head"});
+  head.onclick = (ev) => {
+    if (["INPUT","BUTTON","SELECT","TEXTAREA"].includes(ev.target.tagName)) return;
+    open ? openStages.delete(i) : openStages.add(i); render();
+  };
+
+  const en = el("input", {type: "checkbox", title: "Enabled"});
+  en.checked = stage.enabled !== false;
+  en.onchange = () => { stage.enabled = en.checked; markDirty(); render(); };
+  const name = el("input", {class: "name", value: stage.name || ""});
+  name.oninput = () => { stage.name = name.value; markDirty(); };
+  const chip = el("span", {class: "chip", "data-stage": i, style: "display:none"});
+
+  const typewrap = el("span", {class: "typewrap"},
+                      el("span", {class: "typechip", text: stage.type,
+                                  style: "cursor:help", title: "Click: what this stage does"}));
+  typewrap.firstChild.onclick = (ev) => {
+    ev.stopPropagation();
+    const entry = STAGE_TYPE_INFO[stage.type];
+    if (entry) togglePop(typewrap, entry);
+  };
+  head.append(
+    el("span", {class: "chev", text: open ? "▾" : "▸"}),
+    en, el("span", {style: "color:var(--muted)", text: (i + 1) + "."}), name,
+    typewrap,
+    el("span", {class: "summary", text: stageSummary(stage)}),
+    chip, el("span", {class: "spacer"}),
+    el("button", {class: "small", text: "↑", onclick: () => moveStage(i, -1)}),
+    el("button", {class: "small", text: "↓", onclick: () => moveStage(i, 1)}),
+    el("button", {class: "small", text: "⧉", onclick: () => {
+      wf.stages.splice(i + 1, 0, structuredClone(stage)); markDirty(); render(); }}),
+    el("button", {class: "small danger", text: "✕", onclick: () => {
+      if (confirm("Delete stage?")) { wf.stages.splice(i, 1); openStages.delete(i); markDirty(); render(); }}}),
+    el("button", {class: "small", text: "script", onclick: () => togglePreview(card, i)}),
+    el("button", {class: "small primary", text: "run", onclick: () => runWorkflow(i)}),
+  );
+  card.appendChild(head);
+
+  const body = el("div", {class: "body"});
+  const grid = el("div", {class: "field-grid"});
+  const params = stage.params || (stage.params = {});
+  for (const f of STAGE_FIELDS[stage.type] || []) {
+    if (f.show && !f.show(params)) continue;
+    grid.appendChild(renderField(f, params));
+  }
+  body.appendChild(grid);
+  card.appendChild(body);
+  return card;
+}
+
+function renderField(f, params) {
+  if (f.type === "check") {
+    const cb = el("input", {type: "checkbox"});
+    cb.checked = !!params[f.k];
+    cb.onchange = () => { params[f.k] = cb.checked; markDirty(); render(); };
+    const wrap = el("div", {class: "check" + (f.wide ? " wide" : "")},
+                    cb, el("span", {text: f.label}));
+    if (f.info || f.pic) wrap.appendChild(infoBtn(f));
+    return wrap;
+  }
+  const label = el("label", {text: f.label});
+  if (f.info || f.pic) label.appendChild(infoBtn(f));
+  const wrap = el("div", {class: "field" + (f.wide ? " wide" : "")}, label);
+  let input;
+  if (f.type === "select") {
+    input = el("select");
+    for (const o of f.opts) input.appendChild(el("option", {value: o, text: o}));
+    input.value = params[f.k] || f.opts[0];
+    input.onchange = () => { params[f.k] = input.value; markDirty(); render(); };
+  } else if (f.type === "textarea") {
+    input = el("textarea", {rows: f.rows || 3, placeholder: f.ph || ""});
+    input.value = params[f.k] || "";
+    input.oninput = () => { params[f.k] = input.value; markDirty(); };
+  } else {
+    input = el("input", {placeholder: f.ph || ""});
+    input.value = params[f.k] ?? "";
+    input.oninput = () => { params[f.k] = input.value; markDirty(); };
+  }
+  wrap.appendChild(input);
+  return wrap;
+}
+
+function moveStage(i, d) {
+  const j = i + d;
+  if (j < 0 || j >= wf.stages.length) return;
+  [wf.stages[i], wf.stages[j]] = [wf.stages[j], wf.stages[i]];
+  const oi = openStages.has(i), oj = openStages.has(j);
+  openStages.delete(i); openStages.delete(j);
+  if (oi) openStages.add(j); if (oj) openStages.add(i);
+  markDirty(); render();
+}
+
+async function togglePreview(card, i) {
+  const old = card.querySelector("pre.preview");
+  if (old) { old.remove(); return; }
+  try {
+    await saveWorkflow(true);
+    const {scripts} = await api("/api/generate", {name: wf.name});
+    const entry = scripts.find(s => s.index === i);
+    openStages.add(i);
+    const pre = el("pre", {class: "preview",
+      text: entry ? `# ${entry.path}\n` + entry.script : "(stage disabled)"});
+    card.classList.add("open");
+    card.querySelector(".body").appendChild(pre);
+  } catch (e) { toast(e.message, true); }
+}
+
+/* ------------------------------ actions ------------------------------ */
+async function saveWorkflow(quiet) {
+  if (!wf) return;
+  await api("/api/workflow", wf);
+  dirty = false;
+  if (!quiet) toast("Saved.");
+}
+async function runWorkflow(stage) {
+  if (!wf) return;
+  try {
+    await saveWorkflow(true);
+    await api("/api/run", stage === undefined ? {name: wf.name} : {name: wf.name, stage});
+    toast(stage === undefined ? "Running workflow…" : "Running stage…");
+    pollStatus(true);
+  } catch (e) { toast(e.message, true); }
+}
+
+/* ------------------------------ status + logs ------------------------------ */
+let lastStages = [];
+async function pollStatus(force) {
+  if (!wf) return;
+  try {
+    const st = await api("/api/status?name=" + encodeURIComponent(wf.name));
+    const chip = $("#run-chip");
+    if (st.status && st.status !== "idle") {
+      chip.style.display = ""; chip.textContent = st.status;
+      chip.className = "chip " + st.status;
+    } else chip.style.display = "none";
+    if (st.error && force) toast(st.error, true);
+    lastStages = st.stages || [];
+    document.querySelectorAll(".chip[data-stage]").forEach(e => {
+      const s = lastStages.find(x => x.index === +e.dataset.stage);
+      if (s) { e.style.display = ""; e.textContent = s.status; e.className = "chip " + s.status; }
+      else e.style.display = "none";
+    });
+    const sel = $("#log-select");
+    const sig = lastStages.map(s => s.log).join("|");
+    if (sel.dataset.sig !== sig) {
+      sel.dataset.sig = sig; sel.innerHTML = "";
+      for (const s of lastStages)
+        sel.appendChild(el("option", {value: s.log, text: (s.index + 1) + ". " + s.name}));
+      const running = lastStages.find(s => s.status === "running");
+      if (running) sel.value = running.log;
+      if (sel.value && sel.value !== logPath) { logPath = sel.value; logOffset = 0; $("#logview").textContent = ""; }
+    } else if ($("#log-follow").checked) {
+      const running = lastStages.find(s => s.status === "running");
+      if (running && running.log !== logPath) {
+        sel.value = running.log; logPath = running.log; logOffset = 0; $("#logview").textContent = "";
+      }
+    }
+    await pollLog();
+  } catch (e) { /* transient */ }
+}
+async function pollLog() {
+  if (!logPath) return;
+  const res = await api(`/api/log?path=${encodeURIComponent(logPath)}&offset=${logOffset}`);
+  if (res.offset < logOffset) $("#logview").textContent = "";
+  if (res.data) {
+    const v = $("#logview");
+    v.textContent += res.data; logOffset = res.offset;
+    if (v.textContent.length > 400000) v.textContent = v.textContent.slice(-300000);
+    if ($("#log-follow").checked) v.scrollTop = v.scrollHeight;
+  } else logOffset = res.offset;
+}
+$("#log-select").onchange = () => {
+  logPath = $("#log-select").value; logOffset = 0; $("#logview").textContent = ""; pollLog();
+};
+setInterval(pollStatus, 2000);
+
+/* ------------------------------ toolbar ------------------------------ */
+$("#btn-save").onclick = () => saveWorkflow().catch(e => toast(e.message, true));
+$("#btn-generate").onclick = async () => {
+  if (!wf) return;
+  try {
+    await saveWorkflow(true);
+    const {scripts} = await api("/api/generate", {name: wf.name});
+    toast(`Generated ${scripts.length} script(s) in workflows/${wf.name}/scripts/`);
+  } catch (e) { toast(e.message, true); }
+};
+$("#btn-run").onclick = () => runWorkflow();
+$("#btn-stop").onclick = async () => {
+  if (!wf) return;
+  try { await api("/api/stop", {name: wf.name}); toast("Stopping…"); }
+  catch (e) { toast(e.message, true); }
+};
+$("#btn-new").onclick = async () => {
+  const name = prompt("Workflow name ([A-Za-z0-9._-]+):", "my_workflow");
+  if (!name) return;
+  wf = {name, variables: {}, stages: []};
+  try { await saveWorkflow(true); await refreshList(name); }
+  catch (e) { toast(e.message, true); }
+};
+async function loadPreset(which) {
+  try {
+    const preset = await api("/api/preset?which=" + encodeURIComponent(which));
+    const name = prompt("Name for the preset workflow:", preset.name);
+    if (!name) return;
+    preset.name = name; wf = preset;
+    await saveWorkflow(true); await refreshList(name);
+  } catch (e) { toast(e.message, true); }
+}
+$("#btn-preset").onclick = () => loadPreset("home_tasks");
+$("#btn-preset-master").onclick = () => loadPreset("master_umi");
+$("#btn-delete").onclick = async () => {
+  if (!wf || !confirm(`Delete workflow '${wf.name}' (scripts + logs)?`)) return;
+  try {
+    await api("/api/workflow/delete", {name: wf.name});
+    wf = null; dirty = false; render(); await refreshList();
+  } catch (e) { toast(e.message, true); }
+};
+window.addEventListener("beforeunload", (e) => { if (dirty) e.preventDefault(); });
+
+/* ============================== COMPARE TAB ============================== */
+$("#btn-compare").onclick = runCompare;
+$("#cmp-cand").addEventListener("keydown", e => { if (e.key === "Enter") runCompare(); });
+$("#cmp-ep").onchange = () => { if (lastCompare) renderCompare(lastCompare); };
+
+async function runCompare() {
+  const ref = $("#cmp-ref").value.trim(), cand = $("#cmp-cand").value.trim();
+  if (!ref || !cand) { toast("Enter both repo ids.", true); return; }
+  $("#cmp-results").innerHTML = "<p class='hint'>Comparing… (fetching metadata, first Hub fetch can take a few seconds)</p>";
+  try {
+    lastCompare = await api(`/api/compare?ref=${encodeURIComponent(ref)}&cand=${encodeURIComponent(cand)}`);
+    renderCompare(lastCompare);
+  } catch (e) {
+    $("#cmp-results").innerHTML = "";
+    toast(e.message, true);
+  }
+}
+
+function sumCard(title, s) {
+  const d = el("div", {class: "section"});
+  d.appendChild(el("h2", {text: title + " — " + s.repo}));
+  const lines = [
+    ["robot / source", `${s.robot_type || "?"} · ${s.source}`],
+    ["episodes / frames", `${s.episodes} / ${s.frames}`],
+    ["fps", s.fps], ["state / action dims", `${s.state_dim} / ${s.action_dim}`],
+    ["stats.json", s.has_stats ? "yes" : "no — ref-mean fill unavailable"],
+  ];
+  for (const [k, v] of lines) {
+    const line = el("div", {class: "sumline"});
+    line.append(el("b", {text: k + ": "}), document.createTextNode(String(v)));
+    d.appendChild(line);
+  }
+  return d;
+}
+
+function mapTable(rows, dropped, label) {
+  const wrap = el("div", {class: "section"});
+  wrap.appendChild(el("h2", {text: label}));
+  const scroller = el("div", {class: "map-wrap"});
+  const tbl = el("table", {class: "map"});
+  tbl.appendChild(el("tr", {},
+    el("th", {text: "#"}), el("th", {text: "reference joint"}), el("th", {text: "candidate"}),
+    el("th", {text: "ref mean ± std"}), el("th", {text: "zero-fill lands"})));
+  for (const r of rows) {
+    const cls = r.mapped ? "m-ok" : (r.vel ? "m-vel" : "m-pad");
+    const status = r.mapped ? "✓ mapped" : (r.vel ? "padded (vel → 0 OK)" : "✗ PADDED");
+    const ms = r.ref_mean === null ? "—" : `${r.ref_mean} ± ${r.ref_std}`;
+    let z = "—";
+    if (!r.mapped && !r.vel && r.zero_sigma !== null)
+      z = r.zero_sigma + "σ from mean" + (r.zero_sigma >= 2 ? " ⚠" : "");
+    tbl.appendChild(el("tr", {},
+      el("td", {text: r.dim}), el("td", {text: r.name}),
+      el("td", {class: cls, text: status}),
+      el("td", {text: ms}), el("td", {class: r.zero_sigma >= 2 && !r.mapped && !r.vel ? "m-pad" : "", text: z})));
+  }
+  scroller.appendChild(tbl);
+  wrap.appendChild(scroller);
+  if (dropped.length)
+    wrap.appendChild(el("p", {class: "hint",
+      text: "Dropped candidate dims (not in reference): " + dropped.join(", ")}));
+  return wrap;
+}
+
+function renderCompare(d) {
+  const ep = Math.max(0, +$("#cmp-ep").value || 0);
+  const res = $("#cmp-results"); res.innerHTML = "";
+
+  /* issues */
+  const iss = el("div", {class: "section"});
+  iss.appendChild(el("h2", {text: "Issues & fixes"}));
+  for (const i of d.issues) {
+    const box = el("div", {class: "issue " + i.severity});
+    box.append(el("b", {text: i.title}), el("p", {text: i.text}));
+    iss.appendChild(box);
+  }
+  const rec = d.recommendation;
+  if (rec.pad_fill_mode !== "zero") {
+    const bar = el("div", {style: "display:flex;gap:.6rem;align-items:center;flex-wrap:wrap;margin-top:.4rem"});
+    bar.appendChild(el("code", {text:
+      `--pad-fill-mode ${rec.pad_fill_mode}` +
+      (rec.override_padded_stats ? " --override-padded-stats" : "") +
+      (rec.weighting === "source" ? `  |  train: --sample_weighting.type=source --sample_weighting.external_weight=${rec.external_weight}` : "")}));
+    bar.appendChild(el("button", {class: "primary small", text: "Apply to workflow",
+      onclick: () => applyRecommendation(d)}));
+    bar.appendChild(el("span", {class: "hint",
+      text: wf ? `applies to merge + train stages of '${wf.name}'` : "open a workflow first"}));
+    iss.appendChild(bar);
+  }
+  res.appendChild(iss);
+
+  /* summaries */
+  const cols = el("div", {class: "cmp-cols"},
+    sumCard("Reference", d.ref), sumCard("Candidate", d.cand));
+  res.appendChild(cols);
+
+  /* mapping tables */
+  res.appendChild(el("div", {class: "cmp-cols"},
+    mapTable(d.action, d.action_dropped, "Action mapping (what the policy is trained to output)"),
+    mapTable(d.state, d.state_dropped, "State mapping (what the policy observes)")));
+
+  /* cameras */
+  const cams = el("div", {class: "section"});
+  cams.appendChild(el("h2", {text: "Cameras (default remap; merged set = intersection)"}));
+  const ct = el("table", {class: "map"});
+  ct.appendChild(el("tr", {}, el("th", {text: "candidate cam"}), el("th", {text: "maps to"}),
+    el("th", {text: "shape"}), el("th", {text: "in reference?"})));
+  for (const c of d.cameras) {
+    ct.appendChild(el("tr", {},
+      el("td", {text: c.cand_cam || "(reference only)"}),
+      el("td", {text: c.maps_to + (c.duplicate ? " (duplicate, dropped)" : "")}),
+      el("td", {text: (c.shape || []).join("×")}),
+      el("td", {class: c.in_ref ? "m-ok" : "m-pad", text: c.in_ref ? "✓" : "✗ dropped from merge"})));
+  }
+  cams.appendChild(ct);
+  res.appendChild(cams);
+
+  /* visualizers */
+  const viz = el("div", {class: "section"});
+  viz.appendChild(el("h2", {text: `Dataset visualizer — episode ${ep} (HF Space, needs internet; public repos only)`}));
+  viz.appendChild(el("div", {class: "cmp-cols"},
+    el("div", {}, el("p", {class: "hint", text: d.ref.repo}),
+      el("iframe", {class: "viz", src: `${VIZ_BASE}/${d.ref.repo}/episode_${ep}`, loading: "lazy"})),
+    el("div", {}, el("p", {class: "hint", text: d.cand.repo}),
+      el("iframe", {class: "viz", src: `${VIZ_BASE}/${d.cand.repo}/episode_${ep}`, loading: "lazy"}))));
+  res.appendChild(viz);
+}
+
+async function applyRecommendation(d) {
+  if (!wf) { toast("Open a workflow in the Workflow tab first.", true); return; }
+  const rec = d.recommendation;
+  let merges = 0, trains = 0, added = false;
+  for (const stage of wf.stages || []) {
+    if (stage.type === "merge") {
+      stage.params = stage.params || {};
+      stage.params.pad_fill_mode = rec.pad_fill_mode;
+      stage.params.override_padded_stats = rec.override_padded_stats;
+      const srcs = (stage.params.source_repos || "").trim();
+      if (!srcs.split(/\s+/).includes(d.cand.repo)) {
+        stage.params.source_repos = (srcs ? srcs + " " : "") + d.cand.repo;
+        added = true;
+      }
+      merges++;
+    } else if (stage.type === "train" && rec.weighting === "source"
+               && (stage.params?.weighting === "source" || /pretrain|generalist|pre-train/i.test(stage.name || ""))) {
+      stage.params.weighting = "source";
+      stage.params.external_weight = String(rec.external_weight);
+      trains++;
+    }
+  }
+  if (!merges) { toast("Workflow has no merge stage to apply the flags to.", true); return; }
+  markDirty();
+  await saveWorkflow(true);
+  render();
+  toast(`Applied to ${merges} merge stage(s)${trains ? ` + ${trains} pre-train stage(s)` : ""}` +
+        (added ? `; added ${d.cand.repo} to merge sources` : "") + ` in '${wf.name}'.`);
+}
+
+/* ============================== GUIDE TAB ============================== */
+const GUIDE = [
+  {c: "var(--c-extract)", step: "Phase 0", title: "Record once: the master dataset", stage: "custom (record) + extract stage", body: `
+    <p>Record teleop sessions with <b>everything on</b>: all 18 DOF (lift axis enabled) and
+    RGB-D (<code>use_depth=True</code> on the head RealSense — now the xlerobot default).
+    That master dataset is future-proof: you never re-collect because a training run wants a
+    different schema.</p>
+    <ul>
+      <li>Derive training views with <code>lerobot-extract-subset</code> (the <b>extract</b>
+          stage): <code>bimanual12</code> keeps both 6-DOF arms and drops depth, so tensor
+          shapes line up exactly with open-source bimanual datasets — no padding at all for
+          those dims.</li>
+      <li>Other profiles: <code>arms_head14</code>, <code>full18</code>; or an explicit
+          <code>--keep-names</code> list. Optional fps/resolution changes at extract time.</li>
+      <li>Depth stays in the master for future depth-aware policies
+          (RGBD_IMPLEMENTATION_GUIDE.md) — subsets drop it by default.</li>
+    </ul>`},
+  {c: "var(--c-merge)", step: "Phase 1", title: "Convert & Merge", stage: "merge stage", body: `
+    <p>External data (ALOHA, Open-X, FastUMI) must be <b>converted to the xlerobot schema</b>
+    first (DATA_CONVERSION.md / <code>lerobot-umi-retarget</code>) — joint <i>names</i> are what
+    alignment maps by, not positions. Then <code>lerobot-cotrain-align</code> merges everything
+    into one dataset with one set of normalization stats.</p>
+    <ul>
+      <li>Always set <code>--match-features-from</code> to one of your task repos.</li>
+      <li><b>Preflight every external repo in the Compare tab</b> — it shows exactly what gets
+          padded/dropped before you spend hours encoding.</li>
+      <li>Mixing ratio: keep external data ≤ 50–70 % of merged frames.</li>
+    </ul>`},
+  {c: "var(--c-mitigate)", step: "Always on", title: "Padding-bias mitigation", stage: "merge + train flags", body: `
+    <p>Dims a source can't supply get <b>filled with a constant</b>. Zeros teach the policy
+    "keep these joints frozen" and drag normalization stats toward 0, making your real motion
+    look like outliers. Three fixes, cheapest first:</p>
+    <ul>
+      <li><code>--pad-fill-mode ref-mean</code> — fill at your robot's mean pose (velocity dims
+          stay 0, which is correct). <code>state-copy</code> also writes identity
+          "hold position" actions.</li>
+      <li><code>--override-padded-stats</code> — merged stats for padded dims come from
+          <i>your</i> data, not the fills.</li>
+      <li><code>--sample_weighting.type=source</code> at train time — padded external episodes
+          get e.g. 0.3× loss weight (the merge writes <code>meta/cotrain_sources.json</code>
+          automatically).</li>
+    </ul>
+    <p class="muted">Long-term alternatives: per-dim loss masking, or end-effector-space
+    co-training (<code>lerobot-umi-retarget --action-space ee</code>) which avoids padding
+    entirely.</p>`},
+  {c: "var(--c-train)", step: "Phase 2", title: "Generalist pre-train", stage: "train stage (pre-train template)", body: `
+    <p>Train SmolVLA from <code>lerobot/smolvla_base</code> on the merged dataset
+    (~60k steps, batch 16, AMP). Language conditioning lets one policy absorb many tasks —
+    every merged episode keeps its own task string.</p>
+    <ul>
+      <li>The generalist checkpoint is the <b>reusable artifact</b>; redo only when you add
+          major new data.</li>
+      <li>UMI-heavy data? Two-stage pre-train: UMI-heavy merge first, then continue on an
+          xlerobot-only merge before fine-tuning.</li>
+    </ul>`},
+  {c: "var(--c-train)", step: "Scale", title: "UMI-style data at scale", stage: "master RGB-D / UMI preset", body: `
+    <p>FastUMI-100K offers 100k+ trajectories — three orders of magnitude above your per-task
+    counts. Treat it as a <b>pretraining prior</b> (manipulation skills + language grounding),
+    not in-domain data: the camera viewpoint and workspace gaps mean it won't teach
+    xlerobot-specific control.</p>
+    <ul>
+      <li>Retarget with <code>lerobot-umi-retarget</code> at <code>--target-fps 30</code>
+          (joint space) or <code>--action-space ee</code> (end-effector space — sidesteps
+          padding entirely, but changes deployment).</li>
+      <li><b>Two-stage pre-train</b> (the Master RGB-D / UMI preset): stage 1 on a 12-DOF
+          merge of your extracted subset + UMI + bimanual data (UMI can dominate here);
+          stage 2 continues on a native 18-DOF merge so the final action distribution is
+          yours. SmolVLA pads state/action internally, so the 12→18 dim change is safe with
+          <code>train_state_proj=true</code>.</li>
+      <li>Start with the 5–10 UMI tasks closest to your home tasks; keep UMI a minority of
+          stage-2 frames or down-weight it (<code>weighting: source</code>).</li>
+      <li>Preflight every retargeted repo in <b>Compare datasets</b> — retargeting bugs show
+          up as unmapped names or absurd stats immediately.</li>
+    </ul>`},
+  {c: "var(--c-sarm)", step: "Quality", title: "SARM annotation & RA-BC", stage: "sarm stage", body: `
+    <p>SARM scores every frame's task progress; RA-BC turns those scores into per-sample loss
+    weights so training favors clean, purposeful demonstrations over hesitant or failed
+    ones.</p>
+    <ul>
+      <li>The <b>sarm</b> stage runs <code>compute_rabc_weights</code> and writes
+          <code>sarm_progress.parquet</code> next to the dataset.</li>
+      <li>Fine-tune with <code>weighting: rabc</code> (head mode must match the annotation's
+          <code>sparse</code>/<code>dense</code>).</li>
+      <li>Where it pays off most: mixed-quality data — autonomous rollout harvests, old
+          recordings, aborted sessions. Annotate instead of deleting.</li>
+      <li>Order matters: annotate <i>after</i> any merge/extract (indices must match the
+          dataset you train on).</li>
+    </ul>`},
+  {c: "var(--c-finetune)", step: "Phase 3", title: "Per-task specialist fine-tune", stage: "train stage (fine-tune template)", body: `
+    <p>Fine-tune from the generalist on each single-task repo: ~20k steps,
+    <code>cosine_decay_with_warmup</code>, peak LR 5e-5. One fine-tune stage per home task.</p>
+    <ul>
+      <li>Fine-tune <b>long enough</b> and evaluate base/lift/head motion specifically — not
+          just gripper success — to confirm the padding bias washed out.</li>
+      <li>Optional RA-BC (<code>weighting: rabc</code>) to favor high-quality demos.</li>
+    </ul>`},
+  {c: "var(--c-deploy)", step: "Phase 4", title: "Deploy & DAgger loop", stage: "custom stage", body: `
+    <p>Deploy the specialist, collect corrections with VR teleop
+    (<code>lerobot-rollout --strategy.type=dagger</code>, DAGGER_HIL.md), merge corrections
+    back into the task repo, re-run Phase 3. <b>This loop is where success rates actually
+    climb</b> — 20 correction episodes routinely beat 100 fresh demos.</p>`},
+  {c: "var(--c-data)", step: "Playbook", title: "Getting more valid data (ranked by value/hour)", stage: "", body: `
+    <ol>
+      <li><b>DAgger corrections</b> — on-policy states with expert actions.</li>
+      <li><b>VR teleop demos</b> — gold standard for new tasks; vary objects/lighting; 50+
+          episodes/task floor.</li>
+      <li><b>Autonomous rollout harvesting</b> — sentry mode + SARM/RA-BC filtering.</li>
+      <li><b>Re-weight old recordings</b> — SARM-annotate instead of deleting.</li>
+      <li><b>Retargeted UMI</b> — pretraining prior, not in-domain data; keep minority share.</li>
+      <li><b>Aligned ALOHA/Open-X</b> — bimanual priors at modest fractions.</li>
+    </ol>
+    <p class="muted">Flywheel: every deployment records, every recording gets scored, every
+    training round re-weights.</p>`},
+];
+
+function renderGuide() {
+  const g = $("#view-guide"); g.innerHTML = "";
+  const flow = el("div", {id: "guide-flow"});
+  GUIDE.forEach((s, i) => {
+    if (i) flow.appendChild(el("span", {class: "farrow", text: "→"}));
+    flow.appendChild(el("span", {class: "fnode", style: `border-color:${s.c};color:${s.c}`,
+      text: s.title, onclick: () => g.children[i + 1].scrollIntoView({behavior: "smooth"})}));
+  });
+  g.appendChild(flow);
+  for (const s of GUIDE) {
+    const sec = el("div", {class: "gsec", style: `--gc:${s.c}`});
+    const h = el("h3", {}, el("span", {class: "gstep", text: s.step}),
+                document.createTextNode(s.title));
+    if (s.stage) h.appendChild(el("span", {class: "muted", style: "font-size:.72rem;font-weight:400",
+                                          text: "· " + s.stage}));
+    sec.appendChild(h);
+    const body = el("div"); body.innerHTML = s.body;
+    sec.appendChild(body);
+    g.appendChild(sec);
+  }
+}
+renderGuide();
+refreshList();
+</script>
+</body>
+</html>

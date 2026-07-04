@@ -353,7 +353,7 @@ rm -rf ~/.cache/huggingface/lerobot/Odog16/tool_pickup
 # If you merged with --push-to-hub false, push later from Python (same root as output):
 #   python -c "from pathlib import Path; from lerobot.datasets.lerobot_dataset import LeRobotDataset; r='Odog16/making_coffee_v1'; LeRobotDataset(r, root=Path('~/.cache/huggingface/lerobot').expanduser()/r).push_to_hub()"
 #
-# Policy checkpoints are not datasets: use lerobot-train --policy.push_to_hub or upload_checkpoints.py.
+# Policy checkpoints are not datasets: use lerobot-train --policy.push_to_hub or python -m lerobot.upload_checkpoints.
 #
 
 # All Odog16 xlerobot task folders under ~/.cache/huggingface/lerobot/Odog16 (no ALOHA,
@@ -968,8 +968,8 @@ lerobot-train \
 #     --config_path=outputs/train/trash_pickup_SmolVLA_v1/checkpoints/last/pretrained_model/train_config.json \
 #     --resume=true
 
-# Upload SmolVLA checkpoints after training (edit upload_checkpoints.py for each run):
-# python upload_checkpoints.py
+# Upload SmolVLA checkpoints after training (edit src/lerobot/upload_checkpoints.py for each run):
+# uv run python -m lerobot.upload_checkpoints
 
 # ── MULTI-DATASET: combine trash_pickup with older datasets ────────────────────
 # (lerobot supports comma-separated repo_ids or use a local merged dataset)

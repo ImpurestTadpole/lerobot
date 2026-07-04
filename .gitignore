@@ -184,3 +184,11 @@ patched_preprocessor.json
 
 # Editor settings
 .cursor/
+
+# Workflow UI runtime state (generated scripts, logs, run state)
+workflows/
+
+# SARM/annotation visualization outputs (defaults now under outputs/)
+sarm_predictions/
+sarm_viz/
+subtask_viz/

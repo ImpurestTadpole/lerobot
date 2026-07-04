@@ -35,6 +35,7 @@ Example usage:
 
 from __future__ import annotations
 
+import json
 from abc import ABC, abstractmethod
 from dataclasses import dataclass, field
 from pathlib import Path
@@ -83,11 +84,17 @@ class SampleWeightingConfig:
     contains additional type-specific parameters.
 
     Attributes:
-        type: Weighting strategy type ("rabc", "uniform", etc.)
+        type: Weighting strategy type ("rabc", "source", "uniform", etc.)
         progress_path: Path to precomputed progress values (for RABC)
         head_mode: Which model head to use for progress ("sparse" or "dense")
         kappa: Hard threshold for high-quality samples (RABC-specific)
         epsilon: Small constant for numerical stability
+        sources_path: Path to a cotrain_sources.json manifest (for "source").
+            Auto-detected as <dataset_root>/meta/cotrain_sources.json when unset.
+        external_weight: Loss weight for episodes from non-native (padded)
+            co-training sources; native episodes keep weight 1.0 (for "source").
+        source_weights: Optional per-repo overrides, e.g.
+            {"lerobot/aloha_mobile_cabinet": 0.5} (for "source").
         extra_params: Additional type-specific parameters passed to the weighter
     """
 
@@ -96,6 +103,9 @@ class SampleWeightingConfig:
     head_mode: str = "sparse"
     kappa: float = 0.01
     epsilon: float = 1e-6
+    sources_path: str | None = None
+    external_weight: float = 0.3
+    source_weights: dict = field(default_factory=dict)
     # Additional type-specific params can be added here or passed via extra_params
     extra_params: dict = field(default_factory=dict)
 
@@ -125,11 +135,16 @@ def make_sample_weighter(
     if config.type == "rabc":
         return _make_rabc_weighter(config, policy, device, dataset_root, dataset_repo_id)
 
+    if config.type == "source":
+        return _make_source_weighter(config, device, dataset_root, dataset_repo_id)
+
     if config.type == "uniform":
         # No-op weighter that returns uniform weights
         return UniformWeighter(device=device)
 
-    raise ValueError(f"Unknown sample weighting type: '{config.type}'. Supported types: 'rabc', 'uniform'")
+    raise ValueError(
+        f"Unknown sample weighting type: '{config.type}'. Supported types: 'rabc', 'source', 'uniform'"
+    )
 
 
 def _make_rabc_weighter(
@@ -183,6 +198,130 @@ def _make_rabc_weighter(
         device=device,
         **config.extra_params,
     )
+
+
+def _make_source_weighter(
+    config: SampleWeightingConfig,
+    device: torch.device,
+    dataset_root: str | None = None,
+    dataset_repo_id: str | None = None,
+) -> SampleWeighter:
+    """Create a SourceWeighter from a merged co-training dataset's manifest."""
+    sources_path = config.sources_path
+    if sources_path is None:
+        if dataset_root:
+            sources_path = str(Path(dataset_root) / "meta" / "cotrain_sources.json")
+        elif dataset_repo_id:
+            sources_path = str(
+                Path("~/.cache/huggingface/lerobot").expanduser()
+                / dataset_repo_id
+                / "meta"
+                / "cotrain_sources.json"
+            )
+        else:
+            raise ValueError(
+                "Source sample weighting requires 'sample_weighting.sources_path' or a local "
+                "'dataset.root' containing meta/cotrain_sources.json (written by lerobot-cotrain-align)."
+            )
+    return SourceWeighter(
+        sources_path=sources_path,
+        external_weight=config.external_weight,
+        source_weights=config.source_weights,
+        device=device,
+        epsilon=config.epsilon,
+        **config.extra_params,
+    )
+
+
+class SourceWeighter(SampleWeighter):
+    """
+    Per-episode loss weights based on which co-training source an episode came from.
+
+    ``lerobot-cotrain-align`` writes ``meta/cotrain_sources.json`` into the merged
+    dataset, mapping contiguous episode ranges back to their source repos and
+    recording which state/action dims were zero/mean-padded per source. Episodes
+    from *native* sources (no padded dims — your own embodiment) keep weight 1.0;
+    episodes from padded external sources get ``external_weight`` (< 1) so their
+    supervised-to-constant padded dims contribute a proportionally smaller
+    gradient without discarding their visual/language diversity.
+
+    Per-repo overrides via ``source_weights={"repo/id": w}`` take precedence.
+
+    Weights are normalized per batch to sum to batch size (same convention as
+    RA-BC) so the overall gradient scale is preserved.
+    """
+
+    def __init__(
+        self,
+        sources_path: str | Path,
+        external_weight: float = 0.3,
+        source_weights: dict[str, float] | None = None,
+        device: torch.device | None = None,
+        epsilon: float = 1e-6,
+        normalize: bool = True,
+    ):
+        self.device = device if device is not None else torch.device("cpu")
+        self.epsilon = epsilon
+        self.normalize = normalize
+
+        sources_path = Path(sources_path).expanduser()
+        if not sources_path.is_file():
+            raise FileNotFoundError(
+                f"Co-train source manifest not found: {sources_path}. It is written by "
+                "lerobot-cotrain-align (meta/cotrain_sources.json in the merged dataset); "
+                "re-run the merge or set sample_weighting.sources_path explicitly."
+            )
+        with open(sources_path, encoding="utf-8") as f:
+            manifest = json.load(f)
+
+        source_weights = source_weights or {}
+        entries = manifest.get("sources") or []
+        total_episodes = int(manifest.get("total_episodes") or 0)
+        if not entries or total_episodes <= 0:
+            raise ValueError(f"Manifest {sources_path} has no sources/episodes.")
+
+        weights = torch.ones(total_episodes, dtype=torch.float32)
+        self._per_source: dict[str, float] = {}
+        n_external_eps = 0
+        for entry in entries:
+            repo_id = entry.get("repo_id", "?")
+            native = bool(entry.get("native", False))
+            w = source_weights.get(repo_id, 1.0 if native else float(external_weight))
+            start, end = int(entry["episode_start"]), int(entry["episode_end"])
+            weights[start:end] = w
+            self._per_source[repo_id] = w
+            if not native:
+                n_external_eps += end - start
+        self._episode_weights = weights.to(self.device)
+        self._total_episodes = total_episodes
+        self._n_external_eps = n_external_eps
+
+    def compute_batch_weights(self, batch: dict) -> tuple[torch.Tensor, dict]:
+        ep_idx = batch.get("episode_index")
+        if ep_idx is None:
+            raise KeyError(
+                "SourceWeighter needs 'episode_index' in the batch (present in standard "
+                "LeRobotDataset items)."
+            )
+        ep_idx = ep_idx.reshape(-1).long().to(self._episode_weights.device)
+        ep_idx = ep_idx.clamp(0, self._total_episodes - 1)
+        weights = self._episode_weights[ep_idx]
+        stats = {
+            "mean_weight": float(weights.mean()),
+            "min_weight": float(weights.min()),
+            "max_weight": float(weights.max()),
+        }
+        if self.normalize:
+            weights = weights * weights.numel() / (weights.sum() + self.epsilon)
+        return weights.to(self.device), stats
+
+    def get_stats(self) -> dict:
+        return {
+            "type": "source",
+            "total_episodes": self._total_episodes,
+            "external_episodes": self._n_external_eps,
+            **{f"weight/{k}": v for k, v in self._per_source.items()},
+        }
 
 
 class UniformWeighter(SampleWeighter):
