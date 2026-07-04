@@ -158,12 +158,18 @@ class DAggerStrategyConfig(RolloutStrategyConfig):
     Alternates between autonomous policy execution and human intervention.
     Intervention frames are tagged with ``intervention=True``.
 
-    Input is controlled via either a keyboard or foot pedal, selected by
-    ``input_device``.  Each device exposes three actions:
+    Input is controlled via a keyboard, a foot pedal, or the teleoperator
+    itself, selected by ``input_device``.  Keyboard/pedal expose three actions:
 
     1. **pause_resume** — toggle policy execution on/off.
     2. **correction** — toggle human correction recording.
     3. **upload** — push dataset to hub on demand (corrections-only mode).
+
+    ``input_device="teleop"`` polls ``teleop.get_teleop_events()`` each control
+    tick and follows its ``is_intervention`` toggle (e.g. the RIGHT A button on
+    the xlerobot VR teleop): ON drives AUTONOMOUS → PAUSED → CORRECTING, OFF
+    drives CORRECTING → PAUSED → AUTONOMOUS.  A keyboard listener stays active
+    for ESC (stop) and upload only.
 
     When ``record_autonomous=False`` (default) only human-correction windows
     are recorded — each correction becomes its own episode.  Set to ``True``
@@ -185,8 +191,10 @@ class DAggerStrategyConfig(RolloutStrategyConfig):
     pedal: DAggerPedalConfig = field(default_factory=DAggerPedalConfig)
 
     def __post_init__(self):
-        if self.input_device not in ("keyboard", "pedal"):
-            raise ValueError(f"DAgger input_device must be 'keyboard' or 'pedal', got '{self.input_device}'")
+        if self.input_device not in ("keyboard", "pedal", "teleop"):
+            raise ValueError(
+                f"DAgger input_device must be 'keyboard', 'pedal' or 'teleop', got '{self.input_device}'"
+            )
 
 
 # ---------------------------------------------------------------------------

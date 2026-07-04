@@ -195,10 +195,32 @@ the pieces:
 
 ### 3a. Intervention recording (DAgger-style flywheel)
 
-The VR teleop exposes an intervention interface consumed by the HVLA runtime
-(`s1_process.py`): **RIGHT A** toggles human takeover; while active the human
-corrects the robot and frames are recorded with the intervention flag
-(`hil_processor.AddTeleopEventsAsInfoStep`), then policy control resumes.
+Two runtimes support VR intervention (**RIGHT A** toggles human takeover):
+
+**Any policy (SmolVLA/ACT specialists)** — `lerobot-rollout` DAgger strategy
+with the teleop input device:
+
+```bash
+lerobot-rollout \
+    --strategy.type=dagger \
+    --strategy.input_device=teleop \
+    --strategy.num_episodes=20 \
+    --policy.path=outputs/train/trash_pickup_cotrain_v1/checkpoints/last/pretrained_model \
+    --robot.type=xlerobot \
+    --teleop.type=xlerobot_vr \
+    --dataset.repo_id=Odog16/rollout_trash_pickup_dagger \
+    --dataset.single_task="Pick up the trash and place it in the bin"
+```
+
+The policy runs autonomously; RIGHT A pauses it and hands control to VR (the
+teleop recalibrates its IK targets to the robot's current joints on takeover);
+each correction window is saved as one episode tagged `intervention=True`.
+Toggle RIGHT A again to resume the policy. ESC stops; the dataset repo id must
+start with `rollout_`. Add `--strategy.record_autonomous=true` to also record
+the policy's own frames (tagged `intervention=False`).
+
+**HVLA** — the S1 runtime (`s1_process.py`) has the same loop built in via its
+`record_dataset` / `intervention_dataset` options.
 
 Loop:
 1. Deploy the current specialist checkpoint.
@@ -209,6 +231,11 @@ Loop:
 4. Merge the new episodes into the task repo and re-run the Phase-2 (or RA-BC)
    fine-tune. 10–30 intervention episodes per iteration is typically enough to
    see a measurable success-rate jump.
+
+Note: DAgger datasets carry an extra boolean `intervention` feature. Training
+on them directly works (unused keys are ignored); to physically merge them
+into an existing task repo with `lerobot-cotrain-align`, the align pass drops
+the extra feature automatically.
 
 ### 3b. Reward-weighted data reuse (RA-BC + SARM)
 

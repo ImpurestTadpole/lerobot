@@ -18,13 +18,20 @@ Implements the RaC paradigm (Recovery and Correction) for interactive
 imitation learning.  Alternates between autonomous policy execution and
 human intervention via teleoperator.
 
-Input is controlled via either a keyboard or foot pedal, selected by
-the ``input_device`` config field.  Each device exposes three actions:
+Input is controlled via a keyboard, foot pedal, or the teleoperator itself,
+selected by the ``input_device`` config field.  Keyboard/pedal expose:
 
     1. **pause_resume** — Toggle policy execution (AUTONOMOUS <-> PAUSED).
     2. **correction**   — Toggle correction recording (PAUSED <-> CORRECTING).
     3. **upload**        — Push dataset to hub on demand (corrections-only mode).
     ESC (keyboard only) — Stop session.
+
+``input_device="teleop"`` instead polls ``teleop.get_teleop_events()`` every
+control tick and mirrors its ``is_intervention`` toggle (e.g. RIGHT A on the
+xlerobot VR teleop) by walking the state machine one transition per tick:
+ON drives AUTONOMOUS → PAUSED → CORRECTING, OFF drives the reverse.  A
+keyboard listener stays active for ESC/upload only, so it cannot fight the
+teleop-driven phase.
 
 Recording modes:
     ``record_autonomous=True``:  Sentry-like continuous recording with
@@ -61,6 +68,7 @@ from lerobot.common.control_utils import (
 )
 from lerobot.datasets import VideoEncodingManager
 from lerobot.datasets.utils import DEFAULT_VIDEO_FILE_SIZE_IN_MB
+from lerobot.teleoperators.utils import TeleopEvents
 from lerobot.utils.constants import ACTION, OBS_STR
 from lerobot.utils.feature_utils import build_dataset_frame
 from lerobot.utils.keyboard_input import create_key_listener
@@ -94,6 +102,15 @@ _DAGGER_TRANSITIONS: dict[tuple[DAggerPhase, str], DAggerPhase] = {
     (DAggerPhase.PAUSED, "pause_resume"): DAggerPhase.AUTONOMOUS,
     (DAggerPhase.PAUSED, "correction"): DAggerPhase.CORRECTING,
     (DAggerPhase.CORRECTING, "correction"): DAggerPhase.PAUSED,
+}
+
+# Next single transition to request from (current, desired) — used by the
+# "teleop" input device to walk the machine toward the intervention toggle.
+_STEP_TOWARD: dict[tuple[DAggerPhase, DAggerPhase], str] = {
+    (DAggerPhase.AUTONOMOUS, DAggerPhase.CORRECTING): "pause_resume",
+    (DAggerPhase.PAUSED, DAggerPhase.CORRECTING): "correction",
+    (DAggerPhase.CORRECTING, DAggerPhase.AUTONOMOUS): "correction",
+    (DAggerPhase.PAUSED, DAggerPhase.AUTONOMOUS): "pause_resume",
 }
 
 
@@ -163,18 +180,26 @@ class DAggerEvents:
 # ---------------------------------------------------------------------------
 
 
-def _init_dagger_keyboard(events: DAggerEvents, cfg: DAggerKeyboardConfig):
+def _init_dagger_keyboard(events: DAggerEvents, cfg: DAggerKeyboardConfig, transitions_enabled: bool = True):
     """Initialise a keyboard listener for DAgger's 3 controls.
 
     Backend selection (pynput on X11 / trusted-macOS / Windows, a terminal reader on
     Wayland / headless TTY) is delegated to :func:`create_key_listener`. Returns the
     listener (exposing ``stop()``) or ``None`` when no keyboard backend is usable.
+
+    With ``transitions_enabled=False`` (teleop input mode) only ESC and the
+    upload key are handled — phase transitions are owned by the teleoperator
+    toggle and keyboard-driven transitions would fight it.
     """
     # Map config key names to DAgger event names.
-    key_to_event = {
-        cfg.pause_resume: "pause_resume",
-        cfg.correction: "correction",
-    }
+    key_to_event = (
+        {
+            cfg.pause_resume: "pause_resume",
+            cfg.correction: "correction",
+        }
+        if transitions_enabled
+        else {}
+    )
 
     def dispatch(name: str) -> None:
         """Apply a resolved key name to the DAgger events."""
@@ -187,13 +212,12 @@ def _init_dagger_keyboard(events: DAggerEvents, cfg: DAggerKeyboardConfig):
         if name == cfg.upload:
             events.upload_requested.set()
 
-    return create_key_listener(
-        dispatch,
-        controls_help=(
-            f"pause_resume='{cfg.pause_resume}', correction='{cfg.correction}', "
-            f"upload='{cfg.upload}', ESC=stop"
-        ),
+    controls_help = (
+        f"pause_resume='{cfg.pause_resume}', correction='{cfg.correction}', upload='{cfg.upload}', ESC=stop"
+        if transitions_enabled
+        else f"upload='{cfg.upload}', ESC=stop (pause/correction driven by teleop)"
     )
+    return create_key_listener(dispatch, controls_help=controls_help)
 
 
 def _init_dagger_pedal(events: DAggerEvents, cfg: DAggerPedalConfig):
@@ -259,8 +283,21 @@ class DAggerStrategy(RolloutStrategy):
 
         if self.config.input_device == "keyboard":
             self._listener = _init_dagger_keyboard(self._events, self.config.keyboard)
-        else:
+        elif self.config.input_device == "pedal":
             self._pedal_thread = _init_dagger_pedal(self._events, self.config.pedal)
+        else:  # "teleop"
+            teleop = ctx.hardware.teleop
+            if not callable(getattr(teleop, "get_teleop_events", None)):
+                raise ValueError(
+                    f"input_device='teleop' requires a teleoperator exposing get_teleop_events() "
+                    f"(e.g. xlerobot_vr); '{type(teleop).__name__}' does not."
+                )
+            if callable(getattr(teleop, "reset_intervention", None)):
+                teleop.reset_intervention()
+            # Keyboard stays available for ESC/upload only.
+            self._listener = _init_dagger_keyboard(
+                self._events, self.config.keyboard, transitions_enabled=False
+            )
 
         record_mode = "all frames (sentry-like)" if self.config.record_autonomous else "corrections only"
         logger.info(
@@ -277,6 +314,25 @@ class DAggerStrategy(RolloutStrategy):
             self._run_continuous(ctx)
         else:
             self._run_corrections_only(ctx)
+
+    def _drive_teleop_phase(self, teleop) -> None:
+        """Poll the teleop intervention toggle and walk the state machine toward it.
+
+        One transition is requested per control tick, so a toggle passes through
+        the intermediate PAUSED phase in two ticks (~2/fps seconds).  Polling
+        ``get_teleop_events()`` every tick also lets the VR teleop run its
+        on-intervention IK recalibration at the moment the human takes over.
+        """
+        try:
+            teleop_events = teleop.get_teleop_events()
+        except Exception as e:
+            logger.warning("get_teleop_events() failed (keeping current phase): %s", e)
+            return
+        is_intervention = bool(teleop_events.get(TeleopEvents.IS_INTERVENTION, False))
+        desired = DAggerPhase.CORRECTING if is_intervention else DAggerPhase.AUTONOMOUS
+        step = _STEP_TOWARD.get((self._events.phase, desired))
+        if step is not None:
+            self._events.request_transition(step)
 
     def teardown(self, ctx: RolloutContext) -> None:
         """Stop listeners, finalise the dataset, and disconnect hardware."""
@@ -361,6 +417,10 @@ class DAggerStrategy(RolloutStrategy):
                         logger.info("Duration limit reached (%.0fs)", cfg.duration)
                         break
 
+                    # Teleop input mode: mirror the intervention toggle
+                    if self.config.input_device == "teleop":
+                        self._drive_teleop_phase(teleop)
+
                     # Process transitions
                     transition = events.consume_transition()
                     if transition is not None:
@@ -385,6 +445,9 @@ class DAggerStrategy(RolloutStrategy):
                     # interpolate to the control loop's tick rate.
                     if phase == DAggerPhase.CORRECTING:
                         obs_processed = ctx.processors.robot_observation_processor(obs)
+                        # VR teleops derive their action from the latest robot obs
+                        if hasattr(teleop, "update_observation_cache"):
+                            teleop.update_observation_cache(obs)
                         teleop_action = teleop.get_action()
                         processed_teleop = ctx.processors.teleop_action_processor((teleop_action, obs))
                         robot_action_to_send = ctx.processors.robot_action_processor((processed_teleop, obs))
@@ -522,6 +585,10 @@ class DAggerStrategy(RolloutStrategy):
                         logger.info("Duration limit reached (%.0fs)", cfg.duration)
                         break
 
+                    # Teleop input mode: mirror the intervention toggle
+                    if self.config.input_device == "teleop":
+                        self._drive_teleop_phase(teleop)
+
                     # Process transitions
                     transition = events.consume_transition()
                     if transition is not None:
@@ -565,6 +632,9 @@ class DAggerStrategy(RolloutStrategy):
                     # interpolate to the control loop's tick rate.
                     if phase == DAggerPhase.CORRECTING:
                         obs_processed = ctx.processors.robot_observation_processor(obs)
+                        # VR teleops derive their action from the latest robot obs
+                        if hasattr(teleop, "update_observation_cache"):
+                            teleop.update_observation_cache(obs)
                         teleop_action = teleop.get_action()
                         processed_teleop = ctx.processors.teleop_action_processor((teleop_action, obs))
                         robot_action_to_send = ctx.processors.robot_action_processor((processed_teleop, obs))
@@ -671,6 +741,8 @@ class DAggerStrategy(RolloutStrategy):
             if not teleop_supports_feedback(teleop) and prev_action is not None:
                 logger.info("Smooth handover: sliding follower to teleop position")
                 obs = robot.get_observation()
+                if hasattr(teleop, "update_observation_cache"):
+                    teleop.update_observation_cache(obs)
                 teleop_action = teleop.get_action()
                 processed = ctx.processors.teleop_action_processor((teleop_action, obs))
                 target = ctx.processors.robot_action_processor((processed, obs))

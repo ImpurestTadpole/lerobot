@@ -21,6 +21,7 @@ and :class:`DatasetContext` — assembled into :class:`RolloutContext`.
 
 from __future__ import annotations
 
+import inspect
 import logging
 from dataclasses import dataclass, field
 from threading import Event
@@ -249,7 +250,12 @@ def build_rollout_context(
     if cfg.teleop is not None:
         logger.info("Connecting teleoperator (%s)...", cfg.teleop.type if cfg.teleop else "?")
         teleop = make_teleoperator_from_config(cfg.teleop)
-        teleop.connect()
+        # VR-based teleops (e.g. xlerobot_vr) accept the robot so they can calibrate
+        # their IK targets from the follower's joint positions; leader arms don't.
+        if "robot" in inspect.signature(teleop.connect).parameters:
+            teleop.connect(robot=robot)
+        else:
+            teleop.connect()
         logger.info("Teleoperator connected")
 
     # TODO(Steven): once Teleoperator motor-control methods are standardised
