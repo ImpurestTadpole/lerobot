@@ -23,6 +23,10 @@ side-by-side [HF dataset visualizer](https://github.com/huggingface/lerobot-data
 embeds, one-click apply of recommended mitigation flags), and **Guide**
 (this document as color-coded phases). Two presets: **Home-tasks** (merge →
 generalist → per-task fine-tunes) and **Master RGB-D / UMI** (§0/§2 below).
+Generated stage scripts `conda activate lerobot` before running anything —
+`lerobot-train` and friends need that env (GPU torch, matching Python), not
+the repo's separate `uv`-managed `.venv` (see GUIDE.md §1). The commands
+below assume `conda activate lerobot` is already active in your shell.
 
 ## 0. Record once: the master dataset
 
@@ -128,7 +132,7 @@ automatically (a `meta/cotrain_align_options.json` marker is compared).
 lerobot-train \
     --dataset.repo_id=Odog16/xlerobot_cotrain_v1 \
     --dataset.root=$HOME/.cache/huggingface/lerobot/Odog16/xlerobot_cotrain_v1 \
-    --policy.type=smolvla \
+    --policy.type=smolvla --policy.push_to_hub=false \
     --policy.pretrained_path=lerobot/smolvla_base \
     --policy.train_state_proj=true --policy.use_amp=true \
     --batch_size=16 --steps=60000 --save_freq=10000 \
@@ -171,7 +175,7 @@ fewer steps (full commands: `Guide.sh` B-4 / RA-BC sections):
 ```bash
 lerobot-train \
     --dataset.repo_id=Odog16/trash_pickup \
-    --policy.type=smolvla \
+    --policy.type=smolvla --policy.push_to_hub=false \
     --policy.pretrained_path=outputs/train/xlerobot_generalist_v1/checkpoints/last/pretrained_model \
     --scheduler.type=cosine_decay_with_warmup --scheduler.peak_lr=5e-5 \
     --batch_size=16 --steps=20000 \
@@ -184,7 +188,7 @@ the required `sarm_progress.parquet` first — the workflow UI's **sarm** stage
 runs it, or directly:
 
 ```bash
-uv run python -m lerobot.rewards.sarm.compute_rabc_weights \
+python -m lerobot.rewards.sarm.compute_rabc_weights \
     --dataset-repo-id Odog16/trash_pickup \
     --reward-model-path Odog16/sarm_xlerobot --head-mode sparse --device cuda
 ```

@@ -969,7 +969,7 @@ lerobot-train \
 #     --resume=true
 
 # Upload SmolVLA checkpoints after training (edit src/lerobot/upload_checkpoints.py for each run):
-# uv run python -m lerobot.upload_checkpoints
+# python -m lerobot.upload_checkpoints
 
 # ── MULTI-DATASET: combine trash_pickup with older datasets ────────────────────
 # (lerobot supports comma-separated repo_ids or use a local merged dataset)

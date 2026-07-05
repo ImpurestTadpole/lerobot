@@ -30,8 +30,16 @@ uv run python scripts/workflow_ui/app.py        # → http://127.0.0.1:7799
   script under `workflows/<name>/scripts/NN_*.sh` (also via *Generate
   scripts*), so any stage can equally be run by hand, in tmux, or copied to
   another box. Scripts are self-contained: they `cd` to the repo root, set
-  `set -euo pipefail`, and clear `PYTHONPATH` (Isaac Sim's bundled packages
-  otherwise break torch imports).
+  `set -euo pipefail`, clear `PYTHONPATH` (Isaac Sim's bundled packages
+  otherwise break torch imports), then `conda activate lerobot` before
+  running anything — **not** `uv run`, which resolves to this repo's
+  separate uv-managed `.venv` and can silently sit on a different,
+  incompatible Python (draccus's argparse integration crashes with
+  `TypeError: str | None is not callable` building the CLI for any
+  `X | None`-typed config field under Python 3.14, which is what this
+  repo's `.venv` happened to resolve to with no `.python-version` pin).
+  Every command below assumes `conda activate lerobot` is already active in
+  your shell — generated scripts do this for you automatically.
 - **Three tabs.** *Workflow* (compose/run stages), *Compare datasets*
   (preflight external repos — see step 4), *Guide* (this pipeline, color-coded).
   Every stage option has a **`?` key** next to its label — a one-glance
@@ -50,7 +58,7 @@ Record with **everything on**: all 18 DOF (lift axis enabled) and RGB-D
 `config_xlerobot.py`, adding `observation.images.head_depth`).
 
 ```bash
-uv run lerobot-record \
+lerobot-record \
     --robot.type=xlerobot \
     --robot.lift_axis.enabled=true \
     --teleop.type=xlerobot_vr \
@@ -67,7 +75,7 @@ episodes per task is the floor.
 ## 3. Derive training views (never re-record for a schema)
 
 ```bash
-uv run lerobot-extract-subset \
+lerobot-extract-subset \
     --source-repo Odog16/master_home_v1 \
     --target-repo-id Odog16/master_home_v1_bimanual12 \
     --profile bimanual12 --target-image-size 360x640
@@ -91,13 +99,13 @@ stage. If *nothing* maps, the source needs conversion first:
 ```bash
 # ALOHA / Open-X → xlerobot schema (see DATA_CONVERSION.md §1)
 # UMI / FastUMI  → joint or EE space:
-uv run lerobot-umi-retarget --source-repo ... --target-fps 30   # DATA_CONVERSION.md §2
+lerobot-umi-retarget --source-repo ... --target-fps 30   # DATA_CONVERSION.md §2
 ```
 
 ## 5. Merge (with padding-bias mitigation on)
 
 ```bash
-uv run lerobot-cotrain-align \
+lerobot-cotrain-align \
     --source-repos Odog16/master_home_v1_bimanual12 \
                    Odog16/umi_pretrain_clean_desktop \
                    Odog16/aloha_aligned_for_cotrain \
@@ -121,9 +129,10 @@ weighting. For the native merge, repeat with your 18-DOF task repos and
 **Stage 1 — 12-DOF, UMI/bimanual-heavy** (UMI may dominate; all names match):
 
 ```bash
-uv run lerobot-train \
+lerobot-train \
     --dataset.repo_id=Odog16/cotrain_umi_bimanual_12dof \
-    --policy.type=smolvla --policy.pretrained_path=lerobot/smolvla_base \
+    --policy.type=smolvla --policy.push_to_hub=false \
+    --policy.pretrained_path=lerobot/smolvla_base \
     --policy.train_state_proj=true --policy.use_amp=true \
     --batch_size=16 --steps=40000 --save_freq=10000 \
     --sample_weighting.type=source --sample_weighting.external_weight=0.3 \
@@ -136,9 +145,9 @@ state/action internally, so the 12→18 change is safe with
 `train_state_proj=true`):
 
 ```bash
-uv run lerobot-train \
+lerobot-train \
     --dataset.repo_id=Odog16/cotrain_native_18dof \
-    --policy.type=smolvla \
+    --policy.type=smolvla --policy.push_to_hub=false \
     --policy.pretrained_path=outputs/train/stage1_umi_12dof/checkpoints/last/pretrained_model \
     --policy.train_state_proj=true --policy.use_amp=true \
     --batch_size=16 --steps=30000 --save_freq=10000 \
@@ -152,7 +161,7 @@ Skipping UMI? Collapse this to the single generalist pre-train of the
 ## 7. SARM annotation → RA-BC (optional but cheap quality win)
 
 ```bash
-uv run python -m lerobot.rewards.sarm.compute_rabc_weights \
+python -m lerobot.rewards.sarm.compute_rabc_weights \
     --dataset-repo-id Odog16/trash_pickup \
     --reward-model-path Odog16/sarm_xlerobot \
     --head-mode sparse --device cuda
@@ -166,9 +175,9 @@ recordings). UI: the pink **sarm** stage.
 ## 8. Fine-tune per-task specialists
 
 ```bash
-uv run lerobot-train \
+lerobot-train \
     --dataset.repo_id=Odog16/trash_pickup \
-    --policy.type=smolvla \
+    --policy.type=smolvla --policy.push_to_hub=false \
     --policy.pretrained_path=outputs/train/stage2_native_18dof/checkpoints/last/pretrained_model \
     --scheduler.type=cosine_decay_with_warmup --scheduler.peak_lr=5e-5 \
     --batch_size=16 --steps=20000 \
@@ -183,7 +192,7 @@ to confirm the padding bias washed out.
 ## 9. Deploy & close the loop
 
 ```bash
-uv run lerobot-rollout --strategy.type=dagger ...    # DAGGER_HIL.md §1
+lerobot-rollout --strategy.type=dagger ...    # DAGGER_HIL.md §1
 ```
 
 Deploy the specialist, collect VR corrections, merge them back into the task

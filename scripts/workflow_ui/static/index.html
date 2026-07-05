@@ -11,19 +11,44 @@
     --bg: #d7d4cd; --panel: #edebe6; --panel2: #f7f6f2; --line: #b9b6ae;
     --ink: #16150f; --text: #16150f; --muted: #716e66; --accent: #ff4a00;
     --ok: #2fae3e; --bad: #e02d10; --warn: #e8a200; --run: #ff4a00;
-    /* phase colors — shared by stage chips and guide sections */
+    /* phase colors — shared by stage chips and guide sections (identical in
+       both themes — already vivid/saturated enough to read on dark or light) */
     --c-merge: #0060df; --c-train: #7a49ff; --c-finetune: #1f9d4d;
     --c-deploy: #e8720c; --c-mitigate: #e02d10; --c-data: #008f7a;
     --c-custom: #b98a00; --c-extract: #008f7a; --c-sarm: #d6248f;
+    /* device "screen" — intentionally dark in both themes, like a real LCD */
     --screen: #191813; --screen-text: #e8e6df;
+    /* surfaces/accents that can't just invert --ink (shadows must stay dark,
+       text/hover surfaces must stay light-on-dark-bg correctly) */
+    --key-shadow: #16150f; --input-bg: #fff; --hover-bg: #fff;
+    --placeholder: #b3b0a8; --dot-color: #c4c1b9; --table-border: #e4e2dc;
     font-size: 15px;
+  }
+  /* dark theme: explicit toggle (data-theme="dark") always wins; otherwise
+     follow the OS preference unless the user explicitly chose "light" */
+  @media (prefers-color-scheme: dark) {
+    :root:not([data-theme="light"]) {
+      --bg: #171613; --panel: #201f1c; --panel2: #2b2a26; --line: #46443d;
+      --ink: #ece9e2; --text: #ece9e2; --muted: #8f8c82; --accent: #ff5a17;
+      --ok: #3ecf50; --bad: #ff5b46; --warn: #ffb020; --run: #ff5a17;
+      --key-shadow: #000; --input-bg: #201f1c; --hover-bg: #37362f;
+      --placeholder: #6b6961; --dot-color: #242320; --table-border: #3a3934;
+    }
+  }
+  :root[data-theme="dark"] {
+    --bg: #171613; --panel: #201f1c; --panel2: #2b2a26; --line: #46443d;
+    --ink: #ece9e2; --text: #ece9e2; --muted: #8f8c82; --accent: #ff5a17;
+    --ok: #3ecf50; --bad: #ff5b46; --warn: #ffb020; --run: #ff5a17;
+    --key-shadow: #000; --input-bg: #201f1c; --hover-bg: #37362f;
+    --placeholder: #6b6961; --dot-color: #242320; --table-border: #3a3934;
   }
   * { box-sizing: border-box; }
   body { margin: 0; background: var(--bg); color: var(--text);
-         background-image: radial-gradient(#c4c1b9 1px, transparent 1px);
+         background-image: radial-gradient(var(--dot-color) 1px, transparent 1px);
          background-size: 22px 22px;
          font-family: "Helvetica Neue", Helvetica, Arial, system-ui, sans-serif;
-         height: 100vh; display: flex; flex-direction: column; }
+         height: 100vh; display: flex; flex-direction: column;
+         transition: background-color .15s, color .15s; }
   ::selection { background: var(--accent); color: #fff; }
   header { display: flex; align-items: center; gap: .6rem; padding: .6rem 1rem;
            background: var(--panel); border-bottom: 2px solid var(--ink); flex-wrap: wrap; }
@@ -39,7 +64,14 @@
                     padding: .35rem .9rem; font-size: .72rem; font-weight: 700;
                     text-transform: uppercase; letter-spacing: .08em; box-shadow: none; }
   nav.tabs button + button { border-left: 1.5px solid var(--ink); }
-  nav.tabs button.active { background: var(--ink); color: #fff; }
+  nav.tabs button.active { background: var(--ink); color: var(--bg); }
+  .tabdot { display: inline-block; width: 7px; height: 7px; border-radius: 50%;
+            margin-left: .35rem; background: var(--muted); vertical-align: middle; }
+  .tabdot.running { background: var(--run); animation: led 1s infinite; }
+  .tabdot.done { background: var(--ok); }
+  .tabdot.failed, .tabdot.stopped { background: var(--bad); }
+  .tabdot.pending { background: var(--warn); }
+  .tabdot.hidden { display: none; }
   #wf-title { font-family: ui-monospace, "SF Mono", monospace; font-size: .8rem; }
   main { flex: 1; display: flex; min-height: 0; }
   .view { flex: 1; display: none; min-height: 0; }
@@ -48,21 +80,21 @@
   button { background: var(--panel2); color: var(--ink); border: 1.5px solid var(--ink);
            border-radius: 9px; padding: .38rem .85rem; cursor: pointer; font-size: .78rem;
            font-weight: 600; text-transform: uppercase; letter-spacing: .05em;
-           box-shadow: 0 2px 0 var(--ink); }
-  button:hover { background: #fff; }
-  button:active { transform: translateY(2px); box-shadow: 0 0 0 var(--ink); }
+           box-shadow: 0 2px 0 var(--key-shadow); }
+  button:hover { background: var(--hover-bg); }
+  button:active { transform: translateY(2px); box-shadow: 0 0 0 var(--key-shadow); }
   button.primary { background: var(--accent); color: #fff; }
   button.primary:hover { background: #ff5c18; }
   button.danger:hover { background: var(--bad); color: #fff; }
-  button.small { padding: .12rem .5rem; font-size: .68rem; box-shadow: 0 1.5px 0 var(--ink); }
-  input, select, textarea { background: #fff; color: var(--ink); border: 1.5px solid var(--line);
+  button.small { padding: .12rem .5rem; font-size: .68rem; box-shadow: 0 1.5px 0 var(--key-shadow); }
+  input, select, textarea { background: var(--input-bg); color: var(--ink); border: 1.5px solid var(--line);
            border-radius: 8px; padding: .35rem .55rem; font-size: .85rem; width: 100%;
            font-family: ui-monospace, "SF Mono", monospace; }
   textarea { resize: vertical; }
   input:focus, select:focus, textarea:focus { outline: none; border-color: var(--ink);
            box-shadow: 0 0 0 2px rgba(255, 74, 0, .35); }
   input[type="checkbox"] { width: auto; accent-color: var(--accent); transform: scale(1.15); }
-  ::placeholder { color: #b3b0a8; }
+  ::placeholder { color: var(--placeholder); }
   /* ---------- workflow view ---------- */
   #sidebar { width: 225px; background: var(--panel); border-right: 2px solid var(--ink);
              padding: .8rem; display: flex; flex-direction: column; gap: .55rem; }
@@ -78,6 +110,9 @@
   /* log pane = the device screen */
   #logpane { width: 36%; max-width: 600px; border-left: 2px solid var(--ink);
              background: var(--screen); display: flex; flex-direction: column; }
+  /* full-width when the log lives on its own toggleable page instead of the
+     workflow split view */
+  #view-log #logpane { width: 100%; max-width: none; border-left: none; }
   #logpane .bar { display: flex; gap: .5rem; align-items: center; padding: .5rem .75rem;
                   background: var(--panel); border-bottom: 2px solid var(--ink); }
   #logpane .bar .check { color: var(--ink); }
@@ -90,7 +125,12 @@
                 color: var(--muted); margin: 0 0 .7rem; display: flex; align-items: center; gap: .5rem; }
   .section h2::before { content: ""; width: 7px; height: 7px; border-radius: 50%;
                         background: var(--ink); display: inline-block; }
-  .var-row { display: grid; grid-template-columns: 1fr 2fr auto; gap: .5rem; margin-bottom: .4rem; }
+  .var-row { display: grid; grid-template-columns: 1fr 2fr auto auto; gap: .5rem;
+             margin-bottom: .4rem; align-items: center; }
+  .var-row.var-missing input:nth-of-type(2) { border-color: var(--bad);
+             box-shadow: 0 0 0 2px rgba(224,45,16,.18); }
+  .var-badge { font-size: .6rem; font-weight: 700; text-transform: uppercase;
+               letter-spacing: .06em; color: var(--bad); white-space: nowrap; }
   .field-grid { display: grid; gap: .6rem .75rem;
                 grid-template-columns: repeat(auto-fill, minmax(215px, 1fr)); }
   .field label { display: flex; align-items: center; gap: .35rem; font-size: .62rem;
@@ -112,6 +152,30 @@
   .pop pre.pic { background: var(--screen); color: var(--screen-text); border-radius: 6px;
                  padding: .45rem .55rem; margin: 0 0 .45rem; white-space: pre;
                  font: 11px/1.5 ui-monospace, "SF Mono", monospace; overflow-x: auto; }
+  /* ---------- variable picker menu (the "+ Variable" dropdown) ---------- */
+  .varmenu-host { position: relative; display: inline-block; }
+  .picker-host { position: relative; display: flex; gap: .3rem; align-items: center; }
+  .picker-host input { flex: 1; min-width: 0; }
+  .picker-btn { flex: none; padding: .35rem .5rem; }
+  .varmenu { width: 348px; max-height: 380px; overflow-y: auto; }
+  .varmenu input { margin-bottom: .4rem; }
+  .varmenu .vgroup { font-size: .6rem; text-transform: uppercase; letter-spacing: .08em;
+                     color: var(--muted); font-weight: 700; padding: .35rem .3rem .15rem; }
+  .varmenu .vitem { display: flex; align-items: center; gap: .5rem; padding: .3rem .4rem;
+                    border-radius: 7px; cursor: pointer; }
+  .varmenu .vitem:hover { background: var(--panel); }
+  .varmenu .vitem.added { cursor: default; opacity: .5; }
+  .varmenu .vitem .vname { font-family: ui-monospace, monospace; font-weight: 700;
+                           font-size: .74rem; white-space: nowrap; flex: none; }
+  .varmenu .vitem .vdesc { flex: 1; font-size: .68rem; color: var(--muted); overflow: hidden;
+                           text-overflow: ellipsis; white-space: nowrap; }
+  .varmenu .vitem .vdefault { font-family: ui-monospace, monospace; font-size: .62rem;
+                              color: var(--accent); max-width: 100px; overflow: hidden;
+                              text-overflow: ellipsis; white-space: nowrap; flex: none; }
+  .varmenu .vitem.added .vdefault { color: var(--muted); }
+  .varmenu .vcustom .vname { color: var(--accent); }
+  .varmenu hr { border: none; border-top: 1.5px solid var(--line); margin: .4rem 0; }
+  .varmenu .vempty { font-size: .74rem; color: var(--muted); margin: .3rem .2rem; }
   /* ---------- stages ---------- */
   .stage { border: 1.5px solid var(--ink); border-left: 6px solid var(--line);
            border-radius: 12px; background: var(--panel2); margin-bottom: .7rem;
@@ -127,7 +191,7 @@
   .stage.open .head { border-bottom: 1.5px solid var(--line); }
   .stage .head input.name { width: 230px; font-weight: 700; background: transparent;
                             border-color: transparent; }
-  .stage .head input.name:hover, .stage .head input.name:focus { background: #fff;
+  .stage .head input.name:hover, .stage .head input.name:focus { background: var(--input-bg);
                             border-color: var(--line); }
   .stage .summary { font-size: .72rem; color: var(--muted); overflow: hidden;
                     font-family: ui-monospace, monospace;
@@ -160,10 +224,10 @@
   .t-sarm .typechip { background: var(--c-sarm); border-color: var(--c-sarm); }
   .spacer { flex: 1; }
   #toast { position: fixed; bottom: 1.1rem; left: 50%; transform: translateX(-50%);
-           background: var(--ink); color: #fff; border: 1.5px solid var(--ink);
+           background: var(--ink); color: var(--bg); border: 1.5px solid var(--ink);
            padding: .55rem 1.1rem; border-radius: 10px; display: none; z-index: 10;
            max-width: 70ch; font-size: .82rem; box-shadow: 0 3px 0 rgba(22,21,15,.4); }
-  #toast.error { background: var(--bad); }
+  #toast.error { background: var(--bad); color: #fff; }
   .hint { font-size: .74rem; color: var(--muted); margin: .2rem 0 0; }
   a { color: var(--accent); }
   /* ---------- guide view ---------- */
@@ -187,7 +251,7 @@
   #guide-flow .fnode { border: 1.5px solid var(--ink); border-radius: 9px; padding: .3rem .7rem;
                        font-size: .68rem; font-weight: 700; text-transform: uppercase;
                        letter-spacing: .06em; cursor: pointer; background: var(--panel2);
-                       color: var(--ink) !important; box-shadow: 0 2px 0 var(--ink);
+                       color: var(--ink) !important; box-shadow: 0 2px 0 var(--key-shadow);
                        display: inline-flex; align-items: center; gap: .4rem; }
   #guide-flow .fnode::before { content: ""; width: 8px; height: 8px; border-radius: 50%;
                        background: currentColor; }
@@ -209,12 +273,12 @@
   .issue.ok   { border-left-color: var(--ok); }
   .issue b { font-size: .85rem; }
   .issue p { margin: .25rem 0 0; font-size: .8rem; color: var(--muted); }
-  table.map { width: 100%; border-collapse: collapse; font-size: .76rem; background: #fff; }
+  table.map { width: 100%; border-collapse: collapse; font-size: .76rem; background: var(--input-bg); }
   table.map th { text-align: left; color: var(--muted); font-weight: 700; padding: .3rem .5rem;
                  font-size: .62rem; text-transform: uppercase; letter-spacing: .07em;
                  border-bottom: 1.5px solid var(--ink); position: sticky; top: 0;
                  background: var(--panel); }
-  table.map td { padding: .24rem .5rem; border-bottom: 1px solid #e4e2dc;
+  table.map td { padding: .24rem .5rem; border-bottom: 1px solid var(--table-border);
                  font-family: ui-monospace, monospace; }
   td.m-ok { color: var(--ok); font-weight: 700; }
   td.m-pad { color: var(--bad); font-weight: 700; }
@@ -228,6 +292,14 @@
   iframe.viz { width: 100%; height: 560px; border: 1.5px solid var(--ink); border-radius: 12px;
                background: var(--screen); }
 </style>
+<script>
+/* Apply any explicitly-saved theme before first paint, so a returning user
+   who overrode their OS preference doesn't see a flash of the wrong theme. */
+(function () {
+  var saved = localStorage.getItem("xlerobot-cotrain-theme");
+  if (saved) document.documentElement.setAttribute("data-theme", saved);
+})();
+</script>
 </head>
 <body>
 <header>
@@ -236,6 +308,7 @@
     <button data-view="workflow" class="active">Workflow</button>
     <button data-view="compare">Compare datasets</button>
     <button data-view="guide">Guide</button>
+    <button data-view="log">Log <span id="log-tab-dot" class="tabdot hidden"></span></button>
   </nav>
   <span id="wf-title" style="color:var(--muted)">no workflow selected</span>
   <span id="run-chip" class="chip" style="display:none"></span>
@@ -246,6 +319,7 @@
     <button id="btn-run" class="primary">Run all</button>
     <button id="btn-stop" class="danger">Stop</button>
   </span>
+  <button id="theme-toggle" class="small" title="Toggle dark mode">☾ dark</button>
 </header>
 <main>
   <!-- ============================ WORKFLOW ============================ -->
@@ -267,8 +341,13 @@
       <p class="hint" style="font-size:.85rem;line-height:1.6;margin-top:.6rem">
       <b>Run</b> and <b>Run all</b> execute stages directly on this machine — no copy-pasting.
       Every stage is also written to <code style="font-family:ui-monospace">workflows/&lt;name&gt;/scripts/*.sh</code>
-      when you hit <b>Generate scripts</b>, so anything can be re-run by hand or on another box.</p>
+      when you hit <b>Generate scripts</b>, so anything can be re-run by hand or on another box.
+      Watch progress on the <b>Log</b> tab — it lights up while a stage is running.</p>
     </div></div>
+  </div>
+
+  <!-- ============================ LOG (toggleable page) ============================ -->
+  <div class="view" id="view-log">
     <div id="logpane">
       <div class="bar">
         <span style="font-size:.8rem;color:var(--muted)">Log:</span>
@@ -363,8 +442,8 @@ const STAGE_FIELDS = {
      info:"Training data: a merged co-train dataset (pre-train) or a single task repo (fine-tune)."},
     {k:"dataset_root", label:"Dataset root (optional)", ph:"$HOME/.cache/huggingface/lerobot/...",
      info:"Local path override. Source weighting reads meta/cotrain_sources.json from here (or the HF cache)."},
-    {k:"policy_type", label:"Policy type", ph:"smolvla",
-     info:"smolvla / act / diffusion / pi0 … — the policy architecture to train."},
+    {k:"policy_type", label:"Policy type", ph:"smolvla", datalist:"policies",
+     info:"The policy architecture to train. Suggestions are every policy registered in this checkout (src/lerobot/policies/*) — type to filter, or enter a name not yet in the list."},
     {k:"pretrained_path", label:"Pretrained path", wide:true,
      ph:"lerobot/smolvla_base or outputs/train/.../checkpoints/last/pretrained_model",
      info:"Starting weights: a base model for pre-training, or a previous stage's checkpoint to continue from.",
@@ -377,8 +456,8 @@ const STAGE_FIELDS = {
      info:"Checkpoint every N steps → output_dir/checkpoints/."},
     {k:"peak_lr", label:"Peak LR", ph:"5e-5",
      info:"Scheduler peak. Fine-tunes want a LOW peak (5e-5) so the generalist isn't wiped."},
-    {k:"scheduler_type", label:"Scheduler", ph:"cosine_decay_with_warmup",
-     info:"LR curve. cosine_decay_with_warmup is the fine-tune default; blank = policy default.",
+    {k:"scheduler_type", label:"Scheduler", ph:"cosine_decay_with_warmup", datalist:"schedulers",
+     info:"LR curve. cosine_decay_with_warmup is the fine-tune default; blank = policy default. Suggestions come from src/lerobot/optim/schedulers.py.",
      pic:"lr ▁▄█▇▅▃▂▁  warmup→decay"},
     {k:"output_dir", label:"Output dir", ph:"outputs/train/my_run",
      info:"Checkpoints + logs land here. Later stages point pretrained_path at .../checkpoints/last/pretrained_model."},
@@ -404,6 +483,12 @@ const STAGE_FIELDS = {
      info:"Project name runs are grouped under."},
     {k:"resume", label:"Resume from output dir", type:"check",
      info:"Continue an interrupted run from the last checkpoint in output_dir."},
+    {k:"push_to_hub", label:"Push policy to Hub", type:"check",
+     info:"lerobot-train defaults to pushing the trained policy to the Hub, which fails validation without a repo id — this always passes --policy.push_to_hub explicitly. OFF (default) is right for intermediate/pipeline stages.",
+     pic:"OFF (default) → --policy.push_to_hub=false\nON  → --policy.push_to_hub=true\n      --policy.repo_id=<below>"},
+    {k:"policy_repo_id", label:"Policy Hub repo id", ph:"Odog16/trash_pickup_specialist",
+     show:(p)=>!!p.push_to_hub,
+     info:"Where the pushed checkpoint lands on the Hub. Required when Push policy to Hub is on."},
     {k:"extra_args", label:"Extra CLI args", wide:true, ph:"--policy.chunk_size=50",
      info:"Raw flags appended verbatim to lerobot-train."},
   ],
@@ -425,8 +510,8 @@ const STAGE_FIELDS = {
      info:"Optional downsample while extracting (nearest-neighbour; never upsamples)."},
     {k:"target_image_size", label:"Image size HxW", ph:"360x640",
      info:"Optional resize of RGB frames during extraction."},
-    {k:"robot_type", label:"Robot type override", ph:"xlerobot",
-     info:"Metadata label for the subset. Blank keeps the source's."},
+    {k:"robot_type", label:"Robot type override", ph:"xlerobot", datalist:"robots",
+     info:"Metadata label for the subset. Blank keeps the source's. Suggestions are every robot registered in this checkout (src/lerobot/robots/*)."},
     {k:"keep_depth", label:"Keep depth streams", type:"check",
      info:"OFF (default) strips *_depth — 18-DOF RGB-D master → RGB-only subset that shape-matches external data. ON keeps depth for depth-aware training.",
      pic:"head ▣ + head_depth ▨\n  └─▶ head ▣   (default)"},
@@ -499,6 +584,35 @@ const STAGE_TEMPLATES = {
   custom:  {name:"Custom script", type:"custom", enabled:true, params:{script:""}},
 };
 
+/* Common workflow variables offered by the "+ Variable" menu — one dense line
+   each: name, what it's for, and a preview of a sane default. */
+const VARIABLE_CATALOG = [
+  {group:"Dataset repos", items:[
+    {key:"HF_USER", default:"Odog16", info:"Your HF username/org — prefix for every repo id below."},
+    {key:"MASTER_REPO", default:"Odog16/master_home_v1", info:"Full 18-DOF RGB-D recording — untouched source of truth."},
+    {key:"SUBSET_REPO", default:"Odog16/master_home_v1_bimanual12", info:"12-DOF RGB-only view extracted from the master."},
+    {key:"REFERENCE_REPO", default:"Odog16/tool_pickup", info:"Schema reference for --match-features-from (defines joint names)."},
+    {key:"MERGED_REPO", default:"Odog16/xlerobot_cotrain_v1", info:"Output of a single-stage co-train merge."},
+    {key:"MERGED_12DOF", default:"Odog16/cotrain_umi_bimanual_12dof", info:"Stage-1 merge: subset + UMI + bimanual data."},
+    {key:"MERGED_18DOF", default:"Odog16/cotrain_native_18dof", info:"Stage-2 merge: your native 18-DOF task repos."},
+    {key:"TASK_A", default:"Odog16/trash_pickup", info:"Single-task repo for a fine-tune or SARM stage."},
+    {key:"TASK_B", default:"Odog16/tool_pickup", info:"A second single-task repo (e.g. another fine-tune)."},
+    {key:"TASK_REPOS", default:"Odog16/trash_pickup Odog16/tool_pickup", info:"Space-separated native task repos to merge."},
+    {key:"EXTERNAL_REPOS", default:"Odog16/aloha_aligned_for_cotrain", info:"Converted external data to co-train with."},
+    {key:"BIMANUAL_REPOS", default:"Odog16/aloha_aligned_for_cotrain", info:"Bimanual (ALOHA/Open-X) sources for a 12-DOF merge."},
+    {key:"UMI_REPOS", default:"Odog16/umi_pretrain_clean_desktop", info:"Retargeted FastUMI sources for pretraining scale."},
+    {key:"SARM_MODEL", default:"Odog16/sarm_xlerobot", info:"Trained SARM reward model used for annotation."},
+  ]},
+  {group:"Training knobs", items:[
+    {key:"GENERALIST_STEPS", default:"60000", info:"Steps for a single-stage generalist pre-train."},
+    {key:"STAGE1_STEPS", default:"40000", info:"Steps for the UMI-heavy 12-DOF pre-train stage."},
+    {key:"STAGE2_STEPS", default:"30000", info:"Steps for the native 18-DOF continuation stage."},
+    {key:"FINETUNE_STEPS", default:"20000", info:"Steps for a per-task specialist fine-tune."},
+    {key:"FINETUNE_LR", default:"5e-5", info:"Low peak LR so fine-tuning doesn't erase the generalist."},
+    {key:"BATCH_SIZE", default:"16", info:"Per-GPU batch size shared across stages."},
+  ]},
+];
+
 /* ------------------------------ api helpers ------------------------------ */
 async function api(path, body) {
   const res = await fetch(path, body === undefined ? {} :
@@ -545,6 +659,118 @@ function infoBtn(entry) {
   };
   return b;
 }
+
+/* ------------------------------ variable picker menu ------------------------------ */
+function openVarMenu(hostWrap) {
+  const existing = hostWrap.querySelector(".varmenu");
+  closePops();
+  if (existing) return;                                // second click closes
+  const vars = wf.variables || (wf.variables = {});
+
+  function addVar(key, value) {
+    vars[key] = value; markDirty(); closePops(); render();
+  }
+
+  const filterInput = el("input", {placeholder: "Filter variables…"});
+  const list = el("div", {class: "vlist"});
+  const footer = el("div", {class: "vfooter"});
+  const menu = el("div", {class: "pop varmenu", onclick: (e) => e.stopPropagation()},
+                  filterInput, list, footer);
+
+  let topRow = null;
+  function renderList(query) {
+    list.innerHTML = ""; topRow = null;
+    const needle = query.trim().toLowerCase();
+    for (const grp of VARIABLE_CATALOG) {
+      const matches = grp.items.filter(it => !needle
+        || it.key.toLowerCase().includes(needle) || it.info.toLowerCase().includes(needle));
+      if (!matches.length) continue;
+      list.appendChild(el("div", {class: "vgroup", text: grp.group}));
+      for (const it of matches) {
+        const already = Object.prototype.hasOwnProperty.call(vars, it.key);
+        const row = el("div", {class: "vitem" + (already ? " added" : "")},
+          el("span", {class: "vname", text: it.key}),
+          el("span", {class: "vdesc", text: it.info}),
+          el("span", {class: "vdefault", text: already ? "already added" : it.default}));
+        if (!already) {
+          row.onclick = () => addVar(it.key, it.default);
+          if (!topRow) topRow = row;
+        }
+        list.appendChild(row);
+      }
+    }
+    if (!list.children.length)
+      list.appendChild(el("p", {class: "vempty", text: "No matches — use Custom below."}));
+  }
+  renderList("");
+  filterInput.oninput = () => renderList(filterInput.value);
+  filterInput.onkeydown = (ev) => {
+    if (ev.key === "Enter" && topRow) { ev.preventDefault(); topRow.click(); }
+    else if (ev.key === "Escape") closePops();
+  };
+
+  const customRow = el("div", {class: "vitem vcustom", onclick: () => {
+    let n = 1, name = "NEW_VAR";
+    while (Object.prototype.hasOwnProperty.call(vars, name)) { n += 1; name = `NEW_VAR_${n}`; }
+    addVar(name, "");
+  }}, el("span", {class: "vname", text: "+ Custom…"}),
+     el("span", {class: "vdesc", text: "Blank variable — name it yourself"}));
+  footer.append(el("hr"), customRow);
+
+  hostWrap.appendChild(menu);
+  filterInput.focus();
+  const r = menu.getBoundingClientRect();              // keep on-screen
+  if (r.right > innerWidth - 8) { menu.style.left = "auto"; menu.style.right = "0"; }
+}
+
+/* ------------------------------ registry picker menu ------------------------------ */
+/* Same dense list look as the variable menu, but always shows every option
+   regardless of the field's current value — unlike native <input list>
+   datalists, which filter suggestions against the existing text and so show
+   almost nothing once a field is pre-filled (e.g. "smolvla"). */
+function openRegistryMenu(hostWrap, categoryKey, currentValue, onSelect) {
+  const existing = hostWrap.querySelector(".varmenu");
+  closePops();
+  if (existing) return;
+  const options = REGISTRY[categoryKey] || [];
+
+  const filterInput = el("input", {placeholder: `Filter ${categoryKey}…`});
+  const list = el("div", {class: "vlist"});
+  const menu = el("div", {class: "pop varmenu", onclick: (e) => e.stopPropagation()},
+                  filterInput, list);
+
+  let topRow = null;
+  function renderList(query) {
+    list.innerHTML = ""; topRow = null;
+    const needle = query.trim().toLowerCase();
+    const matches = options.filter((o) => !needle || o.toLowerCase().includes(needle));
+    for (const o of matches) {
+      const isCurrent = o === currentValue;
+      const row = el("div", {class: "vitem" + (isCurrent ? " added" : "")},
+        el("span", {class: "vname", text: o}),
+        el("span", {class: "vdesc", text: isCurrent ? "current value" : ""}));
+      row.onclick = () => { onSelect(o); closePops(); };
+      list.appendChild(row);
+      if (!topRow) topRow = row;
+    }
+    if (!matches.length) {
+      list.appendChild(el("p", {class: "vempty", text: options.length
+        ? "No matches — you can still type any value in the field."
+        : "Registry not loaded yet (server unreachable?) — type a value directly."}));
+    }
+  }
+  renderList("");
+  filterInput.oninput = () => renderList(filterInput.value);
+  filterInput.onkeydown = (ev) => {
+    if (ev.key === "Enter" && topRow) { ev.preventDefault(); topRow.click(); }
+    else if (ev.key === "Escape") closePops();
+  };
+
+  hostWrap.appendChild(menu);
+  filterInput.focus();
+  const r = menu.getBoundingClientRect();
+  if (r.right > innerWidth - 8) { menu.style.left = "auto"; menu.style.right = "0"; }
+}
 document.addEventListener("click", () => closePops());
 
 /* ------------------------------ tabs ------------------------------ */
@@ -552,7 +778,8 @@ document.querySelectorAll("nav.tabs button").forEach(b => b.onclick = () => {
   document.querySelectorAll("nav.tabs button").forEach(x => x.classList.toggle("active", x === b));
   document.querySelectorAll(".view").forEach(v =>
     v.classList.toggle("active", v.id === "view-" + b.dataset.view));
-  $("#wf-actions").style.visibility = b.dataset.view === "workflow" ? "visible" : "hidden";
+  $("#wf-actions").style.visibility =
+    (b.dataset.view === "workflow" || b.dataset.view === "log") ? "visible" : "hidden";
 });
 
 /* ------------------------------ sidebar ------------------------------ */
@@ -580,6 +807,35 @@ function refreshListHighlight() {
 /* ------------------------------ workflow rendering ------------------------------ */
 function markDirty() { dirty = true; }
 
+/* ------------------------------ required-variable checks ------------------------------ */
+/* A variable is "required" if some enabled stage references it via {{NAME}} —
+   scripts built from an empty required variable produce a broken flag
+   (e.g. --target-repo-id=) and fail to run, so we catch that before Run/Generate. */
+const VAR_REF_RE = /\{\{\s*([A-Za-z0-9_]+)\s*\}\}/g;
+function usedVariablesIn(stages) {
+  const used = new Set();
+  for (const stage of stages) {
+    const text = JSON.stringify(stage.params || {});
+    let m;
+    VAR_REF_RE.lastIndex = 0;
+    while ((m = VAR_REF_RE.exec(text))) used.add(m[1]);
+  }
+  return used;
+}
+function missingRequiredVars(stages) {
+  const used = usedVariablesIn(stages);
+  const vars = (wf && wf.variables) || {};
+  return [...used].filter((name) => !String(vars[name] ?? "").trim());
+}
+function blockIfMissingVars(stages, actionLabel) {
+  const missing = missingRequiredVars(stages);
+  if (!missing.length) return false;
+  toast(`${actionLabel}: fill in required variable(s) ${missing.join(", ")} first.`, true);
+  render();
+  $("#editor .section")?.scrollIntoView({behavior: "smooth", block: "start"});
+  return true;
+}
+
 function render() {
   $("#wf-title").textContent = wf ? wf.name : "no workflow selected";
   const ed = $("#editor"); ed.innerHTML = "";
@@ -588,17 +844,30 @@ function render() {
   const varSec = el("div", {class: "section"});
   varSec.appendChild(el("h2", {text: "Variables — use {{NAME}} in any stage field"}));
   const vars = wf.variables || (wf.variables = {});
+  const usedVars = usedVariablesIn((wf.stages || []).filter((s) => s.enabled !== false));
   for (const key of Object.keys(vars)) {
+    const isUsed = usedVars.has(key);
+    const row = el("div", {class: "var-row"});
     const ki = el("input", {value: key});
     const vi = el("input", {value: vars[key]});
+    const badge = el("span", {class: "var-badge"});
+    const refreshMissing = () => {
+      const missing = isUsed && !String(vars[key]).trim();
+      row.classList.toggle("var-missing", missing);
+      badge.textContent = missing ? "required" : "";
+    };
     ki.onchange = () => { const v = vars[key]; delete vars[key]; vars[ki.value] = v; markDirty(); render(); };
-    vi.oninput = () => { vars[key] = vi.value; markDirty(); };
-    varSec.appendChild(el("div", {class: "var-row"}, ki, vi,
-      el("button", {class: "small danger", text: "✕",
-                    onclick: () => { delete vars[key]; markDirty(); render(); }})));
+    vi.oninput = () => { vars[key] = vi.value; markDirty(); refreshMissing(); };
+    refreshMissing();
+    row.append(ki, vi, badge, el("button", {class: "small danger", text: "✕",
+                    onclick: () => { delete vars[key]; markDirty(); render(); }}));
+    varSec.appendChild(row);
   }
-  varSec.appendChild(el("button", {class: "small", text: "+ variable",
-    onclick: () => { vars["NEW_VAR"] = ""; markDirty(); render(); }}));
+  const addVarWrap = el("span", {class: "varmenu-host"});
+  const addVarBtn = el("button", {class: "small", text: "+ Variable"});
+  addVarBtn.onclick = (ev) => { ev.stopPropagation(); openVarMenu(addVarWrap); };
+  addVarWrap.appendChild(addVarBtn);
+  varSec.appendChild(addVarWrap);
   ed.appendChild(varSec);
 
   const stSec = el("div", {class: "section"});
@@ -711,6 +980,20 @@ function renderField(f, params) {
     input = el("input", {placeholder: f.ph || ""});
     input.value = params[f.k] ?? "";
     input.oninput = () => { params[f.k] = input.value; markDirty(); };
+    if (f.datalist) {
+      const pickerWrap = el("span", {class: "picker-host"});
+      const pickerBtn = el("button", {class: "small picker-btn", text: "▾",
+        title: `Pick a known ${f.datalist.replace(/s$/, "")}`});
+      pickerBtn.onclick = (ev) => {
+        ev.stopPropagation();
+        openRegistryMenu(pickerWrap, f.datalist, input.value, (choice) => {
+          input.value = choice; params[f.k] = choice; markDirty();
+        });
+      };
+      pickerWrap.append(input, pickerBtn);
+      wrap.appendChild(pickerWrap);
+      return wrap;
+    }
   }
   wrap.appendChild(input);
   return wrap;
@@ -750,6 +1033,10 @@ async function saveWorkflow(quiet) {
 }
 async function runWorkflow(stage) {
   if (!wf) return;
+  const relevant = stage === undefined
+    ? (wf.stages || []).filter((s) => s.enabled !== false)
+    : (wf.stages[stage]?.enabled !== false ? [wf.stages[stage]] : []);
+  if (blockIfMissingVars(relevant, stage === undefined ? "Run all" : "Run stage")) return;
   try {
     await saveWorkflow(true);
     await api("/api/run", stage === undefined ? {name: wf.name} : {name: wf.name, stage});
@@ -765,10 +1052,15 @@ async function pollStatus(force) {
   try {
     const st = await api("/api/status?name=" + encodeURIComponent(wf.name));
     const chip = $("#run-chip");
+    const dot = $("#log-tab-dot");
     if (st.status && st.status !== "idle") {
       chip.style.display = ""; chip.textContent = st.status;
       chip.className = "chip " + st.status;
-    } else chip.style.display = "none";
+      dot.className = "tabdot " + st.status;
+    } else {
+      chip.style.display = "none";
+      dot.className = "tabdot hidden";
+    }
     if (st.error && force) toast(st.error, true);
     lastStages = st.stages || [];
     document.querySelectorAll(".chip[data-stage]").forEach(e => {
@@ -814,6 +1106,8 @@ setInterval(pollStatus, 2000);
 $("#btn-save").onclick = () => saveWorkflow().catch(e => toast(e.message, true));
 $("#btn-generate").onclick = async () => {
   if (!wf) return;
+  const enabled = (wf.stages || []).filter((s) => s.enabled !== false);
+  if (blockIfMissingVars(enabled, "Generate scripts")) return;
   try {
     await saveWorkflow(true);
     const {scripts} = await api("/api/generate", {name: wf.name});
@@ -1146,8 +1440,39 @@ function renderGuide() {
     g.appendChild(sec);
   }
 }
+/* ------------------------------ repo option registry ------------------------------ */
+/* Real policy/robot/scheduler type names from this checkout, offered through
+   the "▾" picker button (openRegistryMenu) — not enforced, since a value
+   might be for a policy/robot added after this server started (restart to
+   pick it up) or simply not yet merged. Read live at click-time by
+   openRegistryMenu, so it doesn't matter whether this resolves before or
+   after a field with a picker button has already been rendered. */
+let REGISTRY = {policies: [], robots: [], schedulers: []};
+async function loadRegistry() {
+  try { REGISTRY = await api("/api/registry"); }
+  catch (e) { /* fields still work as plain free text; picker shows "not loaded" */ }
+}
+
+/* ------------------------------ theme toggle ------------------------------ */
+const THEME_KEY = "xlerobot-cotrain-theme";
+function currentTheme() {
+  return document.documentElement.getAttribute("data-theme")
+    || (matchMedia("(prefers-color-scheme: dark)").matches ? "dark" : "light");
+}
+function updateThemeToggleLabel() {
+  $("#theme-toggle").textContent = currentTheme() === "dark" ? "☀ light" : "☾ dark";
+}
+$("#theme-toggle").onclick = () => {
+  const next = currentTheme() === "dark" ? "light" : "dark";
+  document.documentElement.setAttribute("data-theme", next);
+  localStorage.setItem(THEME_KEY, next);
+  updateThemeToggleLabel();
+};
+updateThemeToggleLabel();
+
 renderGuide();
 refreshList();
+loadRegistry();
 </script>
 </body>
 </html>
