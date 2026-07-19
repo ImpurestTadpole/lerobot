@@ -64,6 +64,165 @@ While these devices are natively integrated into the LeRobot codebase, the libra
 
 For detailed hardware setup guides, see the [Hardware Documentation](https://huggingface.co/docs/lerobot/integrate_hardware).
 
+## XLerobot — Mobile Bimanual Robot
+
+**XLerobot** is a fully mobile, bimanual manipulation platform built on top of LeRobot. It combines an omnidirectional wheeled base with two independent 6-DOF arms, a 2-DOF head, an optional vertical gantry lift axis, and a multi-camera vision system — all driven by Feetech STS3215 servo motors and integrated into the standard `Robot` interface.
+
+### Hardware Overview
+
+| Component | Details |
+|---|---|
+| **Mobile base** | 3-wheel omnidirectional (omni-wheels at 120°), velocity-controlled via Feetech STS3215 |
+| **Left arm** | 6-DOF (shoulder pan/lift, elbow flex, wrist flex/roll, gripper) — STS3215 servos on Bus 1 |
+| **Right arm** | 6-DOF (same joint layout as left) — STS3215 servos on Bus 2 |
+| **Head** | 2-DOF pan + tilt — STS3215 servos on Bus 2 |
+| **Gantry lift** | Optional Z-axis leadscrew (100 mm/rev, 575 mm stroke) — single STS3215 on Bus 2, motor ID 9 |
+| **Head camera** | Intel RealSense D435i (640×360 RGB, 30 fps, serial `342222071125`) |
+| **Wrist cameras** | 2× Innomaker USB cameras (640×360 MJPG, 30 fps) on `/dev/video6` and `/dev/video8` |
+| **Compute** | NVIDIA Jetson (on-robot), with optional ZMQ bridge to a remote GPU workstation |
+
+**Motor bus layout:**
+- **Bus 1** (`/dev/ttyACM1`): Left arm (IDs 1–6) + omni-base wheels (IDs 7–9)
+- **Bus 2** (`/dev/ttyACM0`): Right arm (IDs 1–6) + head pan/tilt (IDs 7–8) + gantry lift (ID 9, optional)
+
+### Installation
+
+Install LeRobot with the XLerobot dependencies (Feetech motors + RealSense camera):
+
+```bash
+pip install lerobot[feetech,realsense,viz]
+```
+
+### Configuration
+
+XLerobot uses the `xlerobot` robot type. The default configuration is defined in `XLerobotConfig`:
+
+```python
+from lerobot.robots.xlerobot import XLerobot
+from lerobot.robots.xlerobot.config_xlerobot import XLerobotConfig
+
+config = XLerobotConfig(
+    port1="/dev/ttyACM1",   # Bus 1: left arm + base
+    port2="/dev/ttyACM0",   # Bus 2: right arm + head + lift
+)
+robot = XLerobot(config)
+robot.connect()
+```
+
+**Enable the gantry lift axis:**
+
+```python
+from lerobot.robots.xlerobot.lift_axis import LiftAxisConfig
+
+config = XLerobotConfig(
+    lift_axis=LiftAxisConfig(
+        enabled=True,
+        soft_max_mm=575.0,      # travel range
+        max_cmd_vel_frac=0.4,   # policy velocity cap (40% of v_max)
+        home_on_connect=True,   # auto-home when robot.connect() is called
+    )
+)
+```
+
+**Remote mode (ZMQ bridge)** — run inference on a GPU workstation while the Jetson controls the hardware:
+
+```python
+# On the Jetson (robot side):
+from lerobot.robots.xlerobot.xlerobot_host import XLerobotHost
+host = XLerobotHost(robot)
+host.run()
+
+# On the GPU workstation (client side):
+from lerobot.robots.xlerobot.config_xlerobot import XLerobotClientConfig
+config = XLerobotClientConfig(remote_ip="JETSON_IP")
+robot = XLerobot(config)  # streams observations + sends actions over ZMQ
+```
+
+### Calibration
+
+Run the interactive calibration routine once per robot (saves to disk for future sessions):
+
+```bash
+lerobot-calibrate --robot.type=xlerobot --robot.port1=/dev/ttyACM1 --robot.port2=/dev/ttyACM0
+```
+
+The calibration wizard walks through each joint group in order:
+
+1. **Left arm** — move to mid-range, then sweep full range of motion
+2. **Right arm** — same procedure
+3. **Head** — pan and tilt through full range
+4. **Base wheels** — set to full-turn mode automatically (no manual sweep needed)
+5. **Gantry lift** (if enabled) — drives downward until stall, then backs off to set home = 0 mm
+
+Calibration is saved to `~/.cache/huggingface/lerobot/calibration/xlerobot.json` and auto-loaded on subsequent `robot.connect()` calls.
+
+### Teleoperation
+
+Keyboard teleop drives the base while a paired leader arm (e.g. SO-100) controls the robot arms:
+
+```bash
+lerobot-teleoperate \
+  --robot.type=xlerobot \
+  --robot.port1=/dev/ttyACM1 \
+  --robot.port2=/dev/ttyACM0 \
+  --teleop.type=so100_leader
+```
+
+**Base keyboard controls** (active during any teleoperation session):
+
+| Key | Action |
+|---|---|
+| `i` / `k` | Forward / Backward |
+| `j` / `l` | Strafe Left / Right |
+| `u` / `o` | Rotate Left / Right |
+| `n` / `m` | Speed Up / Speed Down (3 levels) |
+| `b` | Quit |
+
+### Data Collection
+
+```bash
+lerobot-record \
+  --robot.type=xlerobot \
+  --robot.port1=/dev/ttyACM1 \
+  --robot.port2=/dev/ttyACM0 \
+  --dataset.repo_id=YOUR_HF_USERNAME/xlerobot_task \
+  --dataset.num_episodes=50
+```
+
+### Observation & Action Space
+
+| Key | Type | Description |
+|---|---|---|
+| `left_arm_*.pos` | `float` ×6 | Left arm joint positions (normalized −100 to 100) |
+| `right_arm_*.pos` | `float` ×6 | Right arm joint positions |
+| `head_pan.pos`, `head_tilt.pos` | `float` ×2 | Head joint positions |
+| `x.vel`, `y.vel`, `theta.vel` | `float` ×3 | Base body-frame velocities (m/s, deg/s) |
+| `gantry.height_mm` | `float` | Lift axis height in mm (0 = home/bottom) |
+| `head` | `uint8 (360, 640, 3)` | RealSense head camera (RGB) |
+| `left_wrist` | `uint8 (360, 640, 3)` | Left wrist camera (RGB) |
+| `right_wrist` | `uint8 (360, 640, 3)` | Right wrist camera (RGB) |
+
+The camera names (`head`, `left_wrist`, `right_wrist`) are aligned with **SmolVLA**'s `OBS_IMAGE_1/2/3` convention, making the robot natively compatible with SmolVLA policies without any rename mapping.
+
+### Visualization
+
+Stream live robot data to a [Rerun](https://rerun.io) viewer during teleoperation or recording:
+
+```bash
+lerobot-teleoperate --robot.type=xlerobot ... --display_data=true
+```
+
+Set environment variables to tune streaming performance on Jetson:
+
+```bash
+export RERUN_FLUSH_TICK_SECS=0.008   # flush every 8ms for low latency
+export RERUN_FLUSH_NUM_BYTES=16000   # ~16 KB per flush
+export RERUN_LOG_FREQUENCY=2         # log every other frame to reduce CPU
+export RERUN_DOWNSAMPLE_FACTOR=0.5   # resize images before sending
+```
+
+---
+
 ## LeRobot Dataset
 
 To solve the data fragmentation problem in robotics, we utilize the **LeRobotDataset** format.
