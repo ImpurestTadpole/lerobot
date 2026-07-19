@@ -261,35 +261,32 @@ class PreTrainedConfig(draccus.ChoiceRegistry, HubMixin, abc.ABC):  # type: igno
         with open(config_file) as f:
             config = json.load(f)
 
-        if "type" not in config:
+        # Resolve the concrete config subclass from the serialized "type" tag, then parse
+        # the config (with CLI overrides) directly for that class. The "type" key is
+        # stripped because draccus only consumes it when parsing the registry base class.
+        policy_type = config.pop("type", None)
+        if policy_type is None:
             inferred = _infer_policy_config_type(config)
             if inferred is not None:
-                config["type"] = inferred
+                policy_type = inferred
             else:
                 raise ValueError(
                     f"Policy {CONFIG_NAME} at {config_file!r} has no top-level 'type' key and "
                     "could not infer the policy class. Add \"type\": \"<policy_name>\" (e.g. "
                     '"sarm") or re-save the checkpoint with a current lerobot version.'
                 )
+        try:
+            config_cls = cls.get_choice_class(policy_type)
+        except Exception as e:
+            raise ValueError(
+                f"Policy type '{policy_type}' (from {CONFIG_NAME} of {model_id}) is not registered. "
+                f"Available policy types: {cls.get_known_choices()}"
+            ) from e
 
         with tempfile.NamedTemporaryFile("w+", delete=False, suffix=".json") as f:
             json.dump(config, f)
-            temp_for_choice = f.name
-
-        # HACK: Parse the original config to get the config subclass, so that we can
-        # apply cli overrides.
-        # This is very ugly, ideally we'd like to be able to do that natively with draccus
-        # something like --policy.path (in addition to --policy.type)
-        with draccus.config_type("json"):
-            orig_config = draccus.parse(cls, temp_for_choice, args=[])
-
-        # ChoiceRegistry dispatch requires top-level ``type``; concrete config dataclasses
-        # (e.g. SARMConfig) do not define that field — strip before the second parse.
-        config.pop("type", None)
-        with tempfile.NamedTemporaryFile("w+", delete=False, suffix=".json") as f:
-            json.dump(config, f)
-            temp_for_subclass = f.name
+            config_file = f.name
 
         cli_overrides = policy_kwargs.pop("cli_overrides", [])
         with draccus.config_type("json"):
-            return draccus.parse(orig_config.__class__, temp_for_subclass, args=cli_overrides)
+            return draccus.parse(config_cls, config_file, args=cli_overrides)
