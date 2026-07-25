@@ -74,6 +74,8 @@ class LeRobotDatasetMetadata:
         revision: str | None = None,
         force_cache_sync: bool = False,
         metadata_buffer_size: int = 10,
+        *,
+        token: str | bool | None = None,
     ):
         """Load or download metadata for an existing LeRobot dataset.
 
@@ -95,6 +97,10 @@ class LeRobotDatasetMetadata:
                 even when local files exist.
             metadata_buffer_size: Number of episode metadata records to buffer
                 in memory before flushing to parquet.
+            token: Authentication token used for Hub requests. Pass a string
+                token, ``True`` to require the locally stored token, ``False``
+                to disable authentication, or ``None`` to use the Hugging Face
+                Hub default.
         """
         self.repo_id = repo_id
         self.revision = revision if revision else CODEBASE_VERSION
@@ -115,9 +121,12 @@ class LeRobotDatasetMetadata:
         except (FileNotFoundError, NotADirectoryError) as local_err:
             try:
                 if is_valid_version(self.revision):
-                    self.revision = get_safe_version(self.repo_id, self.revision)
+                    if token is None:
+                        self.revision = get_safe_version(self.repo_id, self.revision)
+                    else:
+                        self.revision = get_safe_version(self.repo_id, self.revision, token=token)
 
-                self._pull_from_repo(allow_patterns="meta/")
+                self._pull_from_repo(allow_patterns="meta/", token=token)
                 self._load_metadata()
             except Exception as hub_err:
                 if isinstance(hub_err, RepositoryNotFoundError):
@@ -237,7 +246,10 @@ class LeRobotDatasetMetadata:
         self,
         allow_patterns: list[str] | str | None = None,
         ignore_patterns: list[str] | str | None = None,
+        *,
+        token: str | bool | None = None,
     ) -> None:
+        token_kwargs = {} if token is None else {"token": token}
         if self._requested_root is None:
             self.root = Path(
                 snapshot_download(
@@ -247,6 +259,7 @@ class LeRobotDatasetMetadata:
                     cache_dir=HF_LEROBOT_HUB_CACHE,
                     allow_patterns=allow_patterns,
                     ignore_patterns=ignore_patterns,
+                    **token_kwargs,
                 )
             )
             return
@@ -259,6 +272,7 @@ class LeRobotDatasetMetadata:
             local_dir=self._requested_root,
             allow_patterns=allow_patterns,
             ignore_patterns=ignore_patterns,
+            **token_kwargs,
         )
         self.root = self._requested_root
 
