@@ -28,7 +28,9 @@ from lerobot import envs
 from lerobot.optim import LRSchedulerConfig, OptimizerConfig
 from lerobot.utils.constants import PRETRAINED_MODEL_DIR
 from lerobot.utils.hub import HubMixin, find_latest_hub_checkpoint
+from lerobot.utils.source_sampling import SourceSamplingConfig
 from lerobot.utils.sample_weighting import SampleWeightingConfig
+from lerobot.utils.dim_masking import DimMaskingConfig
 
 from . import parser
 from .default import DatasetConfig, EvalConfig, JobConfig, PeftConfig, WandBConfig
@@ -129,8 +131,24 @@ class TrainPipelineConfig(HubMixin):
     # final model is pushed regardless. Works the same locally and remotely.
     save_checkpoint_to_hub: bool = False
 
-    # Sample weighting configuration (e.g., for RA-BC training)
+    # Sample weighting configuration (e.g., for RA-BC training) — reweights the
+    # LOSS of already-drawn samples, does not change draw frequency.
     sample_weighting: SampleWeightingConfig | None = None
+
+    # Source-group sampling configuration — controls how often each named group
+    # of co-training sources is *drawn* per epoch (see
+    # config/generalist_source_weights.yaml), independent of sample_weighting
+    # above. Use this to stop one very large source (e.g. DROID) from
+    # dominating the effective training distribution by raw frame count.
+    source_sampling: SourceSamplingConfig | None = None
+
+    # Per-dimension action loss masking for co-training merges — excludes
+    # fill-value dims (e.g. DROID's right arm in a dual-arm schema) from the
+    # loss for the sources that don't have that DOF, using the same
+    # meta/cotrain_sources.json manifest as sample_weighting/source_sampling
+    # above. See lerobot.utils.dim_masking. Currently consumed by PI05Policy;
+    # a no-op for any policy that doesn't read ACTION_DIM_MASK from the batch.
+    dim_masking: DimMaskingConfig | None = None
 
     # RA-BC (Reward-Aligned Behavior Cloning) parameters
     use_rabc: bool = False

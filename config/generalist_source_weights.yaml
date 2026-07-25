@@ -1,0 +1,86 @@
+# Per-source-group sampling weights for the EE-space generalist pretrain.
+#
+# Read by src/lerobot/utils/source_sampling.py, consumed by
+# WeightedEpisodeAwareSampler (src/lerobot/datasets/sampler.py) via
+# --source_sampling.group_config_path=config/generalist_source_weights.yaml
+# on lerobot-train. This controls how often each group is *drawn* per epoch
+# — independent of --sample_weighting (which reweights the loss of samples
+# already drawn, see meta/cotrain_sources.json + SourceWeighter). Both can be
+# used together; they don't conflict, since one affects sampling frequency
+# and the other affects loss magnitude.
+#
+# source_weights must sum to 1.0 (enforced at load time, not a soft check).
+# Every repo_id listed anywhere under a merged dataset's meta/cotrain_sources.json
+# must appear in exactly one group below, or training will refuse to start
+# (see build_episode_source_groups's unmapped-repo error) — this is
+# deliberate: an unmapped source getting an undefined weight silently is
+# exactly the kind of bug this whole mechanism exists to prevent.
+#
+# These starting values reflect this project's established value ranking
+# (own in-domain data highest, external sources capped regardless of their
+# raw volume) — NOT a final answer. Revisit once the generalist validation
+# step (fine-tune comparison vs. the old generalist) has real results.
+#
+# STATUS as of 2026-07-21 (see memory ee-space-generalist-plan.md): own_tasks
+# and the original 6 aloha_ee repos are done; fastumi_ee (full-volume),
+# the 13 extra aloha_ee repos, and droid_ee are still downloading/converting
+# in the background. Re-run the audit (see docs/dataset_composition_audit.md)
+# once everything finishes before actually training with this config —
+# repo_ids below are the intended final set, not all guaranteed to exist yet.
+#
+# KNOWN GAP: Odog16/test_transfer_block_ee failed to convert (source parquet
+# has an unparseable "depth"/"depth_" pyarrow dtype — a data-loading error,
+# not a bug in scripts/convert_joint_to_ee.py) and is deliberately left out
+# of own_tasks below until that's fixed; own_tasks' natural frame count will
+# change slightly once/if it's added back.
+
+source_weights:
+  own_tasks: 0.35
+  fastumi_ee: 0.20
+  aloha_ee: 0.15
+  droid_ee: 0.30
+
+source_groups:
+  own_tasks:
+    - Odog16/tool_pickup_ee
+    - Odog16/trash_pickup_merged_ee
+    - Odog16/block_sorting_single_ee
+    - Odog16/block_sorting_clean_ee
+    - Odog16/making_coffee_v1_ee
+    - Odog16/ob15_general_dataset_v1_ee
+    - Odog16/ob15_packing_box_filtered_ee
+    # - Odog16/test_transfer_block_ee  # excluded: conversion failed, see KNOWN GAP above
+
+  fastumi_ee:
+    - Odog16/umi_ee_pretrain_full_clean_desktop
+    - Odog16/umi_ee_pretrain_full_dispose_of_desktop_debris
+    - Odog16/umi_ee_pretrain_full_put_books_into_schoolbag
+    - Odog16/umi_ee_pretrain_full_pack_skincare_products
+    - Odog16/umi_ee_pretrain_full_take_bottle_and_place_on_coaster
+
+  aloha_ee:
+    - Odog16/aloha_sim_insertion_human_ee
+    - Odog16/aloha_sim_transfer_cube_human_ee
+    - Odog16/aloha_sim_transfer_cube_scripted_ee
+    - Odog16/aloha_static_coffee_ee
+    - Odog16/aloha_mobile_cabinet_ee
+    - Odog16/aloha_mobile_wash_pan_ee
+    - Odog16/aloha_static_screw_driver_ee
+    - Odog16/aloha_static_candy_ee
+    - Odog16/aloha_mobile_wipe_wine_ee
+    - Odog16/aloha_static_towel_ee
+    - Odog16/aloha_static_vinh_cup_ee
+    - Odog16/aloha_static_vinh_cup_left_ee
+    - Odog16/aloha_static_ziploc_slide_ee
+    - Odog16/aloha_static_coffee_new_ee
+    - Odog16/aloha_static_cups_open_ee
+    - Odog16/aloha_static_pingpong_test_ee
+    - Odog16/aloha_static_pro_pencil_ee
+    # - Odog16/aloha_mobile_shrimp_ee  # excluded: episodes average 3750 frames
+    # (vs. hundreds for every other source), OOM-killed twice at ~59GB RSS
+    # since convert_joint_to_ee.py loads a whole episode's decoded frames at
+    # once — a real gap in the script, not worth fixing for 18 episodes/~0.02h
+    - Odog16/aloha_sim_insertion_scripted_ee
+
+  droid_ee:
+    - Odog16/droid_ee

@@ -34,6 +34,10 @@ ACTION = "action"
 ACTION_PREFIX = ACTION + "."
 ACTION_TOKENS = ACTION + ".tokens"
 ACTION_TOKEN_MASK = ACTION + ".token_mask"
+# Per-sample, per-dim boolean mask (True = real command, False = a co-training
+# merge's fill value for a dim this source's embodiment doesn't have — see
+# lerobot.utils.dim_masking.DimMaskProvider). Absent from the batch = no masking.
+ACTION_DIM_MASK = ACTION + ".dim_mask"
 REWARD = "next.reward"
 TRUNCATED = "next.truncated"
 DONE = "next.done"

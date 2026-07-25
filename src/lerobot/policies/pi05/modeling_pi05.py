@@ -47,6 +47,7 @@ else:
 from lerobot.configs import PreTrainedConfig
 from lerobot.utils.constants import (
     ACTION,
+    ACTION_DIM_MASK,
     OBS_LANGUAGE_ATTENTION_MASK,
     OBS_LANGUAGE_TOKENS,
 )
@@ -1078,17 +1079,33 @@ class PI05Policy(PreTrainedPolicy):
         losses = losses[:, :, :original_action_dim]
 
         loss_dict = {
+            # Intentionally unmasked (raw per-dim mean) even when a dim mask is
+            # present below — this is what lets validation confirm masking is
+            # actually excluding the padded dims (their raw loss stays visible
+            # here while not contributing to the training signal).
             "loss_per_dim": losses.mean(dim=[0, 1]).detach().cpu().numpy().tolist(),
         }
 
+        # Per-dim co-training fill mask (True = real command), see
+        # lerobot.utils.dim_masking. Excludes dims that are merge fill values
+        # for this sample's source (e.g. DROID's right arm) from the loss, so
+        # the model isn't trained to predict a fake constant pose for them.
+        dim_mask = batch.get(ACTION_DIM_MASK)
+        if dim_mask is not None:
+            m = dim_mask[:, None, :original_action_dim].to(losses.dtype)  # [B, 1, D], broadcasts over time
+            losses = losses * m
+            denom = m.expand_as(losses).sum(dim=(1, 2)).clamp(min=1)  # [B], real (unmasked) elements
+        else:
+            denom = None
+
         if reduction == "none":
             # Return per-sample losses (B,) by averaging over time and action dims
-            per_sample_loss = losses.mean(dim=(1, 2))
+            per_sample_loss = losses.sum(dim=(1, 2)) / denom if denom is not None else losses.mean(dim=(1, 2))
             loss_dict["loss"] = per_sample_loss.mean().item()
             return per_sample_loss, loss_dict
         else:
             # Default: return scalar mean loss
-            loss = losses.mean()
+            loss = (losses.sum(dim=(1, 2)) / denom).mean() if denom is not None else losses.mean()
             loss_dict["loss"] = loss.item()
             return loss, loss_dict
 

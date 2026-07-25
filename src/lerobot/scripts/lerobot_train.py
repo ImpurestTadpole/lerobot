@@ -23,6 +23,7 @@ import logging
 import sys
 import time
 from contextlib import nullcontext
+from pathlib import Path
 from pprint import pformat
 from typing import TYPE_CHECKING, Any
 
@@ -57,6 +58,7 @@ from lerobot.optim.factory import make_optimizer_and_scheduler
 from lerobot.policies import PreTrainedPolicy, make_policy, make_pre_post_processors
 from lerobot.rewards import make_reward_pre_post_processors
 from lerobot.utils.collate import lerobot_collate_fn
+from lerobot.utils.constants import ACTION_DIM_MASK
 from lerobot.utils.import_utils import register_third_party_plugins
 from lerobot.utils.logging_utils import AverageMeter, MetricsTracker
 from lerobot.utils.random_utils import set_seed
@@ -81,6 +83,7 @@ def update_policy(
     lr_scheduler=None,
     lock=None,
     sample_weighter=None,
+    dim_mask_provider=None,
 ) -> tuple[MetricsTracker, dict | None]:
     """
     Performs a single training step to update the policy's weights.
@@ -98,6 +101,9 @@ def update_policy(
         lr_scheduler: An optional learning rate scheduler.
         lock: An optional lock for thread-safe optimizer updates.
         sample_weighter: Optional SampleWeighter instance for per-sample loss weighting.
+        dim_mask_provider: Optional DimMaskProvider instance for per-dim action loss
+            masking (excludes co-training fill-value dims from the loss). Injects
+            batch[ACTION_DIM_MASK]; a no-op for policies that don't read that key.
 
     Returns:
         A tuple containing:
@@ -109,6 +115,9 @@ def update_policy(
 
     if torch.cuda.is_available():
         torch.cuda.reset_peak_memory_stats()
+
+    if dim_mask_provider is not None:
+        batch[ACTION_DIM_MASK] = dim_mask_provider.compute_batch_mask(batch)
 
     # Compute sample weights if a weighter is provided
     sample_weights = None
@@ -383,6 +392,21 @@ def train(cfg: TrainPipelineConfig, accelerator: "Accelerator | None" = None):
             dataset_repo_id=cfg.dataset.repo_id,
         )
 
+    # Create per-dim action loss mask provider if configured (excludes co-training
+    # fill-value dims, e.g. DROID's right arm, from the loss)
+    dim_mask_provider = None
+    if cfg.dim_masking is not None:
+        from lerobot.utils.dim_masking import make_dim_mask_provider
+
+        if is_main_process:
+            logging.info("Creating dim mask provider for per-dim action loss masking")
+        dim_mask_provider = make_dim_mask_provider(
+            cfg.dim_masking,
+            device,
+            dataset_root=cfg.dataset.root,
+            dataset_repo_id=cfg.dataset.repo_id,
+        )
+
     step = 0  # number of policy updates (forward + backward + optim)
 
     if cfg.resume:
@@ -415,20 +439,58 @@ def train(cfg: TrainPipelineConfig, accelerator: "Accelerator | None" = None):
 
     # create dataloader for offline training
     if not cfg.dataset.streaming:
-        # All non-streaming (map-style) datasets use EpisodeAwareSampler.
-        # The order is a pure function of (seed, epoch), so every rank independently produces the
-        # same permutation. accelerate then shards it disjointly across ranks via BatchSamplerShard
-        # without needing a `generator` attribute to synchronize an RNG, and resume is sample-exact.
+        # All non-streaming (map-style) datasets use EpisodeAwareSampler, unless
+        # source_sampling is configured (see config/generalist_source_weights.yaml)
+        # to keep one large co-training source from dominating draw frequency.
+        # Both cases share the (seed, epoch)-derived permutation property: every
+        # rank independently produces the same order, accelerate shards it
+        # disjointly across ranks via BatchSamplerShard without needing a shared
+        # `generator`, and resume is sample-exact.
         shuffle = False
-        sampler = EpisodeAwareSampler(
-            dataset.meta.episodes["dataset_from_index"],
-            dataset.meta.episodes["dataset_to_index"],
-            episode_indices_to_use=dataset.episodes,
-            drop_n_last_frames=getattr(active_cfg, "drop_n_last_frames", 0),
-            shuffle=True,
-            seed=cfg.seed if cfg.seed is not None else 0,
-            absolute_to_relative_idx=dataset.absolute_to_relative_idx,
-        )
+        if cfg.source_sampling is not None:
+            from lerobot.datasets.sampler import WeightedEpisodeAwareSampler
+            from lerobot.utils.source_sampling import (
+                build_episode_source_groups,
+                load_source_sampling_config,
+            )
+
+            sc = cfg.source_sampling
+            group_weights, repo_to_group = load_source_sampling_config(sc.group_config_path)
+            sources_path = sc.sources_path or str(Path(cfg.dataset.root or "") / "meta" / "cotrain_sources.json")
+            episode_groups = build_episode_source_groups(
+                sources_path, repo_to_group, total_episodes=len(dataset.meta.episodes["dataset_from_index"])
+            )
+            sampler = WeightedEpisodeAwareSampler(
+                dataset.meta.episodes["dataset_from_index"],
+                dataset.meta.episodes["dataset_to_index"],
+                episode_source_group=episode_groups,
+                group_target_weights=group_weights,
+                episode_indices_to_use=dataset.episodes,
+                drop_n_last_frames=getattr(active_cfg, "drop_n_last_frames", 0),
+                seed=cfg.seed if cfg.seed is not None else 0,
+                absolute_to_relative_idx=dataset.absolute_to_relative_idx,
+                num_samples_per_epoch=sc.num_samples_per_epoch,
+                max_upsample_factor=sc.max_upsample_factor,
+                **sc.extra_params,
+            )
+            if is_main_process:
+                for group, stats in sampler.group_stats().items():
+                    logging.info(
+                        f"source_sampling group '{group}': natural_share={stats['natural_share']:.4f} "
+                        f"target_share={stats['target_share']:.4f} "
+                        f"upsample_factor={stats['upsample_factor']:.2f}x "
+                        f"(natural_frames={stats['natural_frames']})"
+                    )
+        else:
+            sampler = EpisodeAwareSampler(
+                dataset.meta.episodes["dataset_from_index"],
+                dataset.meta.episodes["dataset_to_index"],
+                episode_indices_to_use=dataset.episodes,
+                drop_n_last_frames=getattr(active_cfg, "drop_n_last_frames", 0),
+                shuffle=True,
+                seed=cfg.seed if cfg.seed is not None else 0,
+                absolute_to_relative_idx=dataset.absolute_to_relative_idx,
+            )
         if cfg.resume and step > 0:
             # The resume offset depends on the (num_processes, batch_size) that produced `step`, so
             # use the values recorded in the checkpoint (falling back to the current ones for older
@@ -584,6 +646,7 @@ def train(cfg: TrainPipelineConfig, accelerator: "Accelerator | None" = None):
             accelerator=accelerator,
             lr_scheduler=lr_scheduler,
             sample_weighter=sample_weighter,
+            dim_mask_provider=dim_mask_provider,
         )
 
         # Note: eval and checkpoint happens *after* the `step`th training update has completed, so we
@@ -616,6 +679,10 @@ def train(cfg: TrainPipelineConfig, accelerator: "Accelerator | None" = None):
                     if sample_weighter is not None:
                         weighter_stats = sample_weighter.get_stats()
                         wandb_log_dict.update({f"sample_weighting/{k}": v for k, v in weighter_stats.items()})
+                    # Log dim masking statistics if enabled
+                    if dim_mask_provider is not None:
+                        mask_stats = dim_mask_provider.get_stats()
+                        wandb_log_dict.update({f"dim_masking/{k}": v for k, v in mask_stats.items()})
                     wandb_logger.log_dict(wandb_log_dict, step)
             train_tracker.reset_averages()
 
