@@ -394,6 +394,9 @@ class DatasetWriter:
                 self._episodes_since_last_encoding = 0
 
         if episode_data is None:
+            # Only image/depth-stored cameras' staging frames are cleared here — video-
+            # stored cameras' staging frames must survive: the (possibly batched) encoder
+            # still needs them and deletes them itself once each video is written.
             has_static_cams = len(self._meta.image_keys) + len(self._meta.depth_keys) > 0
             self.clear_episode_buffer(delete_images=has_static_cams)
 
