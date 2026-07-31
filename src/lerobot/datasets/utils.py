@@ -52,6 +52,17 @@ The dataset you requested ({repo_id}) is only available in {version} format.
 As we cannot ensure forward compatibility with it, please update your current version of lerobot.
 """
 
+MISSING_VERSION_TAG_MESSAGE = """
+Your dataset must be tagged with a codebase version.
+Assuming _version_ is the codebase_version value in the info.json, you can run this:
+```python
+from huggingface_hub import HfApi
+
+hub_api = HfApi()
+hub_api.create_tag("{repo_id}", tag="_version_", repo_type="dataset")
+```
+"""
+
 
 class CompatibilityError(Exception): ...
 
@@ -400,7 +411,7 @@ def get_safe_version(
         str: The safe version string (e.g., "v1.2.3") to use as a revision.
 
     Raises:
-        ValueError: If the repo has no version tags on the Hub.
+        RuntimeError: If the repo has no version tags.
         BackwardCompatibilityError: If only older major versions are available.
         ForwardCompatibilityError: If only newer major versions are available.
     """
@@ -410,17 +421,7 @@ def get_safe_version(
     hub_versions = get_repo_versions(repo_id) if token is None else get_repo_versions(repo_id, token=token)
 
     if not hub_versions:
-        raise ValueError(
-            f"""Your dataset must be tagged with a codebase version.
-            Assuming _version_ is the codebase_version value in the info.json, you can run this:
-            ```python
-            from huggingface_hub import HfApi
-
-            hub_api = HfApi()
-            hub_api.create_tag("{repo_id}", tag="_version_", repo_type="dataset")
-            ```
-            """
-        )
+        raise RuntimeError(MISSING_VERSION_TAG_MESSAGE.format(repo_id=repo_id))
 
     if target_version in hub_versions:
         return f"v{target_version}"
