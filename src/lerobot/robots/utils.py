@@ -40,14 +40,14 @@ def make_robot_from_config(config: RobotConfig) -> Robot:
         from .so_follower import SO101Follower
 
         return SO101Follower(config)
-    elif config.type == "xlerobot":
-        from .xlerobot import XLerobot
+    elif config.type == "ob15":
+        from .ob15 import OB15
 
-        return XLerobot(config)
-    elif config.type == "xlerobot_client":
-        from .xlerobot.xlerobot_client import XLerobotClient
+        return OB15(config)
+    elif config.type == "ob15_client":
+        from .ob15.ob15_client import OB15Client
 
-        return XLerobotClient(config)
+        return OB15Client(config)
     elif config.type == "lekiwi":
         from .lekiwi import LeKiwi
 
@@ -66,7 +66,7 @@ def make_robot_from_config(config: RobotConfig) -> Robot:
         return BiSOFollower(config)
     elif config.type == "reachy2":
         from .reachy2 import Reachy2Robot
-        
+
 
         return Reachy2Robot(config)
     elif config.type == "openarm_follower":
@@ -85,6 +85,14 @@ def make_robot_from_config(config: RobotConfig) -> Robot:
         from .bi_rebot_b601_follower import BiRebotB601Follower
 
         return BiRebotB601Follower(config)
+    elif config.type in ("gem", "gem_follower"):
+        from .gem_follower import GemFollower
+
+        return GemFollower(config)
+    elif config.type in ("bi_gem", "bi_gem_follower"):
+        from .bi_gem_follower import BiGemFollower
+
+        return BiGemFollower(config)
     elif config.type == "mock_robot":
         from tests.mocks.mock_robot import MockRobot
 

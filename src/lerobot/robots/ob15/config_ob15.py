@@ -14,7 +14,7 @@
 
 from dataclasses import dataclass, field
 
-from lerobot.cameras.configs import CameraConfig, Cv2Rotation, ColorMode
+from lerobot.cameras.configs import CameraConfig, ColorMode, Cv2Rotation
 from lerobot.cameras.opencv.configuration_opencv import OpenCVCameraConfig
 from lerobot.cameras.realsense.configuration_realsense import RealSenseCameraConfig
 
@@ -22,7 +22,7 @@ from ..config import RobotConfig
 from .lift_axis import LiftAxisConfig
 
 
-def xlerobot_cameras_config() -> dict[str, CameraConfig]:
+def ob15_cameras_config() -> dict[str, CameraConfig]:
     """
     Camera configuration using SmolVLA's standardized naming convention.
     
@@ -57,7 +57,7 @@ def xlerobot_cameras_config() -> dict[str, CameraConfig]:
             rotation=Cv2Rotation.NO_ROTATION,
             use_depth=True,
         ),
-    
+
         # IMAGE SIZE RECOMMENDATION:
         # Current 640x480 is 6x more pixels than needed for most manipulation policies.
         # SmolVLA expects 224x224; ACT/Diffusion Policy typically use 224x224 or 256x256.
@@ -80,7 +80,7 @@ def xlerobot_cameras_config() -> dict[str, CameraConfig]:
         #     fourcc="YUYV",  # Changed from MJPG (not supported by RealSense via V4L2)
         #     rotation=Cv2Rotation.NO_ROTATION,
         # ),
-        
+
         # camera2: Wrist view (was "left_wrist")
         # PERFORMANCE: MJPG format is critical for 30 Hz control rate
         # If MJPG fails (camera defaults to YUYV), run: ./setup_camera_formats.sh
@@ -92,8 +92,8 @@ def xlerobot_cameras_config() -> dict[str, CameraConfig]:
             fourcc="MJPG",
             rotation=Cv2Rotation.NO_ROTATION,
             warmup_s=3,  # Increased warmup time for Innomaker cameras
-        ),     
-        
+        ),
+
         # camera3: Additional view (was "right_wrist")
         # PERFORMANCE: MJPG format is critical for 30 Hz control rate
         # If MJPG fails (camera defaults to YUYV), run: ./setup_camera_formats.sh
@@ -109,13 +109,34 @@ def xlerobot_cameras_config() -> dict[str, CameraConfig]:
     }
 
 
-@RobotConfig.register_subclass("xlerobot")
+@RobotConfig.register_subclass("ob15")
 @dataclass
-class XLerobotConfig(RobotConfig):
-    
-    # Port 0 = left arm + base. Port 1 = right arm + head + (optional) lift axis.
-    port1: str = "/dev/ttyACM1"  # left arm motors 1-6 + base motors 7-9
-    port2: str = "/dev/ttyACM0"  # right arm motors 1-6 + head motors 7-8 + lift (motor 9)
+class OB15Config(RobotConfig):
+
+    # Per-limb serial ports. Defaults reproduce the original 2-bus wiring: left_arm+base
+    # share one physical bus, right_arm+head(+lift) share the other. Ports that resolve to
+    # the same device path are automatically merged onto a single FeetechMotorsBus, so any
+    # subset of limbs can move to its own dedicated serial adapter independently just by
+    # giving it a distinct port here -- no code changes needed on either end of the split.
+    #
+    # Stable udev names (once bob_1/config/99-ob15.rules is installed): /dev/ob15_bus1 and
+    # /dev/ob15_bus2 (or /dev/ob15_<limb> after a per-limb split).
+    left_arm_port: str = "/dev/ttyACM1"  # left arm motors, IDs 1-6
+    right_arm_port: str = "/dev/ttyACM0"  # right arm motors, IDs 1-6
+    base_port: str = "/dev/ttyACM1"  # base wheels, IDs 7-9 (shares left_arm_port by default)
+    head_port: str = "/dev/ttyACM0"  # head pan/tilt, IDs 7-8 (shares right_arm_port by default)
+    # Only used when lift_axis.bus == "lift" (lift given its own dedicated port); otherwise
+    # the lift motor attaches to whichever group's bus `lift_axis.bus` names.
+    # Default matches bus2 (right_arm+head+lift). Must NOT default to bus1 — ID 9 collides
+    # with base_right_wheel there.
+    lift_port: str = "/dev/ttyACM0"
+
+    # Legacy aliases from XLerobotConfig (port1=bus1, port2=bus2). If set, they override the
+    # corresponding per-limb ports in __post_init__ so old CLI/Guide.sh flags keep working:
+    #   --robot.port1=/dev/ttyACM1 --robot.port2=/dev/ttyACM0
+    port1: str | None = None
+    port2: str | None = None
+
     camera_start_order: tuple[str, ...] | None = ("head", "left_wrist", "right_wrist")
     camera_start_delay_s: float = 2.0  # Increased delay to allow cameras to initialize properly (especially right_wrist)
     disable_torque_on_disconnect: bool = True
@@ -125,7 +146,7 @@ class XLerobotConfig(RobotConfig):
     # the number of motors in your follower arms.
     max_relative_target: int | None = None
 
-    cameras: dict[str, CameraConfig] = field(default_factory=xlerobot_cameras_config)
+    cameras: dict[str, CameraConfig] = field(default_factory=ob15_cameras_config)
 
     # Set to `True` for backward compatibility with previous policies/dataset
     use_degrees: bool = False
@@ -152,12 +173,26 @@ class XLerobotConfig(RobotConfig):
         }
     )
 
+    def __post_init__(self):
+        super().__post_init__()
+        # Expand legacy bus aliases onto the per-limb ports they used to mean.
+        if self.port1 is not None:
+            self.left_arm_port = self.port1
+            self.base_port = self.port1
+        if self.port2 is not None:
+            self.right_arm_port = self.port2
+            self.head_port = self.port2
+            # Dedicated lift port only applies when lift_axis.bus == "lift"; still keep it
+            # aligned with bus2 so a later bus="lift" split without retargeting lift_port
+            # does not accidentally land on bus1 (ID 9 collision with the base).
+            self.lift_port = self.port2
+
 
 # ZMQ bridge: host on robot (Jetson), client on GPU PC.
 
 
 @dataclass
-class XLerobotHostConfig:
+class OB15HostConfig:
     """ZMQ ports bound on the robot machine. Client connects to these."""
 
     port_zmq_cmd: int = 5555
@@ -168,10 +203,10 @@ class XLerobotHostConfig:
     jpeg_quality: int = 90
 
 
-@RobotConfig.register_subclass("xlerobot_client")
+@RobotConfig.register_subclass("ob15_client")
 @dataclass
-class XLerobotClientConfig(RobotConfig):
-    """Remote XLerobot over ZMQ (`type: xlerobot_client` in robot JSON)."""
+class OB15ClientConfig(RobotConfig):
+    """Remote OB15 over ZMQ (`type: ob15_client` in robot JSON)."""
 
     remote_ip: str
     port_zmq_cmd: int = 5555
@@ -189,7 +224,7 @@ class XLerobotClientConfig(RobotConfig):
             "quit": "b",
         }
     )
-    cameras: dict[str, CameraConfig] = field(default_factory=xlerobot_cameras_config)
+    cameras: dict[str, CameraConfig] = field(default_factory=ob15_cameras_config)
     lift_axis: LiftAxisConfig = field(default_factory=LiftAxisConfig)
     polling_timeout_ms: int = 15
     connect_timeout_s: int = 5

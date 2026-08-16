@@ -3,7 +3,7 @@ from __future__ import annotations
 import logging
 import time
 from dataclasses import dataclass
-from typing import Dict, Optional, Protocol
+from typing import Protocol
 
 from lerobot.motors import Motor, MotorNormMode
 from lerobot.motors.feetech import OperatingMode
@@ -12,11 +12,11 @@ logger = logging.getLogger(__name__)
 
 
 class BusLike(Protocol):
-    motors: Dict[str, object]
+    motors: dict[str, object]
 
     def read(self, item: str, name: str, *, normalize: bool = True) -> float: ...
     def write(self, item: str, name: str, value: float) -> None: ...
-    def sync_write(self, item: str, values: Dict[str, float]) -> None: ...
+    def sync_write(self, item: str, values: dict[str, float]) -> None: ...
 
 
 @dataclass
@@ -30,7 +30,11 @@ class LiftAxisConfig:
 
     enabled: bool = True
     name: str = "gantry"
-    bus: str = "bus2"
+    # Which motor group's bus the lift attaches to: "left_arm" | "right_arm" | "base" |
+    # "head" | "lift" (the last one gives it its own dedicated port, see
+    # OB15Config.lift_port). Default matches the original wiring, where the lift shared
+    # the right arm's bus.
+    bus: str = "right_arm"
     motor_id: int = 9
     motor_model: str = "sts3215"
     lead_mm_per_rev: float = 100.0
@@ -71,9 +75,9 @@ class LiftAxisConfig:
 class LiftAxis:
     """Gantry/Z-axis controller that plugs into an existing Feetech bus."""
 
-    def __init__(self, cfg: LiftAxisConfig, bus1: Optional[BusLike], bus2: Optional[BusLike]):
+    def __init__(self, cfg: LiftAxisConfig, bus: BusLike | None):
         self.cfg = cfg
-        self._bus = bus1 if cfg.bus == "bus1" else bus2
+        self._bus = bus
         self.enabled = bool(cfg.enabled and self._bus is not None)
 
         self._ticks_per_rev = 4096.0
@@ -147,9 +151,9 @@ class LiftAxis:
 
     def contribute_observation(
         self,
-        obs: Dict[str, float],
-        pre_read_pos: Optional[float] = None,
-        pre_read_vel: Optional[float] = None,
+        obs: dict[str, float],
+        pre_read_pos: float | None = None,
+        pre_read_vel: float | None = None,
     ) -> None:
         if not self.enabled:
             return
@@ -203,12 +207,12 @@ class LiftAxis:
         normalized = (vel / float(self.cfg.v_max)) * 100.0
         return max(-100.0, min(100.0, normalized))
 
-    def action_for_logging(self, action: Dict[str, float]) -> Dict[str, float]:
+    def action_for_logging(self, action: dict[str, float]) -> dict[str, float]:
         if not self.enabled:
             return {}
         prefix = f"{self.cfg.name}."
         vel_key = f"{self.cfg.name}.vel"
-        out: Dict[str, float] = {}
+        out: dict[str, float] = {}
         for k, v in action.items():
             if not k.startswith(prefix):
                 continue
@@ -218,7 +222,7 @@ class LiftAxis:
                 out[k] = float(v)
         return out
 
-    def apply_action(self, action: Dict[str, float]) -> None:
+    def apply_action(self, action: dict[str, float]) -> None:
         if not self.enabled:
             return
         self.configure()

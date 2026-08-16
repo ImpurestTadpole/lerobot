@@ -13,6 +13,7 @@ There are two converters, chosen by what the source data contains:
 |---|---|---|
 | Robot datasets with **joint** states (ALOHA, Open-X, other LeRobot repos) | joints | `lerobot-cotrain-align` |
 | UMI-style datasets with **end-effector poses** (FastUMI-100K) | EE poses | `lerobot-umi-retarget` |
+| Existing **joint** datasets (xlerobot / SO-101) → EE for training | joints → EE | `lerobot-joint-to-ee` |
 
 Both are registered CLIs (`pyproject.toml [project.scripts]`); run `--help`
 for every flag.
@@ -139,7 +140,64 @@ and measure generalist transfer before scaling to all 100k trajectories.
 
 ---
 
-## 3. Other format notes
+## 3. Joint datasets → end-effector: `lerobot-joint-to-ee`
+
+Convert an **existing** joint-space LeRobot dataset (including full xlerobot /
+OB15 schemas with head, base, and lift) into EE representation by running
+forward kinematics on each arm while **passing through** non-arm dims unchanged.
+
+Two FK backends:
+
+| `--solver` | Needs URDF? | Notes |
+|---|---|---|
+| `urdf` (default) | Yes — auto-downloads SO-101 arm URDF on first use | Full 6-DOF pose (position + orientation) |
+| `classic` | No | Analytic 2-link model; same conventions as `xlerobot_vr` / `lerobot-umi-retarget` |
+
+```bash
+# xlerobot 18-DOF master → 20-DOF (14 EE + head/base/lift pass-through)
+lerobot-joint-to-ee \
+    --source-repo Odog16/master_home_v1 \
+    --target-repo-id Odog16/master_home_v1_ee \
+    --profile xlerobot_pass_through \
+    --solver urdf \
+    --joint-units degrees \
+    --force-rebuild
+
+# Bimanual arms only: 12 joint dims → 14 EE dims (no head/base/lift)
+lerobot-joint-to-ee \
+    --source-repo Odog16/task_v1 \
+    --target-repo-id Odog16/task_v1_ee \
+    --profile bimanual12 \
+    --solver classic \
+    --ee-format euler
+
+# Auto-detect xlerobot vs SO-101 layout from observation.state names
+lerobot-joint-to-ee \
+    --source-repo Odog16/some_dataset \
+    --target-repo-id Odog16/some_dataset_ee \
+    --auto-profile \
+    --solver urdf
+```
+
+Profiles:
+
+- `so101` — single 6-DOF arm → 7 EE dims
+- `bimanual12` — left + right arms → 14 EE dims
+- `xlerobot_pass_through` — bimanual EE + copy `head_*`, `x.vel`, `gantry.height_mm`, …
+- `xlerobot_full` — same pass-through set as the 18-DOF xlerobot schema
+
+`--ee-format rotvec` (default) writes `left_ee.x`, `left_ee.wx`, … matching
+LeRobot's processor convention. `--ee-format euler` writes UMI-style
+`left_x`, `left_roll`, …
+
+**Important:** FK expects arm joints in **degrees** unless you pass
+`--joint-units normalized` (approximate `[-100,100]` → degrees via
+`--norm-scale`, default 1.8). Gripper values are passed through as recorded
+(typically 0–100).
+
+---
+
+## 4. Other format notes
 
 - **LeRobot v2.1 → v3.0**: `uv run python src/lerobot/scripts/convert_dataset_v21_to_v30.py`
   converts standard v2.1 repos. (`lerobot-umi-retarget` reads FastUMI's v2.1

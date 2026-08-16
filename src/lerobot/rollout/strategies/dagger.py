@@ -28,10 +28,14 @@ selected by the ``input_device`` config field.  Keyboard/pedal expose:
 
 ``input_device="teleop"`` instead polls ``teleop.get_teleop_events()`` every
 control tick and mirrors its ``is_intervention`` toggle (e.g. RIGHT A on the
-xlerobot VR teleop) by walking the state machine one transition per tick:
-ON drives AUTONOMOUS → PAUSED → CORRECTING, OFF drives the reverse.  A
-keyboard listener stays active for ESC/upload only, so it cannot fight the
-teleop-driven phase.
+xlerobot VR teleop, configurable via that teleop's ``button_map``) by walking
+the state machine one transition per tick: ON drives
+AUTONOMOUS → PAUSED → CORRECTING, OFF drives the reverse.  If the teleop's
+event dict also reports ``stop_session`` / ``upload_requested`` (e.g. the VR
+teleop's "stop_session" / "upload_dataset" button_map actions), those drive
+the same session controls as the keyboard's ESC/upload, so a fully VR-driven
+session needs no keyboard fallback.  A keyboard listener still stays active
+for ESC/upload as a fallback, so it cannot fight the teleop-driven phase.
 
 Recording modes:
     ``record_autonomous=True``:  Sentry-like continuous recording with
@@ -322,12 +326,28 @@ class DAggerStrategy(RolloutStrategy):
         the intermediate PAUSED phase in two ticks (~2/fps seconds).  Polling
         ``get_teleop_events()`` every tick also lets the VR teleop run its
         on-intervention IK recalibration at the moment the human takes over.
+
+        Also mirrors ``STOP_SESSION`` / ``UPLOAD_REQUESTED`` (when the teleop
+        reports them) onto the same ``DAggerEvents`` flags the keyboard/pedal
+        drive, so a teleop with a "stop_session" / "upload_dataset" button_map
+        binding (e.g. xlerobot_vr) can end the session or push to the Hub
+        without the keyboard fallback. Teleoperators that don't support these
+        (missing keys in the returned dict) simply never trigger them here.
         """
         try:
             teleop_events = teleop.get_teleop_events()
         except Exception as e:
             logger.warning("get_teleop_events() failed (keeping current phase): %s", e)
             return
+
+        if teleop_events.get(TeleopEvents.STOP_SESSION, False) and not self._events.stop_recording.is_set():
+            logger.info("Stop requested by teleoperator")
+            self._events.stop_recording.set()
+
+        if teleop_events.get(TeleopEvents.UPLOAD_REQUESTED, False):
+            logger.info("Upload requested by teleoperator")
+            self._events.upload_requested.set()
+
         is_intervention = bool(teleop_events.get(TeleopEvents.IS_INTERVENTION, False))
         desired = DAggerPhase.CORRECTING if is_intervention else DAggerPhase.AUTONOMOUS
         step = _STEP_TOWARD.get((self._events.phase, desired))

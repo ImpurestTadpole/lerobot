@@ -18,7 +18,7 @@ import base64
 import json
 import logging
 from functools import cached_property
-from typing import Any, Dict, Optional, Tuple
+from typing import Any
 
 import cv2
 import numpy as np
@@ -27,14 +27,14 @@ import zmq
 from lerobot.utils.errors import DeviceAlreadyConnectedError, DeviceNotConnectedError
 
 from ..robot import Robot
-from .config_xlerobot import XLerobotClientConfig
+from .config_ob15 import OB15ClientConfig
 
 
-class XLerobotClient(Robot):
-    config_class = XLerobotClientConfig
-    name = "xlerobot_client"
+class OB15Client(Robot):
+    config_class = OB15ClientConfig
+    name = "ob15_client"
 
-    def __init__(self, config: XLerobotClientConfig):
+    def __init__(self, config: OB15ClientConfig):
         super().__init__(config)
         self.config = config
         self.id = config.id
@@ -70,7 +70,7 @@ class XLerobotClient(Robot):
 
     @cached_property
     def _state_ft(self) -> dict[str, type]:
-        """Match `XLerobot._state_ft` key order so HVLA / policies see the same 18-DOF layout."""
+        """Match `OB15._state_ft` key order so HVLA / policies see the same 18-DOF layout."""
         keys: tuple[str, ...] = (
             "left_arm_shoulder_pan.pos",
             "left_arm_shoulder_lift.pos",
@@ -93,7 +93,7 @@ class XLerobotClient(Robot):
         if self.config.lift_axis.enabled:
             keys = (*keys, f"{self.config.lift_axis.name}.height_mm")
         return dict.fromkeys(keys, float)
-        
+
     @cached_property
     def _state_order(self) -> tuple[str, ...]:
         return tuple(self._state_ft.keys())
@@ -103,8 +103,17 @@ class XLerobotClient(Robot):
         return {name: (cfg.height, cfg.width, 3) for name, cfg in self.config.cameras.items()}
 
     @cached_property
+    def _depth_cameras_ft(self) -> dict[str, tuple[int, int, int]]:
+        """Depth features, keyed `{cam_name}_depth`, for cameras with `use_depth=True` (RealSense)."""
+        return {
+            f"{name}_depth": (cfg.height, cfg.width, 1)
+            for name, cfg in self.config.cameras.items()
+            if getattr(cfg, "use_depth", False)
+        }
+
+    @cached_property
     def observation_features(self) -> dict[str, type | tuple]:
-        return {**self._state_ft, **self._cameras_ft}
+        return {**self._state_ft, **self._cameras_ft, **self._depth_cameras_ft}
 
     @cached_property
     def action_features(self) -> dict[str, type]:
@@ -148,7 +157,7 @@ class XLerobotClient(Robot):
     def calibrate(self) -> None:
         pass
 
-    def _poll_and_get_latest_message(self) -> Optional[str]:
+    def _poll_and_get_latest_message(self) -> str | None:
         """Polls the ZMQ socket for a limited time and returns the latest message string."""
         poller = zmq.Poller()
         poller.register(self.zmq_observation_socket, zmq.POLLIN)
@@ -176,7 +185,7 @@ class XLerobotClient(Robot):
 
         return last_msg
 
-    def _parse_observation_json(self, obs_string: str) -> Optional[Dict[str, Any]]:
+    def _parse_observation_json(self, obs_string: str) -> dict[str, Any] | None:
         """Parses the JSON observation string."""
         try:
             return json.loads(obs_string)
@@ -184,7 +193,7 @@ class XLerobotClient(Robot):
             logging.error(f"Error decoding JSON observation: {e}")
             return None
 
-    def _decode_image_from_b64(self, image_b64: str) -> Optional[np.ndarray]:
+    def _decode_image_from_b64(self, image_b64: str) -> np.ndarray | None:
         """Decodes a base64 encoded image string to an OpenCV image."""
         if not image_b64:
             return None
@@ -199,29 +208,50 @@ class XLerobotClient(Robot):
             logging.error(f"Error decoding base64 image data: {e}")
             return None
 
+    def _decode_depth_from_b64(self, depth_b64: str) -> np.ndarray | None:
+        """Decodes a base64-encoded 16-bit PNG depth image to a (H, W, 1) uint16 array (mm)."""
+        if not depth_b64:
+            return None
+        try:
+            png_data = base64.b64decode(depth_b64)
+            np_arr = np.frombuffer(png_data, dtype=np.uint8)
+            depth = cv2.imdecode(np_arr, cv2.IMREAD_UNCHANGED)
+            if depth is None:
+                logging.warning("cv2.imdecode returned None for a depth image.")
+                return None
+            if depth.ndim == 2:
+                depth = depth[..., np.newaxis]
+            return depth
+        except (TypeError, ValueError) as e:
+            logging.error(f"Error decoding base64 depth data: {e}")
+            return None
+
     def _remote_state_from_obs(
-        self, observation: Dict[str, Any]
-    ) -> Tuple[Dict[str, np.ndarray], Dict[str, Any]]:
+        self, observation: dict[str, Any]
+    ) -> tuple[dict[str, np.ndarray], dict[str, Any]]:
         """Extracts frames, and state from the parsed observation."""
 
         flat_state = {key: observation.get(key, 0.0) for key in self._state_order}
 
         state_vec = np.array([flat_state[key] for key in self._state_order], dtype=np.float32)
 
-        obs_dict: Dict[str, Any] = {**flat_state, "observation.state": state_vec}
+        obs_dict: dict[str, Any] = {**flat_state, "observation.state": state_vec}
 
-        # Decode images
-        current_frames: Dict[str, np.ndarray] = {}
-        for cam_name, image_b64 in observation.items():
-            if cam_name not in self._cameras_ft:
+        # Decode images (RGB as JPEG, depth as 16-bit PNG)
+        current_frames: dict[str, np.ndarray] = {}
+        for key, payload_b64 in observation.items():
+            if key in self._depth_cameras_ft:
+                frame = self._decode_depth_from_b64(payload_b64)
+            elif key in self._cameras_ft:
+                frame = self._decode_image_from_b64(payload_b64)
+            else:
                 continue
-            frame = self._decode_image_from_b64(image_b64)
             if frame is not None:
-                current_frames[cam_name] = frame
+                current_frames[key] = frame
 
         return current_frames, obs_dict
 
-    def _get_data(self) -> Tuple[Dict[str, np.ndarray], Dict[str, Any], Dict[str, Any]]:
+    def _get_data(self) -> tuple[dict[str, np.ndarray], dict[str, Any], dict[str, Any]]:
         """
         Polls the video socket for the latest observation data.
 
@@ -267,11 +297,16 @@ class XLerobotClient(Robot):
 
         frames, obs_dict = self._get_data()
 
-        # Loop over each configured camera
+        # Loop over each configured camera (color and, when enabled, depth)
         for cam_name, frame in frames.items():
             if frame is None:
                 logging.warning("Frame is None")
-                frame = np.zeros((640, 480, 3), dtype=np.uint8)
+                if cam_name in self._depth_cameras_ft:
+                    shape = self._depth_cameras_ft[cam_name]
+                    frame = np.zeros(shape, dtype=np.uint16)
+                else:
+                    shape = self._cameras_ft.get(cam_name, (480, 640, 3))
+                    frame = np.zeros(shape, dtype=np.uint8)
             obs_dict[cam_name] = frame
 
         return obs_dict
@@ -302,9 +337,9 @@ class XLerobotClient(Robot):
             theta_cmd += theta_speed
         if self.teleop_keys["rotate_right"] in pressed_keys:
             theta_cmd -= theta_speed
-            
+
         return {
-            "x.vel": x_cmd, 
+            "x.vel": x_cmd,
             "y.vel": y_cmd,
             "theta.vel": theta_cmd,
         }

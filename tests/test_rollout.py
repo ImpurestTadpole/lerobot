@@ -339,6 +339,102 @@ def test_dagger_events_reset():
 
 
 # ---------------------------------------------------------------------------
+# DAgger teleop-driven input (input_device="teleop")
+# ---------------------------------------------------------------------------
+
+
+def _make_dagger_strategy():
+    from lerobot.rollout.strategies import DAggerStrategy
+    from lerobot.rollout.strategies.dagger import DAggerStrategyConfig
+
+    return DAggerStrategy(DAggerStrategyConfig(input_device="teleop"))
+
+
+def test_dagger_drive_teleop_phase_follows_is_intervention():
+    from lerobot.rollout.strategies.dagger import DAggerPhase
+    from lerobot.teleoperators.utils import TeleopEvents
+
+    strategy = _make_dagger_strategy()
+    teleop = MagicMock()
+    teleop.get_teleop_events.return_value = {TeleopEvents.IS_INTERVENTION: True}
+
+    # ON: AUTONOMOUS -> PAUSED -> CORRECTING (one transition requested per tick).
+    strategy._drive_teleop_phase(teleop)
+    old, new = strategy._events.consume_transition()
+    assert (old, new) == (DAggerPhase.AUTONOMOUS, DAggerPhase.PAUSED)
+
+    strategy._drive_teleop_phase(teleop)
+    old, new = strategy._events.consume_transition()
+    assert (old, new) == (DAggerPhase.PAUSED, DAggerPhase.CORRECTING)
+
+    # OFF: CORRECTING -> PAUSED -> AUTONOMOUS.
+    teleop.get_teleop_events.return_value = {TeleopEvents.IS_INTERVENTION: False}
+    strategy._drive_teleop_phase(teleop)
+    old, new = strategy._events.consume_transition()
+    assert (old, new) == (DAggerPhase.CORRECTING, DAggerPhase.PAUSED)
+
+    strategy._drive_teleop_phase(teleop)
+    old, new = strategy._events.consume_transition()
+    assert (old, new) == (DAggerPhase.PAUSED, DAggerPhase.AUTONOMOUS)
+
+
+def test_dagger_drive_teleop_phase_sets_stop_recording():
+    from lerobot.teleoperators.utils import TeleopEvents
+
+    strategy = _make_dagger_strategy()
+    teleop = MagicMock()
+    teleop.get_teleop_events.return_value = {
+        TeleopEvents.IS_INTERVENTION: False,
+        TeleopEvents.STOP_SESSION: True,
+    }
+
+    assert not strategy._events.stop_recording.is_set()
+    strategy._drive_teleop_phase(teleop)
+    assert strategy._events.stop_recording.is_set()
+
+
+def test_dagger_drive_teleop_phase_sets_upload_requested():
+    from lerobot.teleoperators.utils import TeleopEvents
+
+    strategy = _make_dagger_strategy()
+    teleop = MagicMock()
+    teleop.get_teleop_events.return_value = {
+        TeleopEvents.IS_INTERVENTION: False,
+        TeleopEvents.UPLOAD_REQUESTED: True,
+    }
+
+    assert not strategy._events.upload_requested.is_set()
+    strategy._drive_teleop_phase(teleop)
+    assert strategy._events.upload_requested.is_set()
+
+
+def test_dagger_drive_teleop_phase_ignores_teleop_without_session_events():
+    """A teleop that only implements IS_INTERVENTION (no stop/upload keys) must
+    not raise or spuriously set the session-level flags."""
+    from lerobot.teleoperators.utils import TeleopEvents
+
+    strategy = _make_dagger_strategy()
+    teleop = MagicMock()
+    teleop.get_teleop_events.return_value = {TeleopEvents.IS_INTERVENTION: False}
+
+    strategy._drive_teleop_phase(teleop)
+    assert not strategy._events.stop_recording.is_set()
+    assert not strategy._events.upload_requested.is_set()
+
+
+def test_dagger_drive_teleop_phase_handles_exception_gracefully():
+    from lerobot.rollout.strategies.dagger import DAggerPhase
+
+    strategy = _make_dagger_strategy()
+    teleop = MagicMock()
+    teleop.get_teleop_events.side_effect = RuntimeError("boom")
+
+    strategy._drive_teleop_phase(teleop)  # must not raise
+    assert strategy._events.phase == DAggerPhase.AUTONOMOUS
+    assert strategy._events.consume_transition() is None
+
+
+# ---------------------------------------------------------------------------
 # Context dataclass
 # ---------------------------------------------------------------------------
 

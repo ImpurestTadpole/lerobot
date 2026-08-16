@@ -38,18 +38,20 @@ from lerobot.cameras.realsense import RealSenseCameraConfig  # noqa: F401
 from lerobot.robots import (  # noqa: F401
     Robot,
     RobotConfig,
+    bi_gem_follower,
     bi_openarm_follower,
     bi_rebot_b601_follower,
     bi_so_follower,
+    gem_follower,
     hope_jr,
     koch_follower,
     lekiwi,
     make_robot_from_config,
+    ob15,
     omx_follower,
     openarm_follower,
     rebot_b601_follower,
     so_follower,
-    xlerobot,
 )
 from lerobot.teleoperators import (  # noqa: F401
     Teleoperator,

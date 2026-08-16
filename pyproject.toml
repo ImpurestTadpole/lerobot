@@ -170,18 +170,23 @@ pyzmq-dep = ["pyzmq>=26.2.1,<28.0.0"]
 motorbridge-dep = ["motorbridge>=0.3.2,<0.4.0"]
 motorbridge-smart-servo-dep = ["motorbridge-smart-servo>=0.0.4,<0.1.0"]
 timm-dep = ["timm>=1.0.0,<1.1.0"]
+odrive-dep = ["odrive>=0.6.0,<1.0.0"]
 
 # Motors
 feetech = ["feetech-servo-sdk>=1.0.0,<2.0.0", "lerobot[pyserial-dep]", "lerobot[deepdiff-dep]"]
 dynamixel = ["dynamixel-sdk>=3.7.31,<3.9.0", "lerobot[pyserial-dep]", "lerobot[deepdiff-dep]"]
 damiao = ["lerobot[can-dep]"]
 robstride = ["lerobot[can-dep]"]
+odrive = ["lerobot[odrive-dep]"]
 
 # Robots
 openarms = ["lerobot[damiao]"]
 gamepad = ["lerobot[pygame-dep]", "hidapi>=0.14.0,<0.15.0"]
 hopejr = ["lerobot[feetech]", "lerobot[pygame-dep]"]
 lekiwi = ["lerobot[feetech]", "lerobot[pyzmq-dep]"]
+# GEM 7-DOF arm: joint_1 on a SteadyWin GIM6010 (ODrive), joints 2-7 + gripper on Feetech
+# (sts3095/sts3250/sts3215 mix). bi_gem (dual-arm) reuses the same extra.
+gem = ["lerobot[feetech]", "lerobot[odrive]"]
 unitree_g1 = [
     # "unitree-sdk2==1.0.1",
     "lerobot[pyzmq-dep]",
@@ -365,6 +370,7 @@ lerobot-rollout="lerobot.scripts.lerobot_rollout:main"
 lerobot-cotrain-align="lerobot.data_processing.co_training_utils:main"
 lerobot-extract-subset="lerobot.data_processing.extract_subset:main"
 lerobot-umi-retarget="lerobot.data_processing.umi_retarget:main"
+lerobot-joint-to-ee="lerobot.data_processing.joint_to_ee:main"
 
 # ---------------- Tool Configurations ----------------
 

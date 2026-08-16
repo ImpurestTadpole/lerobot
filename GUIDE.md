@@ -207,6 +207,7 @@ feed it through step 7.
 | Symptom | Fix |
 | --- | --- |
 | `AttributeError: ... ParamSpec ... not writable` on any Python command | Isaac Sim's `PYTHONPATH` is shadowing the venv — run with `PYTHONPATH=` prefix (UI-generated scripts already do). |
+| `ModuleNotFoundError: No module named 'lark'` (or other odd import errors) from `pytest`/any Python command | ROS2 Humble's `PYTHONPATH` (`/opt/ros/humble/...`, Python 3.10) is leaking into the 3.12+ venv and pytest is autoloading its `launch_testing` plugin — run with `PYTHONPATH=` prefix, same as the Isaac Sim case above. |
 | UI port busy (`Address already in use`) | `fuser -k 7799/tcp` or `--port 7800`. |
 | A Hub repo 404s in merge/compare | Private or typo'd — `huggingface-cli login`, or `--skip-missing-sources`. |
 | Merge fails on camera keys | Sources share no `observation.images.*` after remap — add `--camera-remap src:head,...` (Compare tab shows the mapping). |

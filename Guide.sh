@@ -3,6 +3,9 @@
 # =============================================================================
 # LeRobot requires Python >=3.12. Use a single conda environment (no venv).
 
+
+username="jetson"
+pwd = jetson01  # change to your username
 # ONE-TIME: Create conda env with Python 3.12 and install lerobot
 # conda create -n lerobot python=3.12 -y
 # conda activate lerobot
@@ -162,11 +165,15 @@ huggingface-cli login
 # =============================================================================
 # RECORDING
 # =============================================================================
-# VR CONTROLLER CONTROLS:
-# Thumbstick UP    → Stop recording
-# Thumbstick LEFT  → Re-record current episode
-# Thumbstick RIGHT → Save episode & move to next
-# Thumbstick DOWN  → Reset robot position
+# VR CONTROLLER CONTROLS (default button_map — see xlerobot_vr/configuration_xlerobot_vr.py):
+# LEFT X or Y button      → Re-record current episode
+# RIGHT B button           → Save episode & move to next (finish early)
+# LEFT Menu button         → Stop recording
+# LEFT Thumbstick click    → Reset robot position
+# RIGHT A button           → Toggle DAgger intervention (human <-> policy)
+# RIGHT Thumbstick click   → Request dataset upload (DAgger corrections-only)
+# Remap any of these without touching motion controls via:
+#   --teleop.button_map='{"right.b": "stop_session", ...}'
 
 # RECORDING WITH AUTO-PUSH TO HUB (recommended):
 # NOTE: Remove --resume=true for new datasets or when robot configuration has changed
@@ -317,11 +324,14 @@ rm -rf ~/.cache/huggingface/lerobot/Odog16/tool_pickup
 # - 320x240: ~30 Hz (faster control)
 # - 640x480: ~15 Hz (higher quality)
 #
-# VR CONTROLLER EVENTS (Left Controller):
-# - Thumbstick RIGHT: Save episode & move to next
-# - Thumbstick LEFT: Re-record current episode
-# - Thumbstick UP: Stop recording completely
-# - Thumbstick DOWN: Reset robot to zero position
+# VR CONTROLLER EVENTS (default button_map; see RECORDING section above for the
+# full table, and --teleop.button_map to remap):
+# - LEFT X/Y button: Re-record current episode
+# - RIGHT B button: Save episode & move to next
+# - LEFT Menu button: Stop recording completely
+# - LEFT Thumbstick click: Reset robot to zero position
+# - RIGHT A button / RIGHT Thumbstick click: DAgger intervention toggle / upload
+#   (only relevant for `lerobot-rollout --strategy.type=dagger --strategy.input_device=teleop`)
 
 # =============================================================================
 # MERGE & PUSH DATASETS (co_training_utils.py)
@@ -1440,6 +1450,13 @@ for repo in repos:
 # =============================================================================
 # Use when the policy is too large for Jetson or you want inference on a stronger GPU.
 # Policy runs on the external machine; Jetson runs the robot client over the network.
+#
+# For DAgger-style human-in-the-loop rollouts driven from the VR controllers
+# instead of async_inference's fixed policy loop, use `lerobot-rollout` with the
+# `dagger` strategy and `--strategy.input_device=teleop` (control loop must run
+# where the teleop/VR bridge does — see xlerobot_vr/xlerobot_vr.py
+# get_teleop_events()). VR session buttons (intervention toggle, stop, upload)
+# are remappable via `--teleop.button_map`; see the RECORDING section above.
 #
 # Step 1 — ON EXTERNAL GPU MACHINE (PC with CUDA): start the policy server
 

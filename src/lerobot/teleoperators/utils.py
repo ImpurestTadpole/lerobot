@@ -31,6 +31,12 @@ class TeleopEvents(Enum):
     RERECORD_EPISODE = "rerecord_episode"
     IS_INTERVENTION = "is_intervention"
     TERMINATE_EPISODE = "terminate_episode"
+    # Session-level controls a teleoperator can drive alongside IS_INTERVENTION,
+    # so strategies (e.g. DAgger with input_device="teleop") don't need a
+    # keyboard/pedal fallback just for stop/upload. Optional: teleoperators that
+    # don't support them simply omit these keys from get_teleop_events().
+    STOP_SESSION = "stop_session"
+    UPLOAD_REQUESTED = "upload_requested"
 
 
 def make_teleoperator_from_config(config: TeleoperatorConfig) -> "Teleoperator":

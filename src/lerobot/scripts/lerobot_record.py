@@ -118,20 +118,22 @@ from lerobot.processor import (
 from lerobot.robots import (  # noqa: F401
     Robot,
     RobotConfig,
+    bi_gem_follower,
     bi_openarm_follower,
     bi_rebot_b601_follower,
     bi_so_follower,
     earthrover_mini_plus,
+    gem_follower,
     hope_jr,
     koch_follower,
     make_robot_from_config,
+    ob15,
     omx_follower,
     openarm_follower,
     reachy2,
     rebot_b601_follower,
     so_follower,
     unitree_g1 as unitree_g1_robot,
-    xlerobot,
 )
 from lerobot.teleoperators import (  # noqa: F401
     Teleoperator,
@@ -283,22 +285,22 @@ def record_loop(
     timestamp = 0
     start_episode_t = time.perf_counter()
     last_status_print = 0  # Track when we last printed status
-    
+
     # Hz rate tracking
     loop_times = []
     last_hz_print = time.perf_counter()
     hz_print_interval = 1.0  # Print Hz rate every 1 second
     prev_loop_start = time.perf_counter()  # Track previous loop start time
     frame_idx = 0  # For throttling visualization
-    
+
     # Depth read throttling: set to 1 to read depth every frame.
     # For training with depth, it's usually better to keep depth time-aligned to RGB/actions.
     depth_read_interval = 1  # Read depth every frame
     last_depth_obs = {}  # Store last depth observation for frames where we skip depth
-    
+
     while timestamp < control_time_s:
         start_loop_t = time.perf_counter()
-        
+
         # Measure time since last loop (for Hz calculation)
         if prev_loop_start > 0:
             loop_period = start_loop_t - prev_loop_start
@@ -318,7 +320,7 @@ def record_loop(
         # We still read color cameras every frame for the dataset
         read_depth_this_frame = (frame_idx % depth_read_interval == 0)
         obs = robot.get_observation(skip_cameras=False, skip_depth=not read_depth_this_frame)
-        
+
         # If we skipped depth this frame, merge last depth observation
         if not read_depth_this_frame and last_depth_obs:
             obs.update(last_depth_obs)
@@ -369,7 +371,7 @@ def record_loop(
         # so action actually sent is saved in the dataset. action = postprocessor.process(action)
         # TODO(steven, pepijn, adil): we should use a pipeline step to clip the action, so the sent action is the action that we input to the robot.
         _sent_action = robot.send_action(robot_action_to_send)
-        
+
         # Use the actually sent action for logging (includes normalization, clipping, etc.)
         action_values = _sent_action
 
@@ -400,7 +402,7 @@ def record_loop(
         precise_sleep(max(sleep_time_s, 0.0))
 
         timestamp = time.perf_counter() - start_episode_t
-        
+
         # Print Hz rate every second
         current_time = time.perf_counter()
         if current_time - last_hz_print >= hz_print_interval:
@@ -425,7 +427,7 @@ def record_loop(
 
         # Increment frame index for visualization and depth throttling
         frame_idx += 1
-        
+
         # Print episode progress every 5 seconds
         if dataset is not None and timestamp - last_status_print >= 5.0:
             elapsed_min = int(timestamp // 60)
@@ -433,7 +435,7 @@ def record_loop(
             remaining_sec = max(0, int(control_time_s - timestamp))
             remaining_min = remaining_sec // 60
             remaining_sec = remaining_sec % 60
-            
+
             logging.info(
                 f"📹 Episode {dataset.num_episodes} | "
                 f"Time: {elapsed_min:02d}:{elapsed_sec:02d} / "
@@ -582,7 +584,7 @@ def record(
                     teleop.vr_event_handler.events["exit_early"] = False
 
                 log_say(
-                    f"Recording episode {dataset.num_episodes + 1} / {dataset.num_episodes + cfg.dataset.num_episodes - recorded_episodes}", 
+                    f"Recording episode {dataset.num_episodes + 1} / {dataset.num_episodes + cfg.dataset.num_episodes - recorded_episodes}",
                     cfg.play_sounds
                 )
                 logging.info(
@@ -619,7 +621,7 @@ def record(
                         teleop.vr_event_handler.events["exit_early"] = False
                     dataset.clear_episode_buffer()
                     continue
-                
+
                 # Save episode immediately before reset phase so an interrupt during reset
                 # doesn't lose the episode.
                 dataset.save_episode()

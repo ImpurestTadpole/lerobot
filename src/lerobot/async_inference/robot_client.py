@@ -55,11 +55,11 @@ from lerobot.robots import (  # noqa: F401
     bi_so_follower,
     koch_follower,
     make_robot_from_config,
+    ob15,
     omx_follower,
     so_follower,
-    xlerobot,
 )
-from lerobot.robots.xlerobot.config_xlerobot import XLerobotConfig  # noqa: F401
+from lerobot.robots.ob15.config_ob15 import OB15Config  # noqa: F401
 from lerobot.transport import (
     services_pb2,  # type: ignore
     services_pb2_grpc,  # type: ignore
@@ -295,7 +295,7 @@ class RobotClient:
                     elif isinstance(location, torch.device) and location.type == 'cuda':
                         location = torch.device('cpu')
                     return original_restore(storage, location)
-                
+
                 torch.serialization.default_restore_location = cpu_restore_location
                 try:
                     timed_actions = pickle.loads(actions_chunk.data)  # nosec
@@ -388,7 +388,7 @@ class RobotClient:
         """
         action_features_list = list(self.robot.action_features)
         action = {}
-        
+
         # Use available action dimensions from the policy
         for i, key in enumerate(action_features_list):
             if i < action_tensor.shape[0]:
@@ -396,7 +396,7 @@ class RobotClient:
             else:
                 # For dimensions beyond policy output, set to 0 (no movement)
                 action[key] = 0.0
-        
+
         return action
 
     def control_loop_action(self, verbose: bool = False) -> dict[str, Any]:

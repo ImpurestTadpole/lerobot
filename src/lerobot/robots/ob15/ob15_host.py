@@ -32,24 +32,35 @@ import zmq
 from lerobot.robots.config import RobotConfig
 from lerobot.robots.utils import make_robot_from_config
 
-from .config_xlerobot import XLerobotConfig, XLerobotHostConfig
-from .xlerobot import XLerobot
+from .config_ob15 import OB15Config, OB15HostConfig
+from .ob15 import OB15
 
 
 def _observation_to_zmq_payload(
     obs: dict[str, Any],
     camera_keys: tuple[str, ...],
+    depth_keys: tuple[str, ...],
     jpeg_quality: int,
 ) -> dict[str, Any]:
-    """Scalars JSON-safe; RGB cameras → JPEG base64. Skips depth / large ndarrays."""
+    """Scalars JSON-safe; RGB cameras → JPEG base64; depth cameras → 16-bit PNG base64."""
     out: dict[str, Any] = {}
     cam_set = set(camera_keys)
+    depth_set = set(depth_keys)
     for k, v in obs.items():
         if k in cam_set:
             if not isinstance(v, np.ndarray) or v.size == 0:
                 out[k] = ""
                 continue
             ret, buffer = cv2.imencode(".jpg", v, [int(cv2.IMWRITE_JPEG_QUALITY), jpeg_quality])
+            out[k] = base64.b64encode(buffer).decode("utf-8") if ret else ""
+            continue
+        if k in depth_set:
+            if not isinstance(v, np.ndarray) or v.size == 0:
+                out[k] = ""
+                continue
+            # Depth is uint16 millimeters; PNG is the lossless codec that preserves that range.
+            depth_2d = v[..., 0] if v.ndim == 3 else v
+            ret, buffer = cv2.imencode(".png", depth_2d, [int(cv2.IMWRITE_PNG_COMPRESSION), 1])
             out[k] = base64.b64encode(buffer).decode("utf-8") if ret else ""
             continue
         if isinstance(v, np.ndarray):
@@ -68,8 +79,8 @@ def _observation_to_zmq_payload(
     return out
 
 
-class XLerobotHost:
-    def __init__(self, config: XLerobotHostConfig):
+class OB15Host:
+    def __init__(self, config: OB15HostConfig):
         self.zmq_context = zmq.Context()
         self.zmq_cmd_socket = self.zmq_context.socket(zmq.PULL)
         self.zmq_cmd_socket.setsockopt(zmq.CONFLATE, 1)
@@ -92,12 +103,12 @@ class XLerobotHost:
 
 def main():
     logging.basicConfig(level=logging.INFO)
-    parser = argparse.ArgumentParser(description="XLerobot ZMQ host (robot USB on this machine).")
+    parser = argparse.ArgumentParser(description="OB15 ZMQ host (robot USB on this machine).")
     parser.add_argument(
         "--robot-config",
         type=str,
         default=None,
-        help="JSON profile (type=xlerobot). Default: XLerobotConfig() defaults.",
+        help="JSON profile (type=ob15). Default: OB15Config() defaults.",
     )
     parser.add_argument("--port-cmd", type=int, default=5555)
     parser.add_argument("--port-observations", type=int, default=5556)
@@ -109,7 +120,7 @@ def main():
 
     import lerobot.cameras.opencv.configuration_opencv  # noqa: F401
     import lerobot.cameras.realsense.configuration_realsense  # noqa: F401
-    import lerobot.robots.xlerobot  # noqa: F401
+    import lerobot.robots.ob15  # noqa: F401
 
     if args.robot_config:
         path = Path(args.robot_config).expanduser()
@@ -125,12 +136,12 @@ def main():
             config_dict = profile
         robot_cfg = draccus.decode(RobotConfig, config_dict)
         robot = make_robot_from_config(robot_cfg)
-        if not isinstance(robot, XLerobot):
-            raise ValueError("--robot-config must describe type=xlerobot for this host.")
+        if not isinstance(robot, OB15):
+            raise ValueError("--robot-config must describe type=ob15 for this host.")
     else:
-        robot = XLerobot(XLerobotConfig(id="xlerobot_zmq_host"))
+        robot = OB15(OB15Config(id="ob15_zmq_host"))
 
-    host_config = XLerobotHostConfig(
+    host_config = OB15HostConfig(
         port_zmq_cmd=args.port_cmd,
         port_zmq_observations=args.port_observations,
         connection_time_s=args.connection_time_s,
@@ -138,16 +149,19 @@ def main():
         max_loop_freq_hz=args.max_loop_freq_hz,
         jpeg_quality=args.jpeg_quality,
     )
-    host = XLerobotHost(host_config)
+    host = OB15Host(host_config)
     cam_keys = tuple(robot.cameras.keys())
+    depth_keys = tuple(
+        f"{name}_depth" for name, cfg in robot.config.cameras.items() if getattr(cfg, "use_depth", False)
+    )
 
-    logging.info("Connecting XLerobot (local USB)")
+    logging.info("Connecting OB15 (local USB)")
     robot.connect()
 
     last_cmd_time = time.time()
     watchdog_active = False
     logging.info(
-        "ZMQ host: cmd PULL *:%d, obs PUSH *:%d — point xlerobot_client.remote_ip here.",
+        "ZMQ host: cmd PULL *:%d, obs PUSH *:%d — point ob15_client.remote_ip here.",
         host_config.port_zmq_cmd,
         host_config.port_zmq_observations,
     )
@@ -178,7 +192,7 @@ def main():
 
             try:
                 raw_obs = robot.get_observation()
-                payload = _observation_to_zmq_payload(raw_obs, cam_keys, host.jpeg_quality)
+                payload = _observation_to_zmq_payload(raw_obs, cam_keys, depth_keys, host.jpeg_quality)
                 host.zmq_observation_socket.send_string(json.dumps(payload), flags=zmq.NOBLOCK)
             except zmq.Again:
                 logging.debug("Dropping observation (no client)")
@@ -193,7 +207,7 @@ def main():
     finally:
         robot.disconnect()
         host.disconnect()
-        logging.info("XLerobot host shut down")
+        logging.info("OB15 host shut down")
 
 
 if __name__ == "__main__":

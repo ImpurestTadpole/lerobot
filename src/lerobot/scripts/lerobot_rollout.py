@@ -87,13 +87,13 @@ Usage examples
         --dataset.repo_id=user/rollout_hil_data \\
         --dataset.single_task="Fold the T-shirt"
 
-    # DAgger mode — xlerobot with VR teleop; RIGHT A toggles intervention
+    # DAgger mode — ob15 with VR teleop; RIGHT A toggles intervention
     lerobot-rollout \\
         --strategy.type=dagger \\
         --strategy.input_device=teleop \\
         --strategy.num_episodes=20 \\
         --policy.path=outputs/train/trash_pickup_cotrain_v1/checkpoints/last/pretrained_model \\
-        --robot.type=xlerobot \\
+        --robot.type=ob15 \\
         --teleop.type=xlerobot_vr \\
         --dataset.repo_id=user/rollout_trash_pickup_dagger \\
         --dataset.single_task="Pick up the trash and place it in the bin"
@@ -170,19 +170,21 @@ from lerobot.configs import parser
 from lerobot.robots import (  # noqa: F401
     Robot,
     RobotConfig,
+    bi_gem_follower,
     bi_openarm_follower,
     bi_rebot_b601_follower,
     bi_so_follower,
     earthrover_mini_plus,
+    gem_follower,
     hope_jr,
     koch_follower,
+    ob15,
     omx_follower,
     openarm_follower,
     reachy2,
     rebot_b601_follower,
     so_follower,
     unitree_g1 as unitree_g1_robot,
-    xlerobot,
 )
 from lerobot.rollout import RolloutConfig, build_rollout_context, create_strategy
 from lerobot.teleoperators import (  # noqa: F401
