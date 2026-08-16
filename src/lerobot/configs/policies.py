@@ -13,7 +13,6 @@
 # limitations under the License.
 import abc
 import builtins
-import io
 import json
 import os
 import tempfile
@@ -198,15 +197,10 @@ class PreTrainedConfig(draccus.ChoiceRegistry, HubMixin, abc.ABC):  # type: igno
         return None
 
     def _save_pretrained(self, save_directory: Path) -> None:
-        # ``type`` is required for ``from_pretrained`` / draccus ChoiceRegistry but is a
-        # ``@property``, not a dataclass field, so draccus.dump omits it unless merged in.
-        buf = io.StringIO()
-        with draccus.config_type("json"):
-            draccus.dump(self, buf, indent=4)
-        data = json.loads(buf.getvalue())
-        data["type"] = self.type
+        # Encode against the base class so draccus includes the choice "type" key,
+        # which `from_pretrained` needs to resolve the concrete subclass.
         with open(save_directory / CONFIG_NAME, "w") as f:
-            json.dump(data, f, indent=4)
+            json.dump(draccus.encode(self, PreTrainedConfig), f, indent=4)
 
     @classmethod
     def from_pretrained(

@@ -89,6 +89,7 @@ lerobot-record \\
 ```
 """
 
+import inspect
 import logging
 import time
 from dataclasses import asdict, dataclass
@@ -157,10 +158,10 @@ from lerobot.teleoperators import (  # noqa: F401
 from lerobot.teleoperators.keyboard import KeyboardTeleop
 from lerobot.teleoperators.xlerobot_vr.xlerobot_vr import XLerobotVRTeleop, init_vr_listener
 from lerobot.utils.constants import ACTION, OBS_STR
+from lerobot.utils.cycle_timer import CycleTimer
 from lerobot.utils.feature_utils import build_dataset_frame, combine_feature_dicts
 from lerobot.utils.import_utils import register_third_party_plugins
 from lerobot.utils.keyboard_input import init_keyboard_listener
-from lerobot.utils.robot_utils import precise_sleep
 from lerobot.utils.utils import (
     init_logging,
     log_say,
@@ -250,7 +251,17 @@ def record_loop(
     display_data: bool = False,
     display_mode: str = "rerun",
     display_compressed_images: bool = False,
+    timer: CycleTimer | None = None,
 ):
+    """Drive the robot from the teleoperator at *fps*, optionally recording each frame.
+
+    *timer* lets a caller that runs several phases — :func:`record` records one episode
+    per call, with an unrecorded reset phase in between — keep one
+    :class:`~lerobot.utils.cycle_timer.CycleTimer` across all of them, so the cadence
+    statistics span the whole session and are reported per episode.  Without it each
+    call gets a private timer: identical pacing and identical slow-loop warnings, just
+    no end-of-run summary, since a single phase has no run to summarise.
+    """
     if dataset is not None and dataset.fps != fps:
         raise ValueError(f"The dataset fps should be equal to requested fps ({dataset.fps} != {fps}).")
 
@@ -279,7 +290,8 @@ def record_loop(
                 "For multi-teleop, the list must contain exactly one KeyboardTeleop and one arm teleoperator. Currently only supported for LeKiwi robot."
             )
 
-    control_interval = 1 / fps
+    if timer is None:
+        timer = CycleTimer(fps, records_data=dataset is not None)
 
     no_action_count = 0
     timestamp = 0
@@ -297,6 +309,7 @@ def record_loop(
     # For training with depth, it's usually better to keep depth time-aligned to RGB/actions.
     depth_read_interval = 1  # Read depth every frame
     last_depth_obs = {}  # Store last depth observation for frames where we skip depth
+    robot_supports_depth_throttle = "skip_depth" in inspect.signature(robot.get_observation).parameters
 
     while timestamp < control_time_s:
         start_loop_t = time.perf_counter()
@@ -312,94 +325,108 @@ def record_loop(
             vr_events = teleop.get_vr_events()
             events.update(vr_events)
 
+        # Checked before `tick()`: this iteration is not a control tick, so it should not
+        # be timed as one.
         if events["exit_early"]:
             events["exit_early"] = False
             break
 
-        # Get robot observation - skip depth reads on some frames for performance
-        # We still read color cameras every frame for the dataset
-        read_depth_this_frame = (frame_idx % depth_read_interval == 0)
-        obs = robot.get_observation(skip_cameras=False, skip_depth=not read_depth_this_frame)
+        timer.tick()
 
-        # If we skipped depth this frame, merge last depth observation
-        if not read_depth_this_frame and last_depth_obs:
-            obs.update(last_depth_obs)
-        elif read_depth_this_frame:
-            # Store depth data for next frames where we skip depth
-            last_depth_obs = {k: v for k, v in obs.items() if k.endswith("_depth")}
+        with timer.section("observe"):
+            if robot_supports_depth_throttle:
+                # Get robot observation - skip depth reads on some frames for performance.
+                # We still read color cameras every frame for the dataset.
+                read_depth_this_frame = frame_idx % depth_read_interval == 0
+                obs = robot.get_observation(skip_cameras=False, skip_depth=not read_depth_this_frame)
 
-        # Applies a pipeline to the raw robot observation, default is IdentityProcessor
-        obs_processed = robot_observation_processor(obs)
+                # If we skipped depth this frame, merge last depth observation
+                if not read_depth_this_frame and last_depth_obs:
+                    obs.update(last_depth_obs)
+                elif read_depth_this_frame:
+                    # Store depth data for next frames where we skip depth
+                    last_depth_obs = {k: v for k, v in obs.items() if k.endswith("_depth")}
+            else:
+                # Get robot observation
+                obs = robot.get_observation()
 
-        if dataset is not None:
-            observation_frame = build_dataset_frame(dataset.features, obs_processed, prefix=OBS_STR)
+        with timer.section("process_obs"):
+            # Applies a pipeline to the raw robot observation, default is IdentityProcessor
+            obs_processed = robot_observation_processor(obs)
 
-        # Get action from teleop
-        if isinstance(teleop, Teleoperator):
-            if hasattr(teleop, "update_observation_cache"):
-                teleop.update_observation_cache(obs)
-            act = teleop.get_action()
-            if robot.name == "unitree_g1":
-                teleop.send_feedback(obs)
+            if dataset is not None:
+                observation_frame = build_dataset_frame(dataset.features, obs_processed, prefix=OBS_STR)
 
-            # Applies a pipeline to the raw teleop action, default is IdentityProcessor
-            act_processed_teleop = teleop_action_processor((act, obs))
-            action_values = act_processed_teleop
-            robot_action_to_send = robot_action_processor((act_processed_teleop, obs))
+        with timer.section("teleop"):
+            # Get action from teleop
+            if isinstance(teleop, Teleoperator):
+                if hasattr(teleop, "update_observation_cache"):
+                    teleop.update_observation_cache(obs)
+                act = teleop.get_action()
+                if robot.name == "unitree_g1":
+                    teleop.send_feedback(obs)
 
-        elif isinstance(teleop, list):
-            arm_action = teleop_arm.get_action()
-            arm_action = {f"arm_{k}": v for k, v in arm_action.items()}
-            keyboard_action = teleop_keyboard.get_action()
-            base_action = robot._from_keyboard_to_base_action(keyboard_action)
-            act = {**arm_action, **base_action} if len(base_action) > 0 else arm_action
-            act_processed_teleop = teleop_action_processor((act, obs))
-            action_values = act_processed_teleop
-            robot_action_to_send = robot_action_processor((act_processed_teleop, obs))
-        else:
-            no_action_count += 1
-            if no_action_count == 1 or no_action_count % 10 == 0:
-                logging.warning(
-                    "No teleoperator provided, skipping action generation. "
-                    "This is likely to happen when resetting the environment without a teleop device. "
-                    "The robot won't be at its rest position at the start of the next episode."
-                )
+                # Applies a pipeline to the raw teleop action, default is IdentityProcessor
+                act_processed_teleop = teleop_action_processor((act, obs))
+                action_values = act_processed_teleop
+                robot_action_to_send = robot_action_processor((act_processed_teleop, obs))
+
+            elif isinstance(teleop, list):
+                arm_action = teleop_arm.get_action()
+                arm_action = {f"arm_{k}": v for k, v in arm_action.items()}
+                keyboard_action = teleop_keyboard.get_action()
+                base_action = robot._from_keyboard_to_base_action(keyboard_action)
+                act = {**arm_action, **base_action} if len(base_action) > 0 else arm_action
+                act_processed_teleop = teleop_action_processor((act, obs))
+                action_values = act_processed_teleop
+                robot_action_to_send = robot_action_processor((act_processed_teleop, obs))
+            else:
+                robot_action_to_send = None
+                no_action_count += 1
+                if no_action_count == 1 or no_action_count % 10 == 0:
+                    logging.warning(
+                        "No teleoperator provided, skipping action generation. "
+                        "This is likely to happen when resetting the environment without a teleop device. "
+                        "The robot won't be at its rest position at the start of the next episode."
+                    )
+
+        # Nothing to send and nothing to record, but the phase still has to be paced and
+        # still has to end: `continue`ing straight past the tail of the loop body used to
+        # spin at full CPU speed on a `control_time_s` that never advanced.
+        if robot_action_to_send is None:
+            timer.wait()
+            timestamp = time.perf_counter() - start_episode_t
             continue
 
-        # Send action to robot
-        # Action can eventually be clipped using `max_relative_target`,
-        # so action actually sent is saved in the dataset. action = postprocessor.process(action)
-        # TODO(steven, pepijn, adil): we should use a pipeline step to clip the action, so the sent action is the action that we input to the robot.
-        _sent_action = robot.send_action(robot_action_to_send)
+        with timer.section("send"):
+            # Send action to robot
+            # Action can eventually be clipped using `max_relative_target`,
+            # so action actually sent is saved in the dataset. action = postprocessor.process(action)
+            # TODO(steven, pepijn, adil): we should use a pipeline step to clip the action, so the sent action is the action that we input to the robot.
+            _sent_action = robot.send_action(robot_action_to_send)
 
         # Use the actually sent action for logging (includes normalization, clipping, etc.)
         action_values = _sent_action
 
         # Write to dataset
         if dataset is not None:
-            action_frame = build_dataset_frame(dataset.features, action_values, prefix=ACTION)
-            frame = {**observation_frame, **action_frame, "task": single_task}
-            dataset.add_frame(frame)
+            with timer.section("record"):
+                action_frame = build_dataset_frame(dataset.features, action_values, prefix=ACTION)
+                frame = {**observation_frame, **action_frame, "task": single_task}
+                dataset.add_frame(frame)
 
         # Visualization runs in a background thread - this call is non-blocking.
         # Frames are dropped if the worker is still busy (queue size = 1).
         if display_data:
-            log_visualization_data(
-                display_mode,
-                observation=obs_processed,
-                action=action_values,
-                compress_images=display_compressed_images,
-            )
+            with timer.section("telemetry"):
+                log_visualization_data(
+                    display_mode,
+                    observation=obs_processed,
+                    action=action_values,
+                    compress_images=display_compressed_images,
+                )
 
-        dt_s = time.perf_counter() - start_loop_t
-
-        sleep_time_s: float = control_interval - dt_s
-        if sleep_time_s < 0:
-            logging.warning(
-                f"Record loop is running slower ({1 / dt_s:.1f} Hz) than the target FPS ({fps} Hz). Dataset frames might be dropped and robot control might be unstable. Common causes are: 1) Camera FPS not keeping up 2) Policy inference taking too long 3) CPU starvation"
-            )
-
-        precise_sleep(max(sleep_time_s, 0.0))
+        timer.wait()
 
         timestamp = time.perf_counter() - start_episode_t
 
@@ -495,6 +522,11 @@ def record(
 
     dataset = None
     listener = None
+    # One timer for the whole session, so its statistics describe the recording rather
+    # than one episode's slice of it.  The reset phases below deliberately run on their
+    # own private timers: they write no frames, so folding their ticks in would dilute
+    # every number that answers "did I record at `fps`?".
+    timer = CycleTimer(cfg.dataset.fps)
 
     try:
         if cfg.resume:
@@ -548,13 +580,15 @@ def record(
                 encoder_queue_maxsize=cfg.dataset.encoder_queue_maxsize,
             )
 
-        robot.connect()
+        # Connect the teleoperator before the robot so the robot isn't left idle (and possibly
+        # tripping a firmware watchdog) during teleop init. Matches lerobot_teleoperate.py.
         if teleop is not None:
             # For XLerobot VR, pass the robot reference so get_action() can compute real commands
             if isinstance(teleop, XLerobotVRTeleop):
                 teleop.connect(robot=robot)
             else:
                 teleop.connect()
+        robot.connect()
 
         # Use VR listener if VR teleop, otherwise use keyboard listener
         if isinstance(teleop, XLerobotVRTeleop):
@@ -608,6 +642,7 @@ def record(
                     display_data=cfg.display_data,
                     display_mode=cfg.display_mode,
                     display_compressed_images=display_compressed_images,
+                    timer=timer,
                 )
                 events.pop("_episode_idx", None)
                 events.pop("_episode_total", None)
@@ -620,10 +655,13 @@ def record(
                         teleop.vr_event_handler.events["rerecord_episode"] = False
                         teleop.vr_event_handler.events["exit_early"] = False
                     dataset.clear_episode_buffer()
+                    timer.log_episode_summary("discarded episode")
+                    timer.restart()
                     continue
 
                 # Save episode immediately before reset phase so an interrupt during reset
                 # doesn't lose the episode.
+                episode_index = dataset.num_episodes
                 dataset.save_episode()
                 recorded_episodes += 1
 
@@ -631,6 +669,13 @@ def record(
                     f"✅ Episode {dataset.num_episodes} saved! "
                     f"({recorded_episodes}/{cfg.dataset.num_episodes} episodes done)"
                 )
+                # Close the window on the episode just saved.  The digest is emitted on
+                # the next episode's first tick, so the reset phase, `save_episode` and
+                # the spoken prompts in between are excluded from the cadence instead of
+                # being charged to whichever episode they sit next to.  `restart()` then
+                # exempts that first tick, whose cameras have been idle for seconds.
+                timer.log_episode_summary(f"episode {episode_index}")
+                timer.restart()
 
                 # Execute a few seconds without recording to give time to manually reset the environment
                 # Skip reset for the last episode to be recorded
@@ -651,6 +696,10 @@ def record(
                         display_mode=cfg.display_mode,
                     )
     finally:
+        # First, and in `finally`: ^C is how most recording sessions end, and the summary
+        # is most useful before the video encoding and the hub upload scroll it away.
+        timer.log_run_summary()
+
         log_say("Stop recording", cfg.play_sounds, blocking=True)
 
         if cfg.display_data:
