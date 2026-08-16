@@ -206,6 +206,14 @@ def _remap_vector_by_names(
 
 PAD_FILL_MODES = ("zero", "ref-mean", "state-copy")
 
+# Camera-key reconciliation policies for multi-source merges. "intersection"
+# (default, legacy behaviour) requires every source to provide every
+# canonical camera; a source missing one causes an error. "zero" instead
+# black-frame-fills any canonical camera a source doesn't natively have
+# (e.g. a single-arm robot merged with dual-arm robots that have a
+# right-wrist camera it structurally cannot provide).
+CAMERA_FILL_MODES = ("intersection", "zero")
+
 # Joint-name tokens that denote velocity dims; for those, 0 is semantically
 # correct ("stopped") and is kept in every fill mode.
 _VEL_NAME_TOKENS = (".vel", "_vel", "velocity")
@@ -432,8 +440,21 @@ def _alignment_artifacts_match(
     target_features: dict[str, Any],
     effective_fps: int,
     pad_fill_mode: str = "zero",
+    expected_total_episodes: int | None = None,
 ) -> bool:
-    """True if *info_json* matches the schema we would write with *target_features*."""
+    """True if *info_json* matches the schema we would write with *target_features*.
+
+    *expected_total_episodes*, when given, must equal the cached
+    ``total_episodes`` — schema alone (fps/names/camera shapes) can match a
+    dataset that was only *partially* written (e.g. the process was killed
+    mid-alignment): ``info.json``/``tasks.parquet`` are updated after every
+    single episode (see ``LeRobotDatasetMetadata.save_episode``), so a
+    50-of-95,658-episode partial run looks schema-valid without this check,
+    and would otherwise be silently accepted as "already aligned," truncating
+    that source in the merge with no error. Pass the source's real
+    ``total_episodes`` to catch this; omit only for callers that don't have
+    it (legacy behaviour).
+    """
     if not info_json.is_file():
         return False
     tasks_parquet = info_json.parent / Path(DEFAULT_TASKS_PATH).name
@@ -444,6 +465,10 @@ def _alignment_artifacts_match(
     with open(info_json, encoding="utf-8") as f:
         cached = json.load(f)
     if int(cached.get("fps", -1)) != int(effective_fps):
+        return False
+    if expected_total_episodes is not None and int(cached.get("total_episodes", -1)) != int(
+        expected_total_episodes
+    ):
         return False
     cf = cached.get("features") or {}
     for key in ("observation.state", "action"):
@@ -718,6 +743,7 @@ def align_single_dataset(
     canonical_visual: dict[str, Any] | None = None,
     forced_effective_fps: int | None = None,
     pad_fill_mode: str = "zero",
+    camera_fill_mode: str = "intersection",
 ) -> Path:
     """Download *source_repo* and write a feature-aligned copy to *output_root*.
 
@@ -751,6 +777,12 @@ def align_single_dataset(
     Non-zero modes require *match_features_from* (the reference supplies the
     joint names and stats).
 
+    *camera_fill_mode* controls what happens when this source has no native
+    equivalent for one of the canonical (post-remap) camera keys: ``"zero"``
+    writes an all-black frame of the target shape for every frame of every
+    episode; ``"intersection"`` (default) raises, since normally the caller
+    already restricted the canonical camera set to keys every source has.
+
     Returns the path to the aligned dataset root.
     """
     if pad_fill_mode not in PAD_FILL_MODES:
@@ -758,6 +790,10 @@ def align_single_dataset(
     if pad_fill_mode != "zero" and match_features_from is None:
         raise ValueError(
             f"pad_fill_mode={pad_fill_mode!r} needs --match-features-from (reference names + stats)."
+        )
+    if camera_fill_mode not in CAMERA_FILL_MODES:
+        raise ValueError(
+            f"camera_fill_mode must be one of {CAMERA_FILL_MODES}, got {camera_fill_mode!r}"
         )
 
     logger.info("Loading source dataset: %s", source_repo)
@@ -827,6 +863,21 @@ def align_single_dataset(
         canonical_visual=canonical_visual,
     )
 
+    provided_cam_keys = _remapped_dst_keys_for_meta(src_meta, camera_remap)
+    missing_cam_keys = [k for k in target_cam_keys if k not in provided_cam_keys]
+    if missing_cam_keys:
+        if camera_fill_mode != "zero":
+            raise ValueError(
+                f"{source_repo} does not provide canonical camera key(s) {missing_cam_keys} "
+                "(after --camera-remap). Pass --camera-fill-mode zero to black-frame-fill "
+                "missing cameras, or adjust --camera-remap / --target-camera-keys."
+            )
+        logger.warning(
+            "%s: zero-filling missing camera(s) %s for every frame (source has no equivalent view).",
+            source_repo,
+            missing_cam_keys,
+        )
+
     resize_info = (
         f", images resized to {target_image_size[0]}×{target_image_size[1]}"
         if target_image_size is not None
@@ -851,17 +902,24 @@ def align_single_dataset(
             logger.warning("Force rebuild: removing %s", output_root)
             shutil.rmtree(output_root)
         elif info_json.is_file() and _alignment_artifacts_match(
-            info_json, target_features, effective_fps, pad_fill_mode
+            info_json,
+            target_features,
+            effective_fps,
+            pad_fill_mode,
+            expected_total_episodes=src_meta.total_episodes,
         ):
             logger.info(
-                "Reusing completed aligned dataset at %s (metadata matches options).",
+                "Reusing completed aligned dataset at %s (metadata matches options, "
+                "all %d episodes confirmed present).",
                 output_root,
+                src_meta.total_episodes,
             )
             return output_root
         elif info_json.is_file():
             logger.warning(
-                "Removing stale aligned dataset (options changed, e.g. "
-                "--match-features-from or resolution): %s",
+                "Removing stale or incomplete aligned dataset (options changed, e.g. "
+                "--match-features-from or resolution, OR a prior run was interrupted "
+                "mid-alignment): %s",
                 output_root,
             )
             shutil.rmtree(output_root)
@@ -998,6 +1056,13 @@ def align_single_dataset(
                     frame[img_key] = _ensure_depth_chw_numpy(
                         frame[img_key], target_hw=target_image_size
                     )
+            for miss_key in missing_cam_keys:
+                feat = target_features[miss_key]
+                h, w = int(feat["shape"][0]), int(feat["shape"][1])
+                if feat.get("dtype") == "depth":
+                    frame[miss_key] = np.zeros((1, h, w), dtype=np.uint16)
+                else:
+                    frame[miss_key] = np.zeros((h, w, 3), dtype=np.uint8)
             frame["task"] = task_description
 
             aligned_ds.add_frame(frame)
@@ -1136,6 +1201,41 @@ def _override_padded_stats(
                 [names[i] for i in sorted(padded)],
                 reference_repo,
             )
+
+    # Camera keys that are entirely zero-filled for some source (see
+    # --camera-fill-mode zero / padded_camera_keys) are a whole-feature-key
+    # problem, not a per-index one: the black frames contribute a whole
+    # constant image to the merged mean/std for that camera key, potentially
+    # dragging it toward black even though most sources have real footage.
+    # This is defensive hardening (see docs/missing_modality_support.md —
+    # VISUAL normalization is IDENTITY by default for pi0.5, so this doesn't
+    # affect current training, but keeps meta/stats.json itself honest for
+    # any future MEAN_STD use or downstream inspection).
+    padded_cam_keys: set[str] = set()
+    for e in entries:
+        padded_cam_keys.update(
+            f"observation.images.{k}" for k in (e.get("padded_camera_keys") or [])
+        )
+    for cam_key in sorted(padded_cam_keys):
+        ref_feat = ref_stats.get(cam_key)
+        merged_feat = merged_stats.get(cam_key)
+        if ref_feat is None or merged_feat is None:
+            logger.warning(
+                "--override-padded-stats: camera key %s missing from reference or merged "
+                "stats; skipped.",
+                cam_key,
+            )
+            continue
+        for stat_key in ("mean", "std", "min", "max"):
+            if stat_key in ref_feat:
+                merged_feat[stat_key] = np.asarray(ref_feat[stat_key], dtype=np.float64)
+        logger.info(
+            "Overrode merged %s stats (mean/std/min/max) with reference %s (zero-filled "
+            "for at least one source).",
+            cam_key,
+            reference_repo,
+        )
+
     write_stats(merged_stats, merged_root)
 
 
@@ -1161,6 +1261,12 @@ _DEFAULT_CAMERA_REMAP: dict[str, str] = {
     "rgb_images.front": "head",
     "rgb_images.left": "left_wrist",
     "rgb_images.right": "right_wrist",
+    # DROID (single-arm; exterior_2_left has no canonical slot and is
+    # intentionally left unmapped so it's dropped, not merged in as a
+    # fourth camera key every other source would then need to be
+    # zero-filled for).
+    "wrist_left": "left_wrist",
+    "exterior_1_left": "head",
 }
 
 
@@ -1182,6 +1288,8 @@ def align_datasets_for_cotraining(
     realign_all_sources: bool = False,
     pad_fill_mode: str = "zero",
     override_padded_stats: bool = False,
+    target_camera_keys: list[str] | None = None,
+    camera_fill_mode: str = "intersection",
 ) -> Path:
     """Align all *source_repos* and merge into one local dataset at *output_root*.
 
@@ -1204,11 +1312,23 @@ def align_datasets_for_cotraining(
     If *skip_missing_sources* is True, repos that are missing locally and return
     Hub 404 are logged and skipped; otherwise loading metadata raises immediately.
 
-    When several sources are merged, camera keys are the **intersection** of
-    remapped ``observation.images.*`` keys (so e.g. depth-only streams are dropped
-    unless every dataset has them). Resolution is the minimum H×W across sources
-    unless *target_image_size* is set. All shards share one fps and identical
-    video ``info`` (including codec) so ``aggregate_datasets()`` metadata checks pass.
+    When several sources are merged, camera keys default to the **intersection**
+    of remapped ``observation.images.*`` keys (so e.g. depth-only streams are
+    dropped unless every dataset has them). Resolution is the minimum H×W
+    across sources unless *target_image_size* is set. All shards share one fps
+    and identical video ``info`` (including codec) so ``aggregate_datasets()``
+    metadata checks pass.
+
+    Pass *target_camera_keys* (e.g. ``["head", "left_wrist", "right_wrist"]``)
+    to fix the canonical camera set explicitly instead of deriving it from the
+    intersection/union of sources — any source camera that doesn't remap into
+    this set is dropped (e.g. DROID's second exterior view). Combine with
+    *camera_fill_mode="zero"* so a source that structurally lacks one of these
+    cameras (e.g. a single-arm robot merged with dual-arm sources that have a
+    ``right_wrist`` camera) gets an all-black frame for it instead of raising.
+    Without *target_camera_keys*, *camera_fill_mode="zero"* instead takes the
+    **union** of every source's remapped camera keys as canonical, zero-filling
+    whichever ones each source is missing.
 
     *pad_fill_mode* selects the constant written into state/action dims a
     source cannot provide (``zero`` / ``ref-mean`` / ``state-copy``, see
@@ -1227,6 +1347,10 @@ def align_datasets_for_cotraining(
         raise ValueError(
             "--pad-fill-mode ref-mean/state-copy and --override-padded-stats require "
             "--match-features-from (the reference supplies joint names and stats)."
+        )
+    if camera_fill_mode not in CAMERA_FILL_MODES:
+        raise ValueError(
+            f"camera_fill_mode must be one of {CAMERA_FILL_MODES}, got {camera_fill_mode!r}"
         )
 
     if camera_remap is None:
@@ -1277,11 +1401,28 @@ def align_datasets_for_cotraining(
         )
 
     merge_fps = _merge_effective_fps(all_metas, target_fps)
-    canonical_cam_keys = _intersection_remapped_camera_keys(all_metas, camera_remap)
+
+    if target_camera_keys is not None:
+        canonical_cam_keys = sorted(f"observation.images.{k}" for k in target_camera_keys)
+        provided_anywhere = set.union(
+            *[_remapped_dst_keys_for_meta(m, camera_remap) for m in all_metas]
+        )
+        missing_everywhere = [k for k in canonical_cam_keys if k not in provided_anywhere]
+        if missing_everywhere:
+            raise ValueError(
+                f"--target-camera-keys includes key(s) {missing_everywhere} that no source "
+                "provides even after --camera-remap. Fix --camera-remap or drop the key."
+            )
+    elif camera_fill_mode == "zero":
+        canonical_cam_keys = sorted(
+            set.union(*[_remapped_dst_keys_for_meta(m, camera_remap) for m in all_metas])
+        )
+    else:
+        canonical_cam_keys = _intersection_remapped_camera_keys(all_metas, camera_remap)
     if not canonical_cam_keys:
         raise ValueError(
             "No observation.images.* keys are shared by all sources after --camera-remap; "
-            "cannot merge. Adjust --camera-remap or --source-repos."
+            "cannot merge. Adjust --camera-remap, --target-camera-keys, or --source-repos."
         )
 
     auto_hw = _min_hw_for_merge(all_metas, camera_remap, set(canonical_cam_keys))
@@ -1298,10 +1439,12 @@ def align_datasets_for_cotraining(
             merge_fps,
         )
         logger.info(
-            "Merge-safe visual schema: keys=%s, size=%s, fps=%d (intersection across sources).",
+            "Merge-safe visual schema: keys=%s, size=%s, fps=%d (camera_fill_mode=%s%s).",
             canonical_cam_keys,
             unified_hw,
             merge_fps,
+            camera_fill_mode,
+            ", explicit target_camera_keys" if target_camera_keys is not None else "",
         )
 
     _src_pbar = tqdm(
@@ -1328,6 +1471,12 @@ def align_datasets_for_cotraining(
             padded_action_dims = _missing_dims(
                 src_ac.get("names"), int((src_ac.get("shape") or (0,))[0]), action_names
             )
+        provided_cam_keys = _remapped_dst_keys_for_meta(src_meta, camera_remap)
+        padded_camera_keys = sorted(
+            k.removeprefix("observation.images.")
+            for k in canonical_cam_keys
+            if k not in provided_cam_keys
+        )
         safe_name = src_repo.replace("/", "__")
         aligned_repo_id = f"{target_repo_id}_src{i}_{safe_name}"
         aligned_root = output_root.parent / f"_align_tmp_{safe_name}"
@@ -1360,10 +1509,11 @@ def align_datasets_for_cotraining(
             aligned_repo_ids.append(src_repo)
             manifest_entries.append({
                 "repo_id": src_repo,
-                "native": not (padded_state_dims or padded_action_dims),
+                "native": not (padded_state_dims or padded_action_dims or padded_camera_keys),
                 "num_episodes": int(src_meta.total_episodes),
                 "padded_state_dims": padded_state_dims,
                 "padded_action_dims": padded_action_dims,
+                "padded_camera_keys": padded_camera_keys,
             })
             continue
 
@@ -1372,14 +1522,23 @@ def align_datasets_for_cotraining(
             shutil.rmtree(aligned_root)
 
         cache_matches = info_json.is_file() and _alignment_artifacts_match(
-            info_json, target_features, merge_fps, pad_fill_mode
+            info_json,
+            target_features,
+            merge_fps,
+            pad_fill_mode,
+            expected_total_episodes=src_meta.total_episodes,
         )
         if not force_rebuild and cache_matches:
-            logger.info("Reusing already-aligned cache: %s", aligned_root)
+            logger.info(
+                "Reusing already-aligned cache: %s (all %d episodes confirmed present)",
+                aligned_root,
+                src_meta.total_episodes,
+            )
         else:
             if aligned_root.exists():
                 logger.warning(
-                    "Rebuilding align cache %s (stale vs current options).",
+                    "Rebuilding align cache %s (stale vs current options, or a prior run "
+                    "was interrupted mid-alignment).",
                     aligned_root,
                 )
                 shutil.rmtree(aligned_root)
@@ -1399,16 +1558,18 @@ def align_datasets_for_cotraining(
                 canonical_visual=canonical_visual,
                 forced_effective_fps=merge_fps if canonical_visual is not None else None,
                 pad_fill_mode=pad_fill_mode,
+                camera_fill_mode=camera_fill_mode,
             )
 
         aligned_roots.append(aligned_root)
         aligned_repo_ids.append(aligned_repo_id)
         manifest_entries.append({
             "repo_id": src_repo,
-            "native": not (padded_state_dims or padded_action_dims),
+            "native": not (padded_state_dims or padded_action_dims or padded_camera_keys),
             "num_episodes": _episodes_in_root(aligned_root),
             "padded_state_dims": padded_state_dims,
             "padded_action_dims": padded_action_dims,
+            "padded_camera_keys": padded_camera_keys,
         })
 
     if not aligned_repo_ids:
@@ -1674,6 +1835,30 @@ def main() -> None:
             "constant fills. Recommended whenever external sources pad dims."
         ),
     )
+    parser.add_argument(
+        "--target-camera-keys",
+        type=str,
+        default=None,
+        help=(
+            "Comma-separated canonical camera keys, e.g. 'head,left_wrist,right_wrist'. "
+            "Fixes the merged schema explicitly instead of deriving it from the "
+            "intersection/union of --source-repos; any source camera that doesn't remap "
+            "into this set is dropped. Combine with --camera-fill-mode zero so a source "
+            "structurally missing one of these cameras gets a black frame instead of an error."
+        ),
+    )
+    parser.add_argument(
+        "--camera-fill-mode",
+        choices=CAMERA_FILL_MODES,
+        default="intersection",
+        help=(
+            "'intersection' (default): every source must provide every canonical camera "
+            "(after --camera-remap / --target-camera-keys), or alignment raises. "
+            "'zero': sources missing a canonical camera get an all-black frame for it "
+            "instead — e.g. a single-arm source merged with dual-arm sources that have "
+            "a right_wrist camera it cannot provide."
+        ),
+    )
 
     args = parser.parse_args()
 
@@ -1717,6 +1902,12 @@ def main() -> None:
         realign_all_sources=args.realign_all_sources,
         pad_fill_mode=args.pad_fill_mode,
         override_padded_stats=args.override_padded_stats,
+        target_camera_keys=(
+            [k.strip() for k in args.target_camera_keys.split(",") if k.strip()]
+            if args.target_camera_keys
+            else None
+        ),
+        camera_fill_mode=args.camera_fill_mode,
     )
 
 

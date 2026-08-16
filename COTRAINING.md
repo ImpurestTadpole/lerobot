@@ -177,10 +177,18 @@ lerobot-train \
     --dataset.repo_id=Odog16/trash_pickup \
     --policy.type=smolvla --policy.push_to_hub=false \
     --policy.pretrained_path=outputs/train/xlerobot_generalist_v1/checkpoints/last/pretrained_model \
+    --use_policy_training_preset=false \
     --scheduler.type=cosine_decay_with_warmup --scheduler.peak_lr=5e-5 \
+    --scheduler.num_warmup_steps=1000 --scheduler.num_decay_steps=20000 --scheduler.decay_lr=1e-6 \
+    --optimizer.type=adamw --optimizer.lr=5e-5 \
     --batch_size=16 --steps=20000 \
     --output_dir=outputs/train/trash_pickup_cotrain_v1
 ```
+
+`--use_policy_training_preset=false` is required whenever `--scheduler.*` is overridden —
+left at its default `true`, `cfg.validate()` silently **overwrites** the scheduler (and
+optimizer) with the policy's own preset, no error, just training at the generalist's LR
+instead of the gentler fine-tune values above.
 
 Add `--use_rabc=true --rabc_head_mode=sparse --rabc_kappa=0.01` to weight
 training toward high-quality demonstrations (see DAGGER_HIL.md §2). Generate

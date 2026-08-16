@@ -39,6 +39,7 @@ import re
 import shlex
 import shutil
 import signal
+import socket
 import subprocess
 import threading
 import time
@@ -162,6 +163,14 @@ def _train_stage_command(p: dict) -> str:
     else:
         args.append("--policy.push_to_hub=false")
     if p.get("train_state_proj"):
+        # SmolVLA-only field (src/lerobot/policies/smolvla/configuration_smolvla.py)
+        # — sending it for any other policy type raises an unrecognized-argument
+        # error, the same class of bug as the scheduler fields above.
+        if (p.get("policy_type") or "").strip() != "smolvla":
+            raise ValueError(
+                "train stage: 'Train state projection' is SmolVLA-only — uncheck it "
+                f"or set Policy type to smolvla (got {p.get('policy_type')!r})"
+            )
         args.append("--policy.train_state_proj=true")
     if p.get("use_amp"):
         args.append("--policy.use_amp=true")
@@ -170,8 +179,29 @@ def _train_stage_command(p: dict) -> str:
     _flag(args, "--save_freq", p.get("save_freq"))
     _flag(args, "--output_dir", p.get("output_dir"))
     if p.get("scheduler_type"):
+        # cfg.validate() unconditionally overwrites self.scheduler (and
+        # self.optimizer) from the policy's own get_scheduler_preset() when
+        # use_policy_training_preset is true (the default) — silently
+        # discarding any --scheduler.* CLI overrides, no error raised. A
+        # custom scheduler here only takes effect with the preset disabled.
+        args.append("--use_policy_training_preset=false")
         _flag(args, "--scheduler.type", p.get("scheduler_type"))
         _flag(args, "--scheduler.peak_lr", p.get("peak_lr"))
+        if p.get("scheduler_type") == "cosine_decay_with_warmup":
+            # This scheduler has no field defaults (num_warmup_steps,
+            # num_decay_steps, decay_lr are all required) — draccus rejects
+            # peak_lr alone with "Missing required field(s)".
+            _flag(args, "--scheduler.num_warmup_steps", p.get("scheduler_warmup_steps") or "1000")
+            _flag(args, "--scheduler.num_decay_steps",
+                  p.get("scheduler_decay_steps") or p.get("steps") or "20000")
+            _flag(args, "--scheduler.decay_lr", p.get("scheduler_decay_lr") or "1e-6")
+        # use_policy_training_preset also supplies the optimizer; without it
+        # draccus requires --optimizer.type explicitly too (validate() raises
+        # "Optimizer and Scheduler must be set when the policy presets are
+        # not used" otherwise). Default to the adamw preset SmolVLA itself
+        # uses so behavior matches except for the scheduler override.
+        _flag(args, "--optimizer.type", p.get("optimizer_type") or "adamw")
+        _flag(args, "--optimizer.lr", p.get("peak_lr"))
     elif p.get("peak_lr"):
         _flag(args, "--scheduler.peak_lr", p.get("peak_lr"))
     weighting = p.get("weighting") or "none"
@@ -507,6 +537,32 @@ def _camera_rows(ref_meta: dict, cand_meta: dict) -> list[dict]:
     return rows
 
 
+def dataset_schema(repo: str) -> dict:
+    """Real joint/camera names for *repo* — powers the extract stage's
+    dimension/camera picker so "keep_names"/"cameras"/"keep_depth" can be
+    filled in by ticking checkboxes instead of typing exact strings."""
+    meta = _load_dataset_meta(repo)
+    feats = meta["info"].get("features") or {}
+    state_names = _names_list(feats.get("observation.state") or {})
+    action_names = _names_list(feats.get("action") or {})
+    cameras = []
+    for key, feat in feats.items():
+        if not key.startswith("observation.images."):
+            continue
+        cam = key.removeprefix("observation.images.")
+        is_depth = feat.get("dtype") == "depth" or cam.endswith("_depth")
+        cameras.append({"name": cam, "is_depth": is_depth, "shape": list(feat.get("shape") or [])})
+    return {
+        "repo": repo,
+        "source": meta["source"],
+        "state_names": state_names,
+        "action_names": action_names,
+        "cameras": cameras,
+        "fps": meta["info"].get("fps"),
+        "episodes": meta["info"].get("total_episodes"),
+    }
+
+
 def compare_datasets(ref_repo: str, cand_repo: str) -> dict:
     """Preflight report: what lerobot-cotrain-align would pad/drop, and how bad
     zero-filling would be given the reference stats."""
@@ -740,6 +796,13 @@ class WorkflowRun:
                 )
                 with self.lock:
                     self.proc = proc
+                    # Persisted so a later process (e.g. after this server
+                    # restarts and loses the Popen handle) can tell a
+                    # genuinely-still-running stage apart from one whose
+                    # subprocess already exited orphaned — see
+                    # _workflow_status_snapshot's liveness reconciliation.
+                    self.stages[pos]["pid"] = proc.pid
+                self._persist()
                 rc = proc.wait()
             with self.lock:
                 self.proc = None
@@ -771,6 +834,63 @@ class WorkflowRun:
 
 _runs: dict[str, WorkflowRun] = {}
 _runs_lock = threading.Lock()
+
+
+def _pid_alive(pid: int | None) -> bool:
+    if not pid:
+        return False
+    try:
+        os.kill(pid, 0)
+    except ProcessLookupError:
+        return False
+    except PermissionError:
+        return True  # exists, just owned by someone else — treat as alive
+    return True
+
+
+def _workflow_status_snapshot(name: str) -> dict:
+    """Live status if this process still has the WorkflowRun in memory,
+    else fall back to the last-persisted run_state.json — status survives a
+    workflow_ui server restart even though live run tracking doesn't (the
+    underlying stage subprocess keeps running orphaned; only this process's
+    bookkeeping of it is lost).
+
+    A disk-sourced "running" status is only trustworthy if the recorded pid
+    is still alive. If the server itself was restarted (losing its Popen
+    handle) while a stage's subprocess was mid-run, that subprocess keeps
+    running to completion on its own (start_new_session=True) but nothing is
+    left to catch its exit code — run_state.json then says "running" forever
+    even after the process is long gone. Detect that here and self-heal by
+    persisting the corrected status, rather than reporting a stale "running"
+    indefinitely."""
+    with _runs_lock:
+        run = _runs.get(name)
+    if run is not None:
+        return {"live": run.status == "running", **run.snapshot()}
+    state_path = WORKFLOWS_DIR / name / "logs" / "run_state.json"
+    if state_path.is_file():
+        try:
+            data = json.loads(state_path.read_text())
+        except (json.JSONDecodeError, OSError):
+            data = None
+        if data is not None:
+            if data.get("status") == "running":
+                running_stage = next(
+                    (s for s in data.get("stages", []) if s.get("status") == "running"), None
+                )
+                if running_stage is not None and not _pid_alive(running_stage.get("pid")):
+                    running_stage["status"] = "orphaned"
+                    data["status"] = "orphaned"
+                    data["error"] = (
+                        f"Stage '{running_stage['name']}' subprocess (pid {running_stage.get('pid')}) "
+                        "is no longer running, but the workflow_ui server lost track of it before "
+                        "recording an exit code (likely a server restart mid-run). Check its log "
+                        "under logs/ directly to see whether it actually finished or crashed."
+                    )
+                    with contextlib.suppress(OSError):
+                        state_path.write_text(json.dumps(data, indent=2))
+            return {"live": False, **data}
+    return {"live": False, "status": "idle", "stages": []}
 
 
 # ---------------------------------------------------------------------------
@@ -1036,9 +1156,169 @@ def master_umi_preset() -> dict:
     }
 
 
+def _model_comparison_train_stages(dataset_var: str, batch_var: str, steps_var: str) -> list[dict]:
+    """One train stage per policy architecture, sharing a dataset/batch/steps
+    variable set — "different levels and types of generalist policy". Only
+    SmolVLA is enabled by default: Run all would otherwise chain four full
+    pretrains back to back (each potentially many hours). Enable the others
+    to compare; each was smoke-tested for real (steps=1) against a local
+    dataset before being added here, since silently-wrong or silently-crashing
+    per-policy fields are a real risk (see cotrain-workflow-ui memory notes).
+    """
+    common = {
+        "dataset_repo_id": f"{{{{{dataset_var}}}}}",
+        "batch_size": f"{{{{{batch_var}}}}}",
+        "steps": f"{{{{{steps_var}}}}}",
+        "weighting": "source", "external_weight": "0.3",
+        "push_to_hub": False,
+        "wandb_enable": True, "wandb_project": "lerobot",
+    }
+    return [
+        {
+            "name": "Pretrain: SmolVLA (VLA, ~450M)",
+            "type": "train", "enabled": True,
+            "params": {**common,
+                "policy_type": "smolvla", "pretrained_path": "lerobot/smolvla_base",
+                "train_state_proj": True, "use_amp": True,
+                "output_dir": "outputs/train/max_data_smolvla",
+            },
+        },
+        {
+            "name": "Pretrain: SmolVLA-large (bigger VLM capacity)",
+            "type": "train", "enabled": False,
+            "params": {**common,
+                "policy_type": "smolvla", "pretrained_path": "lerobot/smolvla_base",
+                "train_state_proj": True, "use_amp": True,
+                "output_dir": "outputs/train/max_data_smolvla_large",
+                "extra_args": "--policy.num_vlm_layers=32 --policy.expert_width_multiplier=1.0",
+            },
+        },
+        {
+            "name": "Pretrain: ACT (transformer BC baseline, ~52M)",
+            "type": "train", "enabled": False,
+            "params": {**common, "policy_type": "act", "use_amp": True,
+                "output_dir": "outputs/train/max_data_act"},
+        },
+        {
+            "name": "Pretrain: Diffusion Policy (~293M)",
+            "type": "train", "enabled": False,
+            "params": {**common, "policy_type": "diffusion", "use_amp": True,
+                "output_dir": "outputs/train/max_data_diffusion"},
+        },
+    ]
+
+
+def max_data_18dof_preset() -> dict:
+    """Maximize native 18-DOF xlerobot data + every locally-available bimanual
+    external source into one merge, then pretrain a generalist — with a choice
+    of policy architecture/scale to compare (SmolVLA, SmolVLA-large, ACT,
+    Diffusion). Source lists were picked from an actual audit of this
+    machine's local dataset cache (episode/frame counts, robot_type, state
+    dim), deliberately excluding test/smoke recordings and superseded
+    duplicate variants (e.g. block_sorting raw vs. _clean, trash_pickup vs.
+    _merged, making_coffee 19-dim vs. _v1 18-dim, ob15_packing_box vs.
+    _filtered) so the merge doesn't double-count near-identical episodes."""
+    return {
+        "name": "max_data_18dof_pretrain",
+        "variables": {
+            "REFERENCE_REPO": "Odog16/tool_pickup",
+            "TASK_REPOS": (
+                "Odog16/tool_pickup Odog16/trash_pickup_merged "
+                "Odog16/block_sorting_single Odog16/block_sorting_clean "
+                "Odog16/making_coffee_v1 Odog16/ob15_general_dataset_v1 "
+                "Odog16/ob15_packing_box_filtered Odog16/test_transfer_block"
+            ),
+            "BIMANUAL_REPOS": (
+                "lerobot/aloha_sim_insertion_human lerobot/aloha_sim_transfer_cube_human "
+                "lerobot/aloha_sim_transfer_cube_scripted lerobot/aloha_mobile_cabinet "
+                "lerobot/aloha_mobile_wash_pan lerobot/aloha_static_battery "
+                "lerobot/aloha_static_coffee"
+            ),
+            "MERGED_REPO": "Odog16/max_data_18dof_v1",
+            "PRETRAIN_STEPS": "60000",
+            "BATCH_SIZE": "16",
+        },
+        "stages": [
+            {
+                "name": "Merge: all native 18-DOF task data + bimanual external",
+                "type": "merge", "enabled": True,
+                "params": {
+                    "source_repos": "{{TASK_REPOS}} {{BIMANUAL_REPOS}}",
+                    "target_repo_id": "{{MERGED_REPO}}",
+                    "target_fps": "30", "target_image_size": "360x640",
+                    "target_state_dim": "18", "target_action_dim": "18",
+                    "match_features_from": "{{REFERENCE_REPO}}",
+                    "pad_fill_mode": "ref-mean", "override_padded_stats": True,
+                    "push_to_hub": False,
+                },
+            },
+            *_model_comparison_train_stages("MERGED_REPO", "BATCH_SIZE", "PRETRAIN_STEPS"),
+        ],
+    }
+
+
+def max_data_12dof_preset() -> dict:
+    """Same idea as the 18-DOF max-data preset, projected to the 12-DOF
+    (both-arms-only) schema: an extract stage derives a 12-dim reference
+    schema from an existing real task repo (no master RGB-D recording
+    required), then every native task repo is merged into that 12-dim target
+    — by-name remap keeps the 12 shared arm-joint names and drops
+    head/base/gantry automatically, no per-repo extract stage needed."""
+    return {
+        "name": "max_data_12dof_pretrain",
+        "variables": {
+            "REFERENCE_REPO": "Odog16/tool_pickup",
+            "BIMANUAL12_REF": "Odog16/tool_pickup_bimanual12",
+            "TASK_REPOS": (
+                "Odog16/tool_pickup Odog16/trash_pickup_merged "
+                "Odog16/block_sorting_single Odog16/block_sorting_clean "
+                "Odog16/making_coffee_v1 Odog16/ob15_general_dataset_v1 "
+                "Odog16/ob15_packing_box_filtered Odog16/test_transfer_block"
+            ),
+            "BIMANUAL_REPOS": (
+                "lerobot/aloha_sim_insertion_human lerobot/aloha_sim_transfer_cube_human "
+                "lerobot/aloha_sim_transfer_cube_scripted lerobot/aloha_mobile_cabinet "
+                "lerobot/aloha_mobile_wash_pan lerobot/aloha_static_battery "
+                "lerobot/aloha_static_coffee"
+            ),
+            "MERGED_REPO": "Odog16/max_data_12dof_v1",
+            "PRETRAIN_STEPS": "60000",
+            "BATCH_SIZE": "16",
+        },
+        "stages": [
+            {
+                "name": "Extract 12-DOF reference schema from an existing task repo",
+                "type": "extract", "enabled": True,
+                "params": {
+                    "source_repo": "{{REFERENCE_REPO}}",
+                    "target_repo_id": "{{BIMANUAL12_REF}}",
+                    "profile": "bimanual12",
+                    "target_image_size": "360x640",
+                },
+            },
+            {
+                "name": "Merge: all task data projected to 12-DOF + bimanual external",
+                "type": "merge", "enabled": True,
+                "params": {
+                    "source_repos": "{{TASK_REPOS}} {{BIMANUAL_REPOS}}",
+                    "target_repo_id": "{{MERGED_REPO}}",
+                    "target_fps": "30", "target_image_size": "360x640",
+                    "target_state_dim": "12", "target_action_dim": "12",
+                    "match_features_from": "{{BIMANUAL12_REF}}",
+                    "pad_fill_mode": "ref-mean", "override_padded_stats": True,
+                    "push_to_hub": False,
+                },
+            },
+            *_model_comparison_train_stages("MERGED_REPO", "BATCH_SIZE", "PRETRAIN_STEPS"),
+        ],
+    }
+
+
 PRESETS = {
     "home_tasks": home_tasks_preset,
     "master_umi": master_umi_preset,
+    "max_data_18dof": max_data_18dof_preset,
+    "max_data_12dof": max_data_12dof_preset,
 }
 
 
@@ -1118,10 +1398,18 @@ class Handler(BaseHTTPRequestHandler):
                 self._json(PRESETS[which]())
             elif parsed.path == "/api/status":
                 self._status(q["name"])
+            elif parsed.path == "/api/running":
+                names = sorted(
+                    p.parent.name for p in WORKFLOWS_DIR.glob("*/workflow.json")
+                ) if WORKFLOWS_DIR.is_dir() else []
+                running = [n for n in names if _workflow_status_snapshot(n).get("status") == "running"]
+                self._json({"running": running})
             elif parsed.path == "/api/log":
                 self._log(q)
             elif parsed.path == "/api/compare":
                 self._json(compare_datasets(q["ref"], q["cand"]))
+            elif parsed.path == "/api/dataset-schema":
+                self._json(dataset_schema(q["repo"]))
             else:
                 self._error("Not found", 404)
         except (KeyError, ValueError, FileNotFoundError) as err:
@@ -1129,16 +1417,7 @@ class Handler(BaseHTTPRequestHandler):
 
     def _status(self, name: str) -> None:
         _check_name(name)
-        with _runs_lock:
-            run = _runs.get(name)
-        if run is not None:
-            self._json({"live": run.status == "running", **run.snapshot()})
-            return
-        state_path = WORKFLOWS_DIR / name / "logs" / "run_state.json"
-        if state_path.is_file():
-            self._json({"live": False, **json.loads(state_path.read_text())})
-        else:
-            self._json({"live": False, "status": "idle", "stages": []})
+        self._json(_workflow_status_snapshot(name))
 
     def _log(self, q: dict) -> None:
         rel = q.get("path", "")
@@ -1212,6 +1491,21 @@ class Handler(BaseHTTPRequestHandler):
         self._json({"ok": True})
 
 
+def _detect_lan_ip() -> str | None:
+    """This machine's LAN-facing IP, for the startup banner's remote-access hint.
+
+    Opens a UDP "connection" (no packet actually sent — UDP has no handshake)
+    to a public address purely so the OS picks a real outbound interface/IP;
+    works even fully offline since nothing is transmitted.
+    """
+    try:
+        with socket.socket(socket.AF_INET, socket.SOCK_DGRAM) as s:
+            s.connect(("8.8.8.8", 80))
+            return s.getsockname()[0]
+    except OSError:
+        return None
+
+
 def main() -> None:
     global CONDA_ENV_NAME
     parser = argparse.ArgumentParser(description=__doc__)
@@ -1229,6 +1523,12 @@ def main() -> None:
     server = ThreadingHTTPServer((args.host, args.port), Handler)
     print(f"Co-training workflow UI → http://{args.host}:{args.port}")
     print(f"Workflows dir: {WORKFLOWS_DIR}")
+    if args.host != "127.0.0.1":
+        lan_ip = _detect_lan_ip()
+        if lan_ip:
+            print(f"Bound beyond loopback — reachable on your LAN at http://{lan_ip}:{args.port}")
+            print("No auth on this server: only do this on a network you fully trust "
+                  "(see GUIDE.md \"Remote access\" for phone/Tailscale setup).")
     try:
         server.serve_forever()
     except KeyboardInterrupt:

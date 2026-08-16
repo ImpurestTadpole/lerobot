@@ -21,10 +21,9 @@ uv run python scripts/workflow_ui/app.py        # → http://127.0.0.1:7799
 ```
 
 - **Access.** The server binds to loopback only (no auth), so open the URL in
-  a browser **on the same machine**. Working from another computer? Tunnel it:
-  `ssh -L 7799:localhost:7799 <user>@<training-box>` then browse
-  `http://localhost:7799` locally. Only use `--host 0.0.0.0` on a network you
-  fully trust — anyone who can reach the port can run shell commands.
+  a browser **on the same machine** by default. See "Remote access" below for
+  reaching it from a phone or another computer while training stays on this
+  machine.
 - **Execution.** *Run* / *Run all* execute stages **directly on the server's
   machine** — no copy-pasting. Each enabled stage is rendered to a standalone
   script under `workflows/<name>/scripts/NN_*.sh` (also via *Generate
@@ -40,16 +39,49 @@ uv run python scripts/workflow_ui/app.py        # → http://127.0.0.1:7799
   repo's `.venv` happened to resolve to with no `.python-version` pin).
   Every command below assumes `conda activate lerobot` is already active in
   your shell — generated scripts do this for you automatically.
-- **Three tabs.** *Workflow* (compose/run stages), *Compare datasets*
-  (preflight external repos — see step 4), *Guide* (this pipeline, color-coded).
-  Every stage option has a **`?` key** next to its label — a one-glance
-  explanation with a small depiction of what the option does; the colored
-  stage-type badge does the same for the whole stage.
+- **Five tabs.** *Workflow* (compose/run stages — the sidebar list also shows
+  a blinking dot next to whichever saved workflow is actively running, even
+  if you're looking at a different one), *Compare datasets* (preflight
+  external repos — see step 4), *Guide* (this pipeline, color-coded),
+  *Recipes* (download a template + schema reference, then drag-drop or paste
+  in a workflow written by hand or by an LLM to import and run it), *Log*
+  (live output of the running stage). Every stage option has a **`?`
+  key** next to its label — a one-glance explanation with a small depiction
+  of what the option does; the colored stage-type badge does the same for
+  the whole stage.
 - **Fastest start:** click **+ Master RGB-D / UMI preset**, edit the variables
   at the top (repo names, step counts), and run stages top to bottom.
 
-Logs land in `workflows/<name>/logs/`; run state survives page reloads; a
+Logs land in `workflows/<name>/logs/`; run state survives page reloads *and*
+server restarts (falls back to the last-written `run_state.json` on disk); a
 failing stage halts the sequence.
+
+### Remote access — run training here, control it from a phone
+
+The server has **no authentication** — anyone who can reach the port can run
+shell commands on this machine. Pick the option matching how much you trust
+the network in between:
+
+1. **Same Wi-Fi (simplest).** Start with `--host 0.0.0.0` — the startup
+   banner then prints this machine's LAN IP (e.g. `http://192.168.1.23:7799`).
+   Open that URL on your phone's browser. Only do this on a network you fully
+   trust (e.g. your home Wi-Fi, not a coffee shop or office guest network).
+2. **From anywhere, securely (recommended for real remote use).** Install
+   [Tailscale](https://tailscale.com) (or another mesh VPN) on this machine
+   *and* your phone, both signed into the same account. No port-forwarding,
+   nothing exposed to the public internet — the phone reaches this machine
+   over an encrypted private network as if it were on the same LAN, from any
+   cellular/Wi-Fi connection. Browse to `http://<this-machine's-tailscale-IP>:7799`
+   (`tailscale ip` on this machine gets it). Takes a few minutes to set up
+   once; after that it's always available.
+3. **From a laptop, no new software.** `ssh -L 7799:localhost:7799
+   <user>@<this-machine>` then browse `http://localhost:7799` on the laptop —
+   traffic is tunneled through SSH, nothing else opens. Awkward on a phone
+   (needs an SSH+port-forward app like Termux) — prefer option 2 there.
+
+Whichever you pick, the workflow only needs a browser tab: start a run, close
+the tab, check back later from anywhere reachable — training keeps running
+on this machine regardless of whether anything is connected to the UI.
 
 ## 2. Phase 0 — record the master dataset (once)
 
@@ -158,7 +190,33 @@ lerobot-train \
 Skipping UMI? Collapse this to the single generalist pre-train of the
 **Home-tasks preset** (60k steps on one 18-DOF merge).
 
-## 7. SARM annotation → RA-BC (optional but cheap quality win)
+## 7. Max-data generalist pretrain, with a model comparison
+
+UI presets **+ Max-data 18-DOF pretrain** / **+ Max-data 12-DOF pretrain**: merge every
+locally-available dataset (no new downloads) into one big pretraining corpus, then compare
+policy architectures on identical data.
+
+- **Source lists were picked from an audit of this machine's cache**, not just "every
+  directory" — duplicate/superseded variants of the same recordings are deliberately
+  excluded (raw `block_sorting` vs. its cleaned `_clean`/`_single` variants, `trash_pickup` vs.
+  the more-complete `_merged`, `making_coffee` 19-dim vs. the corrected `_v1` 18-dim,
+  `ob15_packing_box` vs. its `_filtered` subset) so the merge doesn't double-count
+  near-identical episodes. Obvious smoke-test recordings are excluded too. Both presets'
+  `TASK_REPOS`/`BIMANUAL_REPOS` variables are editable — add newly-recorded or downloaded data
+  there.
+- **12-DOF preset** adds one **extract** stage first: it derives a 12-dim reference schema
+  from an existing task repo (`--profile bimanual12`, no master RGB-D recording needed), then
+  merges every task repo against that reference — by-name remap keeps the 12 shared arm-joint
+  names and drops head/base/gantry automatically, no per-repo extraction required.
+- **Four train stages, one per policy** (SmolVLA, a bigger-capacity SmolVLA, ACT, Diffusion
+  Policy) share the merged dataset — "different levels and types of generalist policy" to
+  compare. **Only SmolVLA is enabled by default**; `Run all` would otherwise chain four full
+  pretrains back to back. Enable the others individually.
+- `train_state_proj` is SmolVLA-only (the generator now rejects it for other policy types
+  rather than letting draccus fail downstream) — ACT/Diffusion pretrain from scratch with no
+  scheduler override, so each uses its own policy-tuned optimizer/scheduler preset.
+
+## 8. SARM annotation → RA-BC (optional but cheap quality win)
 
 ```bash
 python -m lerobot.rewards.sarm.compute_rabc_weights \
@@ -172,24 +230,35 @@ merge/extract (frame indices must match), keep head-mode consistent with
 training, and use it where data is mixed-quality (autonomous harvests, old
 recordings). UI: the pink **sarm** stage.
 
-## 8. Fine-tune per-task specialists
+## 9. Fine-tune per-task specialists
 
 ```bash
 lerobot-train \
     --dataset.repo_id=Odog16/trash_pickup \
     --policy.type=smolvla --policy.push_to_hub=false \
     --policy.pretrained_path=outputs/train/stage2_native_18dof/checkpoints/last/pretrained_model \
+    --use_policy_training_preset=false \
     --scheduler.type=cosine_decay_with_warmup --scheduler.peak_lr=5e-5 \
+    --scheduler.num_warmup_steps=1000 --scheduler.num_decay_steps=20000 --scheduler.decay_lr=1e-6 \
+    --optimizer.type=adamw --optimizer.lr=5e-5 \
     --batch_size=16 --steps=20000 \
     --output_dir=outputs/train/trash_pickup_specialist
     # + --use_rabc=true --rabc_head_mode=sparse --rabc_kappa=0.01  (if annotated)
 ```
 
+`--use_policy_training_preset=false` is required whenever you override `--scheduler.*`:
+`cfg.validate()` otherwise silently **overwrites** your scheduler (and optimizer) with the
+policy's own preset when this flag is left at its default `true` — no error, no warning, it
+just quietly trains at the generalist's own LR/decay-length instead of the gentler fine-tune
+values above. `cosine_decay_with_warmup` also has no field defaults of its own
+(`num_warmup_steps`/`num_decay_steps`/`decay_lr` are all required), and disabling the preset
+means the optimizer needs its own `--optimizer.type`/`--optimizer.lr` too.
+
 One fine-tune per home task, always from the same generalist checkpoint.
 Evaluate **base/lift/head motion specifically** — not just gripper success —
 to confirm the padding bias washed out.
 
-## 9. Deploy & close the loop
+## 10. Deploy & close the loop
 
 ```bash
 lerobot-rollout --strategy.type=dagger ...    # DAGGER_HIL.md §1

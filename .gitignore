@@ -192,3 +192,10 @@ workflows/
 sarm_predictions/
 sarm_viz/
 subtask_viz/
+
+# Local planning / analysis notes
+docs/upstream_merge_plan.md
+docs/dataset_composition_audit.md
+docs/missing_modality_fixes_validation.md
+docs/missing_modality_support.md
+docs/worldmodel_synthetic_data_investigation.md
