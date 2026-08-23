@@ -86,6 +86,7 @@ lerobot-record \\
 ```
 """
 
+import inspect
 import logging
 import time
 from dataclasses import asdict, dataclass
@@ -126,6 +127,7 @@ from lerobot.robots import (  # noqa: F401
     hope_jr,
     koch_follower,
     make_robot_from_config,
+    ob15,
     omx_follower,
     openarm_follower,
     reachy2,
@@ -285,8 +287,20 @@ def record_loop(
     # Depth read throttling: set to 1 to read depth every frame.
     # For training with depth, it's usually better to keep depth time-aligned to RGB/actions.
     depth_read_interval = 1  # Read depth every frame
-    last_depth_obs = {}  # Store last depth observation for frames where we skip depth
-    
+
+    # Only xlerobot's get_observation() accepts skip_cameras/skip_depth today; other robots use
+    # the base no-arg signature and would raise TypeError if we passed these kwargs unconditionally.
+    robot_supports_skip_kwargs = "skip_depth" in inspect.signature(robot.get_observation).parameters
+
+    # Last known-good frame per camera key (color + depth). Used to backfill a camera's frame
+    # for this tick whenever it's missing from `obs` — either because depth was intentionally
+    # skipped this frame (see depth_read_interval above), or because a real read failed (e.g. a
+    # transient USB dropout on a wrist camera). Without this, a single flaky read would leave the
+    # key out of the frame entirely and crash the whole recording session at dataset.add_frame().
+    camera_obs_keys = list(robot.cameras.keys()) if hasattr(robot, "cameras") else []
+    camera_obs_keys += [f"{k}_depth" for k, cam in getattr(robot, "cameras", {}).items() if getattr(cam, "use_depth", False)]
+    last_camera_obs = {}
+
     while timestamp < control_time_s:
         start_loop_t = time.perf_counter()
         
@@ -307,15 +321,21 @@ def record_loop(
 
         # Get robot observation - skip depth reads on some frames for performance
         # We still read color cameras every frame for the dataset
-        read_depth_this_frame = (frame_idx % depth_read_interval == 0)
-        obs = robot.get_observation(skip_cameras=False, skip_depth=not read_depth_this_frame)
-        
-        # If we skipped depth this frame, merge last depth observation
-        if not read_depth_this_frame and last_depth_obs:
-            obs.update(last_depth_obs)
-        elif read_depth_this_frame:
-            # Store depth data for next frames where we skip depth
-            last_depth_obs = {k: v for k, v in obs.items() if k.endswith("_depth")}
+        if robot_supports_skip_kwargs:
+            read_depth_this_frame = (frame_idx % depth_read_interval == 0)
+            obs = robot.get_observation(skip_cameras=False, skip_depth=not read_depth_this_frame)
+        else:
+            obs = robot.get_observation()
+
+        # Backfill any camera key missing from this tick's obs (depth intentionally skipped
+        # above, or a real read failure e.g. a transient USB dropout) with the last known-good
+        # frame for that camera, and record whatever's present now as the new "last good" value.
+        for cam_key in camera_obs_keys:
+            if cam_key in obs:
+                last_camera_obs[cam_key] = obs[cam_key]
+            elif cam_key in last_camera_obs:
+                obs[cam_key] = last_camera_obs[cam_key]
+                logging.debug(f"Camera key '{cam_key}' missing this tick, reusing last known-good frame")
 
         # Applies a pipeline to the raw robot observation, default is IdentityProcessor
         obs_processed = robot_observation_processor(obs)
@@ -327,6 +347,8 @@ def record_loop(
         if isinstance(teleop, Teleoperator):
             if hasattr(teleop, "update_observation_cache"):
                 teleop.update_observation_cache(obs)
+            if getattr(teleop.config, "stream_cameras_to_vr", False) and hasattr(teleop, "send_camera_frames"):
+                teleop.send_camera_frames(obs)
             act = teleop.get_action()
             if robot.name == "unitree_g1":
                 teleop.send_feedback(obs)
@@ -373,12 +395,10 @@ def record_loop(
         # Visualization runs in a background thread - this call is non-blocking.
         # Frames are dropped if the worker is still busy (queue size = 1).
         if display_data:
-            obs_for_rerun = {
-                k: v for k, v in obs_processed.items()
-                if not ("depth" in str(k).lower() or k.endswith("_depth"))
-            }
+            # Depth keys are included here; visualization_utils.log_rerun_data skips them by
+            # default (set RERUN_SKIP_DEPTH=false to show depth in the Rerun viewer).
             log_rerun_data(
-                observation=obs_for_rerun, action=action_values, compress_images=display_compressed_images
+                observation=obs_processed, action=action_values, compress_images=display_compressed_images
             )
 
         dt_s = time.perf_counter() - start_loop_t
@@ -414,6 +434,21 @@ def record_loop(
                 )
                 loop_times.clear()  # Reset for next interval
             last_hz_print = current_time
+
+            # Push task/episode/elapsed-time info to the VR headset HUD once per second (see
+            # XLerobotVRTeleop.send_status / CAMERA_PANEL_SLOTS status text in vr_app.js).
+            if isinstance(teleop, Teleoperator) and hasattr(teleop, "send_status"):
+                ep_idx = events.get("_episode_idx")
+                ep_total = events.get("_episode_total")
+                teleop.send_status(
+                    {
+                        "task": single_task,
+                        "episode_idx": ep_idx,
+                        "episode_total": ep_total,
+                        "elapsed_s": timestamp,
+                        "episode_duration_s": control_time_s,
+                    }
+                )
 
         # Increment frame index for visualization and depth throttling
         frame_idx += 1
@@ -581,6 +616,8 @@ def record(
                 # Used only for logging inside record_loop.
                 events["_episode_idx"] = recorded_episodes + 1
                 events["_episode_total"] = cfg.dataset.num_episodes
+                if isinstance(teleop, Teleoperator) and hasattr(teleop, "send_episode_event"):
+                    teleop.send_episode_event("start")
                 record_loop(
                     robot=robot,
                     events=events,
@@ -595,6 +632,8 @@ def record(
                     display_data=cfg.display_data,
                     display_compressed_images=display_compressed_images,
                 )
+                if isinstance(teleop, Teleoperator) and hasattr(teleop, "send_episode_event"):
+                    teleop.send_episode_event("stop")
                 events.pop("_episode_idx", None)
                 events.pop("_episode_total", None)
 

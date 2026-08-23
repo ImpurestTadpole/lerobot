@@ -261,7 +261,7 @@ def _log_rerun_data_sync(
     """Synchronous implementation (runs in the background viz thread)."""
     # Get configuration from environment
     # Default 0.5: readable for teleop, lightweight. Use downsample OR cv2 JPEG, not both heavy steps.
-    downsample_factor = float(os.getenv("RERUN_DOWNSAMPLE_FACTOR", "0.2"))
+    downsample_factor = float(os.getenv("RERUN_DOWNSAMPLE_FACTOR", "0.65"))
     skip_depth = os.getenv("RERUN_SKIP_DEPTH", "true").lower() in ("true", "1", "yes")
     # int(float(...)) avoids ValueError if user sets e.g. RERUN_LOG_FREQUENCY=0.25. Default 1 = every frame.
     log_frequency = int(float(os.getenv("RERUN_LOG_FREQUENCY", "2")))
@@ -325,7 +325,7 @@ def _log_rerun_data_sync(
                         bgr = cv2.cvtColor(arr, cv2.COLOR_RGB2BGR)
                     else:
                         bgr = arr
-                    quality = int(os.getenv("RERUN_JPEG_QUALITY", "55"))
+                    quality = int(os.getenv("RERUN_JPEG_QUALITY", "95"))
                     success, encoded = cv2.imencode(
                         ".jpg", bgr, [cv2.IMWRITE_JPEG_QUALITY, quality]
                     )

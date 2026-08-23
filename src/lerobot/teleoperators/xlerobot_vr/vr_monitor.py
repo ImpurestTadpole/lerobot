@@ -175,6 +175,7 @@ class VRMonitor:
         self.right_goal = None
         self.headset_goal = None  # Add headset goal
         self._goal_lock = threading.Lock()  # Add thread lock
+        self.loop = None  # asyncio event loop running start_monitoring(), set once it starts
     
     def initialize(self):
         """Initialize VR monitor"""
@@ -223,7 +224,9 @@ class VRMonitor:
     async def start_monitoring(self):
         """Start monitoring VR control information"""
         print("🚀 Starting VR Monitor...")
-        
+
+        self.loop = asyncio.get_running_loop()
+
         if not self.initialize():
             print("❌ Failed to initialize VR monitor")
             return
@@ -341,6 +344,39 @@ class VRMonitor:
                 
                 return dual_goals
     
+    def send_camera_frame(self, cam_name: str, jpeg_bytes: bytes):
+        """Forward a JPEG-encoded camera frame to the VR headset over the existing WS connection.
+
+        This is called from the caller's thread (the teleop control loop), not the asyncio event
+        loop running the VR server, so the actual send is scheduled onto that loop via
+        run_coroutine_threadsafe rather than awaited directly.
+
+        Returns the scheduled concurrent.futures.Future, or None if the VR server/loop isn't
+        ready yet or doesn't support camera streaming (older XLeVR checkout).
+        """
+        if self.loop is None or self.vr_server is None:
+            return None
+        if not hasattr(self.vr_server, "broadcast_camera_frame"):
+            return None
+        return asyncio.run_coroutine_threadsafe(
+            self.vr_server.broadcast_camera_frame(cam_name, jpeg_bytes), self.loop
+        )
+
+    def send_status(self, status: dict):
+        """Forward small JSON status info (task/episode/elapsed time) to the VR headset HUD.
+
+        Same threading model as send_camera_frame: called from the control-loop thread, actual
+        send scheduled onto the VR server's asyncio loop via run_coroutine_threadsafe.
+
+        Returns the scheduled concurrent.futures.Future, or None if the VR server/loop isn't
+        ready yet or doesn't support status broadcasting (older XLeVR checkout).
+        """
+        if self.loop is None or self.vr_server is None:
+            return None
+        if not hasattr(self.vr_server, "broadcast_status"):
+            return None
+        return asyncio.run_coroutine_threadsafe(self.vr_server.broadcast_status(status), self.loop)
+
     def get_left_goal_nowait(self):
         """Return the latest left arm goal if available, else None."""
         return self.get_latest_goal_nowait("left")

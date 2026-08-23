@@ -30,6 +30,7 @@ import traceback
 from queue import Queue
 from typing import Any, Dict, Optional
 
+import cv2
 import numpy as np
 
 # from lerobot.errors import DeviceAlreadyConnectedError, DeviceNotConnectedError
@@ -165,11 +166,23 @@ class SimpleTeleopArm:
     for smooth movement and gripper operations based on VR controller input.
     """
     
-    def __init__(self, joint_map, initial_obs, kinematics, prefix="right", kp=1.5):
+    def __init__(
+        self,
+        joint_map,
+        initial_obs,
+        kinematics,
+        prefix="right",
+        kp=1.5,
+        *,
+        invert_gripper_trigger: bool = False,
+    ):
         self.joint_map = joint_map
         self.prefix = prefix
         self.kp = kp  # Balanced for speed and smoothness (reduced from 2.5 to reduce jitter)
         self.kinematics = kinematics
+        # Right Quest controller trigger axis is often reversed vs left for the same physical motion;
+        # invert so "closed at rest, open when squeezing" matches the left arm.
+        self.invert_gripper_trigger = invert_gripper_trigger
         
         # Initial joint positions - adapted for XLerobot observation format
         self.joint_positions = {
@@ -430,7 +443,10 @@ class SimpleTeleopArm:
             # Normalize after deadzone: map [deadzone, 1.0] to [0.0, 1.0]
             trigger_value = (trigger_value - gripper_deadzone) / (1.0 - gripper_deadzone)
             trigger_value = max(0.0, min(1.0, trigger_value))  # Clamp to [0.0, 1.0]
-        
+
+        if self.invert_gripper_trigger:
+            trigger_value = 1.0 - trigger_value
+
         # Map trigger value [0.0, 1.0] to gripper range [0.0, 100.0]
         # 0.0 trigger = fully open (0.0), 1.0 trigger = fully closed (100.0)
         target_gripper_value = trigger_value * 100.0
@@ -493,7 +509,7 @@ class SimpleHeadControl:
     Maps VR headset yaw (pan) and pitch (tilt) to head motor commands with proportional control.
     """
     
-    def __init__(self, initial_obs, kp=1.0, max_pan_deg=90, max_tilt_deg=45):
+    def __init__(self, initial_obs, kp=1.0, max_pan_deg=90, max_tilt_deg=45, sensitivity=1.0):
         """
         Initialize head control.
         
@@ -502,6 +518,7 @@ class SimpleHeadControl:
             kp: Proportional control gain
             max_pan_deg: Maximum pan angle in degrees (default ±90)
             max_tilt_deg: Maximum tilt angle in degrees (default ±45)
+            sensitivity: Multiplier applied to pan/tilt scales (>1.0 = more responsive)
         """
         self.kp = kp
         self.max_pan_deg = max_pan_deg
@@ -510,8 +527,9 @@ class SimpleHeadControl:
         # Conversion factors: head motors use RANGE_M100_100 normalization
         # Pan: ±90 degrees -> ±100 normalized (scale: 100/90)
         # Tilt: ±45 degrees -> ±100 normalized (scale: 100/45)
-        self.pan_scale = 100.0 / max_pan_deg if max_pan_deg > 0 else 1.0
-        self.tilt_scale = 100.0 / max_tilt_deg if max_tilt_deg > 0 else 1.0
+        # sensitivity > 1.0 amplifies small headset movements into larger motor commands
+        self.pan_scale = (100.0 / max_pan_deg if max_pan_deg > 0 else 1.0) * sensitivity
+        self.tilt_scale = (100.0 / max_tilt_deg if max_tilt_deg > 0 else 1.0) * sensitivity
         
         # Initialize head motor positions from observation (already normalized)
         self.target_positions = {
@@ -766,6 +784,14 @@ class XLerobotVRTeleop(Teleoperator):
         self._obs_cache_duration = 0.01  # Cache for 10ms (faster than camera refresh)
         # Lift velocity smoothing state (smoothed_y, smoothed_vel) for get_vr_lift_action
         self._lift_state = {}
+
+        # Camera-to-headset streaming state (see send_camera_frames)
+        self._last_camera_stream_time = 0.0
+        self._camera_frame_inflight: dict[str, bool] = {}
+
+        # Depth-view toggle state (see _update_depth_toggle / send_camera_frames)
+        self._depth_view_enabled = False
+        self._prev_right_thumbstick_click = False
         
         self.logs = {}
 
@@ -884,13 +910,13 @@ class XLerobotVRTeleop(Teleoperator):
                 prefix="left", kp=self.config.kp
             )
             self.right_arm = SimpleTeleopArm(
-                RIGHT_JOINT_MAP, robot_obs, self.kin_right, 
-                prefix="right", kp=self.config.kp
+                RIGHT_JOINT_MAP, robot_obs, self.kin_right,
+                prefix="right", kp=self.config.kp,
             )
             
-            # Initialize head controller
+            # Initialize head controller (sensitivity=1.3 → 30% more responsive than 1:1 mapping)
             self.head_control = SimpleHeadControl(
-                robot_obs, kp=self.config.kp
+                robot_obs, kp=self.config.kp, sensitivity=1.4
             )
             
             logger.info("[VR] Controllers initialized successfully (arms + head)")
@@ -909,7 +935,122 @@ class XLerobotVRTeleop(Teleoperator):
         """
         self._cached_obs = obs
         self._obs_cache_time = time.perf_counter()
-    
+
+    def _update_depth_toggle(self, right_goal) -> None:
+        """Toggle the VR depth-map panel on a RIGHT thumbstick click (rising edge).
+
+        Kept entirely separate from VREventHandler's episode-control events on purpose — this is
+        a display toggle, not a robot/recording control, and mixing it into that pipeline risks
+        interfering with episode-termination logic (see the "Do NOT map thumbstick movement to
+        episode control events" note on the left-controller handler).
+        """
+        buttons = _safe_buttons(_safe_metadata(right_goal))
+        if "thumbstick" not in buttons:
+            return  # packet omitted button state; don't flap on missing data
+        pressed = bool(buttons.get("thumbstick", False))
+        if pressed and not self._prev_right_thumbstick_click:
+            self._depth_view_enabled = not self._depth_view_enabled
+            logger.info(
+                f"🎮 VR RIGHT thumbstick clicked -> depth view {'ON' if self._depth_view_enabled else 'OFF'}"
+            )
+            if self.vr_monitor is not None:
+                self.vr_monitor.send_status({"depth_view_enabled": self._depth_view_enabled})
+        self._prev_right_thumbstick_click = pressed
+
+    def _encode_and_send_frame(self, key: str, bgr: np.ndarray) -> None:
+        """Shared JPEG-encode + send + in-flight bookkeeping for both color and depth frames."""
+        ok, buffer = cv2.imencode(
+            ".jpg", bgr, [int(cv2.IMWRITE_JPEG_QUALITY), self.config.camera_stream_jpeg_quality]
+        )
+        if not ok:
+            return
+        self._camera_frame_inflight[key] = True
+        future = self.vr_monitor.send_camera_frame(key, buffer.tobytes())
+        if future is not None:
+            future.add_done_callback(lambda _f, k=key: self._camera_frame_inflight.pop(k, None))
+        else:
+            self._camera_frame_inflight.pop(key, None)
+
+    def send_camera_frames(self, obs: dict[str, Any]) -> None:
+        """
+        JPEG-encode the robot's camera frames from `obs` and push them to the VR headset for
+        live display while teleoperating. Opt-in via config.stream_cameras_to_vr; a no-op
+        otherwise. Rate-limited to config.camera_stream_fps and drops a camera's frame instead
+        of queuing it if that camera's previous frame hasn't finished sending yet, so this never
+        blocks the control loop.
+
+        Depth frames (keys ending "_depth") are only encoded/sent when the operator has toggled
+        the depth view on (RIGHT thumbstick click, see _update_depth_toggle) — encoding depth
+        every tick regardless would add CPU cost for a view most sessions never look at.
+        """
+        if not self.config.stream_cameras_to_vr or self.vr_monitor is None:
+            return
+
+        now = time.perf_counter()
+        min_interval = 1.0 / max(self.config.camera_stream_fps, 1e-6)
+        if now - self._last_camera_stream_time < min_interval:
+            return
+        self._last_camera_stream_time = now
+
+        max_w = self.config.camera_stream_max_width
+
+        for key, value in obs.items():
+            is_depth = key.endswith("_depth")
+            if is_depth and not self._depth_view_enabled:
+                continue
+            if not isinstance(value, np.ndarray) or value.ndim != 3:
+                continue
+            if self._camera_frame_inflight.get(key):
+                continue
+
+            if is_depth:
+                # Raw uint16 depth in mm, shape (H, W, 1) — normalize to 0-255 and apply a
+                # false-color map so it's actually readable as an image, not a near-black frame.
+                depth_2d = value[..., 0]
+                clip_mm = max(self.config.camera_stream_depth_max_mm, 1)
+                normalized = (np.clip(depth_2d, 0, clip_mm).astype(np.float32) * (255.0 / clip_mm)).astype(
+                    np.uint8
+                )
+                if max_w and normalized.shape[1] > max_w:
+                    scale = max_w / normalized.shape[1]
+                    new_size = (max_w, max(1, round(normalized.shape[0] * scale)))
+                    normalized = cv2.resize(normalized, new_size, interpolation=cv2.INTER_AREA)
+                bgr = cv2.applyColorMap(normalized, cv2.COLORMAP_TURBO)
+            else:
+                # Downscale for the VR stream only — the captured/recorded frame in `obs` (and
+                # the dataset built from it elsewhere) is untouched. Keeps encode+send cost fixed
+                # regardless of the camera's configured capture resolution.
+                if max_w and value.shape[1] > max_w:
+                    scale = max_w / value.shape[1]
+                    new_size = (max_w, max(1, round(value.shape[0] * scale)))
+                    value = cv2.resize(value, new_size, interpolation=cv2.INTER_AREA)
+                # LeRobot camera frames are RGB; cv2.imencode assumes BGR, so convert first or
+                # red/blue channels come out swapped in the JPEG (yellow renders as light blue).
+                bgr = cv2.cvtColor(value, cv2.COLOR_RGB2BGR)
+
+            self._encode_and_send_frame(key, bgr)
+
+    def send_status(self, status: dict) -> None:
+        """Push small JSON status info (task/episode/elapsed time) to the VR headset HUD.
+
+        `status` is forwarded to the client as-is (JSON-serializable values only). No-op unless
+        config.stream_cameras_to_vr is enabled and the VR link is up — this reuses that flag
+        since it's the same "extra VR view" feature bucket as the camera panels.
+        """
+        if not self.config.stream_cameras_to_vr or self.vr_monitor is None:
+            return
+        self.vr_monitor.send_status(status)
+
+    def send_episode_event(self, event: str) -> None:
+        """Notify the VR headset that episode recording has started or stopped, so it can play a
+        distinct audio cue. `event` is "start" or "stop". Sent as its own status ping (not tied
+        to the once-a-second recording status cadence) so the sound plays right when it happens.
+        No-op unless config.stream_cameras_to_vr is enabled.
+        """
+        if not self.config.stream_cameras_to_vr or self.vr_monitor is None:
+            return
+        self.vr_monitor.send_status({"episode_event": event})
+
     def _get_noop_lift_action(self, robot) -> dict[str, Any]:
         """When lift axis is enabled, return zero velocity so lift does not keep moving."""
         return get_vr_lift_action(None, robot, self._lift_state) if robot else {}
@@ -983,7 +1124,9 @@ class XLerobotVRTeleop(Teleoperator):
             left_goal = dual_goals.get("left")
             right_goal = dual_goals.get("right")
             headset_goal = dual_goals.get("headset")
-            
+
+            self._update_depth_toggle(right_goal)
+
         except Exception as e:
             logger.warning(f"VR data acquisition failed: {e}")
             try:

@@ -30,6 +30,7 @@ lerobot-find-cameras
 import argparse
 import concurrent.futures
 import logging
+import platform
 import time
 from pathlib import Path
 from typing import Any
@@ -44,6 +45,109 @@ from lerobot.cameras.realsense import RealSenseCamera, RealSenseCameraConfig
 logger = logging.getLogger(__name__)
 
 
+def _resolve_stable_video_path(dev_path: str) -> str | None:
+    """Resolve a `/dev/videoN` path to its stable `/dev/v4l/by-path/...` symlink, if any.
+
+    `/dev/videoN` indices can shift across reboots or when unrelated USB devices are
+    plugged/unplugged; the by-path symlink instead tracks the physical USB port, so it's what
+    should go into a robot's camera config (`index_or_path=...`) for a stable setup.
+    """
+    by_path_dir = Path("/dev/v4l/by-path")
+    if not by_path_dir.is_dir():
+        return None
+    for symlink in by_path_dir.iterdir():
+        try:
+            if symlink.resolve() == Path(dev_path).resolve():
+                return str(symlink)
+        except OSError:
+            continue
+    return None
+
+
+def _realsense_usb_prefixes() -> set[str]:
+    """USB device prefixes (minus interface) that have a RealSense by-id symlink.
+
+    The D435i RGB interface (`:1.3`) often has no `/dev/v4l/by-id/` entry — only the
+    depth module (`:1.0`) does. Matching the shared USB prefix still tags RGB/IR/depth.
+    Example prefix: `platform-3610000.usb-usb-0:1.1`
+    """
+    prefixes: set[str] = set()
+    by_id_dir = Path("/dev/v4l/by-id")
+    by_path_dir = Path("/dev/v4l/by-path")
+    if not by_id_dir.is_dir() or not by_path_dir.is_dir():
+        return prefixes
+    realsense_devs: set[Path] = set()
+    for symlink in by_id_dir.iterdir():
+        if "realsense" not in symlink.name.lower():
+            continue
+        try:
+            realsense_devs.add(symlink.resolve())
+        except OSError:
+            continue
+    if not realsense_devs:
+        return prefixes
+    for symlink in by_path_dir.iterdir():
+        try:
+            if symlink.resolve() not in realsense_devs:
+                continue
+        except OSError:
+            continue
+        name = symlink.name
+        if "-video-index" not in name:
+            continue
+        device_and_iface = name.split("-video-index", 1)[0]
+        prefixes.add(device_and_iface.rsplit(":", 1)[0])
+    return prefixes
+
+
+def _annotate_linux_opencv_camera(cam_info: dict[str, Any]) -> None:
+    """Tag RealSense V4L2 nodes so they aren't mistaken for wrist webcams.
+
+    A D435i enumerates several `/dev/video*` devices (Z16 depth, GREY IR, YUYV RGB, metadata).
+    OpenCV can open the RGB and IR nodes, but RGB+depth must go through `type: intelrealsense`
+    with the SDK serial from `lerobot-find-cameras realsense`.
+    """
+    try:
+        resolved = Path(str(cam_info["id"])).resolve()
+    except OSError:
+        return
+
+    by_id_dir = Path("/dev/v4l/by-id")
+    if by_id_dir.is_dir():
+        for symlink in by_id_dir.iterdir():
+            try:
+                if symlink.resolve() == resolved:
+                    cam_info["stable_by_id"] = str(symlink)
+                    break
+            except OSError:
+                continue
+
+    by_path = str(cam_info.get("stable_by_path_id") or "")
+    by_path_name = Path(by_path).name if by_path else ""
+    if not any(by_path_name.startswith(prefix) for prefix in _realsense_usb_prefixes()):
+        return
+
+    if "video-index0" in by_path and ":1.0" in by_path:
+        cam_info["note"] = (
+            "Intel RealSense depth (Z16). Do not use as an OpenCV wrist camera. "
+            "For RGB+depth: `lerobot-find-cameras realsense` then type=intelrealsense."
+        )
+    elif "video-index2" in by_path and ":1.0" in by_path:
+        cam_info["note"] = (
+            "Intel RealSense IR (GREY). Do not use as an OpenCV wrist/head RGB camera."
+        )
+    elif ":1.3" in by_path and "video-index0" in by_path:
+        cam_info["note"] = (
+            "Intel RealSense RGB (OpenCV fallback only). Prefer type=intelrealsense "
+            "with use_depth=true for RGB+depth."
+        )
+    else:
+        cam_info["note"] = (
+            "Intel RealSense V4L2 node (metadata/aux). Not a wrist camera; "
+            "use `lerobot-find-cameras realsense` for the SDK serial."
+        )
+
+
 def find_all_opencv_cameras() -> list[dict[str, Any]]:
     """
     Finds all available OpenCV cameras plugged into the system.
@@ -56,6 +160,11 @@ def find_all_opencv_cameras() -> list[dict[str, Any]]:
     try:
         opencv_cameras = OpenCVCamera.find_cameras()
         for cam_info in opencv_cameras:
+            if platform.system() == "Linux":
+                stable_path = _resolve_stable_video_path(str(cam_info["id"]))
+                if stable_path:
+                    cam_info["stable_by_path_id"] = stable_path
+                _annotate_linux_opencv_camera(cam_info)
             all_opencv_cameras_info.append(cam_info)
         logger.info(f"Found {len(opencv_cameras)} OpenCV cameras.")
     except Exception as e:

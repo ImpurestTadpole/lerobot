@@ -86,8 +86,9 @@ def hw_to_dataset_features(
         }
 
     for key, shape in cam_fts.items():
+        is_depth = len(shape) == 3 and shape[-1] == 1
         features[f"{prefix}.images.{key}"] = {
-            "dtype": "video" if use_video else "image",
+            "dtype": "depth" if is_depth else ("video" if use_video else "image"),
             "shape": shape,
             "names": ["height", "width", "channels"],
         }
@@ -119,7 +120,7 @@ def build_dataset_frame(
             continue
         elif ft["dtype"] == "float32" and len(ft["shape"]) == 1:
             frame[key] = np.array([values[name] for name in ft["names"]], dtype=np.float32)
-        elif ft["dtype"] in ["image", "video"]:
+        elif ft["dtype"] in ["image", "video", "depth"]:
             frame[key] = values[key.removeprefix(f"{prefix}.images.")]
 
     return frame

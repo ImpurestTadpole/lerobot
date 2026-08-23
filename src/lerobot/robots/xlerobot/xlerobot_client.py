@@ -59,9 +59,8 @@ class XLerobotClient(Robot):
 
         # Define three speed levels and a current index
         self.speed_levels = [
-            {"xy": 0.1, "theta": 30},  # slow
-            {"xy": 0.2, "theta": 60},  # medium
-            {"xy": 0.3, "theta": 90},  # fast
+            {"xy": xy, "theta": th}
+            for xy, th in zip(config.base_speed_xy, config.base_speed_theta_deg, strict=True)
         ]
         self.speed_index = 0  # Start at slow
 
@@ -84,12 +83,10 @@ class XLerobotClient(Robot):
             "right_arm_wrist_flex.pos",
             "right_arm_wrist_roll.pos",
             "right_arm_gripper.pos",
-            "head_pan.pos",
-            "head_tilt.pos",
-            "x.vel",
-            "y.vel",
-            "theta.vel",
         )
+        if self.config.use_head:
+            keys = (*keys, "head_pan.pos", "head_tilt.pos")
+        keys = (*keys, "x.vel", "y.vel", "theta.vel")
         if self.config.lift_axis.enabled:
             keys = (*keys, f"{self.config.lift_axis.name}.height_mm")
         return dict.fromkeys(keys, float)

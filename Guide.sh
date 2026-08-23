@@ -32,21 +32,30 @@ sudo chmod 666 /dev/ttyACM0 /dev/ttyACM1
 #   - Unstable robot control
 #
 # RUN THIS ONCE TO INSTALL UDEV RULE (persists across reboots):
-./setup_camera_formats.sh
+# NOTE: this script is not currently checked into the repo (referenced here and in
+# camera_opencv.py, but missing) — use the manual setup below until it's restored.
+# ./setup_camera_formats.sh
 #
-# OR MANUAL SETUP (run after every reboot if you don't install udev rule):
-# v4l2-ctl -d /dev/video6 --set-fmt-video=width=640,height=480,pixelformat=MJPG
-# v4l2-ctl -d /dev/video8 --set-fmt-video=width=640,height=480,pixelformat=MJPG
+# OR MANUAL SETUP (run after every reboot if you don't install udev rule).
+# Addressed by stable /dev/v4l/by-path symlink (tracks the physical USB port, not the
+# /dev/videoN index, which can shift across reboots/replugs) — same paths config_xlerobot.py
+# uses by default for left_wrist/right_wrist. If the wrist cameras move to different USB ports,
+# re-run `lerobot-find-cameras opencv` to get the new paths.
+# v4l2-ctl -d /dev/v4l/by-path/platform-3610000.usb-usb-0:2.4.2:1.0-video-index0 --set-fmt-video=width=640,height=360,pixelformat=MJPG  # left_wrist
+# v4l2-ctl -d /dev/v4l/by-path/platform-3610000.usb-usb-0:2.4.3:1.0-video-index0 --set-fmt-video=width=640,height=360,pixelformat=MJPG  # right_wrist
 #
 # Verify camera formats:
-# v4l2-ctl -d /dev/video6 --get-fmt-video | grep "Pixel Format"
-# v4l2-ctl -d /dev/video8 --get-fmt-video | grep "Pixel Format"
-# v4l2-ctl -d /dev/video4 --get-fmt-video | grep "Pixel Format"
+# v4l2-ctl -d /dev/v4l/by-path/platform-3610000.usb-usb-0:2.4.2:1.0-video-index0 --get-fmt-video | grep "Pixel Format"  # left_wrist
+# v4l2-ctl -d /dev/v4l/by-path/platform-3610000.usb-usb-0:2.4.3:1.0-video-index0 --get-fmt-video | grep "Pixel Format"  # right_wrist
 #
 # Expected output:
-#   video6: MJPG (Motion-JPEG)
-#   video8: MJPG (Motion-JPEG)
-#   video4: YUYV (RealSense uses native SDK, not V4L2) 
+#   left_wrist:  MJPG (Motion-JPEG)
+#   right_wrist: MJPG (Motion-JPEG)
+# Head / depth: do NOT use /dev/video* for the D435i. `lerobot-find-cameras opencv` will also
+# list RealSense V4L2 nodes (Z16 depth, IR, RGB, metadata) — those are not wrist cameras.
+# RGB+depth goes through the RealSense SDK (serial 342222071125, type=intelrealsense).
+# OpenCV RGB fallback (only with --robot.use_realsense_depth=false):
+#   /dev/v4l/by-path/platform-3610000.usb-usb-0:1.1:1.3-video-index0
 
 # =============================================================================
 # GIT WORKFLOW - SYNC WITH GITHUB REPO
@@ -100,6 +109,12 @@ lerobot-teleoperate \
     --teleop.type=xlerobot_vr \
     --display_data=true
 
+# OB15 (XLerobot without head pan/tilt — 15D action space, no head_pan/head_tilt keys):
+lerobot-teleoperate \
+    --robot.type=ob15 \
+    --teleop.type=xlerobot_vr \
+    --display_data=true
+
 
 # -----------------------------------------------------------------------------
 # LIFT AXIS (gantry) - activation, calibration, control
@@ -124,10 +139,19 @@ lerobot-teleoperate \
 # REMOTE VISUALIZATION (ON EXTERNAL PC)
 # =============================================================================
 
+# PREREQUISITE: teleop/record must be running ON THE JETSON with --display_data=true
+# (do not pass --display_ip — that makes the Jetson connect outward instead of serving).
+# On Jetson you should see: "Rerun gRPC server listening on 0.0.0.0:9876"
+# Verify: ss -tlnp | grep 9876
+#
+# PC: install matching rerun-cli (same major as Jetson rerun-sdk, e.g. 0.26.x):
+#   pip install "rerun-sdk==0.26.2"
+# NOT the snap package — it is often an incompatible older version.
+#
 # OPTION 1: Direct connection (recommended - best performance)
 rerun --serve-web --web-viewer-port 9090 --connect "rerun+http://172.20.10.2:9876/proxy"
 
-rerun --serve-web --web-viewer-port 9090 --connect "rerun+http://192.168.0.205:9876/proxy"
+rerun --serve-web --web-viewer-port 9090 --connect "rerun+http://192.168.86.60:9876/proxy"
 
 rerun --serve-web --web-viewer-port 9090 --connect "rerun+http://10.249.40.136:9876/proxy"
 
@@ -137,15 +161,21 @@ ssh -L 9876:localhost:9876 jetson@192.168.0.104
 # Terminal 2:
 rerun --serve-web --web-viewer-port 9090 --connect "rerun+http://localhost:9876/proxy"
 
-# Then open in browser: http://localhost:9090
+# Then open in browser: http://localhost:9090  (not the Jetson IP — the viewer is local on the PC)
+#
+# Troubleshooting:
+# - Blank viewer / "transport error": Jetson teleop not running, wrong IP, or rerun version mismatch.
+# - Nothing on :9876: start lerobot-teleoperate with --display_data=true on the Jetson first.
+# - Firewall: on Jetson: sudo ufw allow 9876/tcp
 
 # NOTE: Install rerun via pip (not snap):
 pip3 install rerun-sdk
 
 # Make Rerun streaming low-latency / live (optional; defaults are already tuned):
-#   export RERUN_FLUSH_TICK_SECS=0.008   # 8ms flush (default). Use 0.002 for minimal latency.
-#   export RERUN_LOG_FREQUENCY=1        # Log every frame (default). Do not increase if you want live view.
-#   export RERUN_DOWNSAMPLE_FACTOR=0.33 # Faster encode on motion-heavy frames (320x180 -> 213x120). Optional.
+#   export RERUN_FLUSH_TICK_SECS=0.004   # 4ms flush (default). Use 0.002 for minimal latency.
+#   export RERUN_LOG_FREQUENCY=2        # Every other frame (default). Use 1 only on fast wired LAN.
+#   export RERUN_TARGET_WIDTH=320       # 640×360 cameras → 320×180 in Rerun (default). Use 480 on wired LAN.
+#   export RERUN_DOWNSAMPLE_FACTOR=0.2  # Optional: override target width for minimal Wi‑Fi bandwidth.
 # Rerun compression is now always on in code; for record/teleop you can still pass:
 #   --display_compressed_images=true   # Redundant but explicit; avoids raw frames if logic ever changes.
 
@@ -170,6 +200,15 @@ huggingface-cli login
 # Thumbstick RIGHT → Save episode & move to next
 # Thumbstick DOWN  → Reset robot position
 
+# REALSENSE DEPTH (head camera) — ON BY DEFAULT for --robot.type=xlerobot / ob15:
+# Every lerobot-record / lerobot-teleoperate run below automatically switches the head cam from
+# OpenCV/V4L2 (RGB-only) to the RealSense SDK with depth capture (XLerobotConfig.use_realsense_depth
+# defaults to True). Requires pyrealsense2 importable in the venv (see camera_realsense.py).
+# Recorded depth lands in the dataset as "observation.images.head_depth" (dtype: depth, 16-bit mm).
+# To see depth in the Rerun viewer during teleop/record: export RERUN_SKIP_DEPTH=false
+# To fall back to plain RGB (e.g. no physical D435i, or pyrealsense2 unavailable), add:
+#     --robot.use_realsense_depth=false
+
 # RECORDING WITH AUTO-PUSH TO HUB (recommended):
 # NOTE: Remove --resume=true for new datasets or when robot configuration has changed
 # Use --resume=true only when continuing an existing compatible dataset
@@ -178,6 +217,18 @@ lerobot-record \
     --teleop.type=xlerobot_vr \
     --dataset.repo_id=Odog16/test_transfer_block \
     --dataset.single_task="transfer the block" \
+    --dataset.num_episodes=5 \
+    --dataset.fps=30 \
+    --display_data=true \
+    --dataset.push_to_hub=true
+    #--resume=true 
+
+#clothing cleanup
+lerobot-record \
+    --robot.type=xlerobot \
+    --teleop.type=xlerobot_vr \
+    --dataset.repo_id=Odog16/clothing_cleanup \
+    --dataset.single_task="cleanup the clothing" \
     --dataset.num_episodes=5 \
     --dataset.fps=30 \
     --display_data=true \
@@ -211,15 +262,15 @@ lerobot-record \
 
 
 # Rerun live-view tuning — set before ANY lerobot-record call.
-# server_memory_limit is now 200MB in code (was 55% = ~4.4GB on 8GB Jetson).
-# A large buffer causes the viewer to replay gigabytes of old data when it
-# (re)connects, appearing frozen/laggy. 200MB ≈ last ~1 min of compressed frames.
+# server_memory_limit defaults to 64MB in code (was 55% = ~4.4GB on 8GB Jetson).
+# A large buffer causes the viewer to replay old data when it (re)connects, appearing frozen/laggy.
+# export LEROBOT_RERUN_SERVER_MEMORY_LIMIT=200MB  # if viewers reconnect often and need more history.
 # RERUN_LOG_FREQUENCY=2  → log every other frame (halves viz CPU load)
-# RERUN_DOWNSAMPLE_FACTOR=0.2 → 72×128px images sent over WiFi instead of 360×640
-# RERUN_JPEG_QUALITY=55  → faster encode, smaller network payload
+# RERUN_TARGET_WIDTH=320 → 320×180 in Rerun from 640×360 cameras (readable, still fast on Jetson)
+# RERUN_JPEG_QUALITY=60  → balance sharpness vs payload
 export RERUN_LOG_FREQUENCY=2
-export RERUN_DOWNSAMPLE_FACTOR=0.2
-export RERUN_JPEG_QUALITY=55
+export RERUN_TARGET_WIDTH=320
+export RERUN_JPEG_QUALITY=60
 
 lerobot-record \
     --robot.type=xlerobot \
@@ -1534,7 +1585,10 @@ python -m lerobot.async_inference.robot_client \
     --robot.port1=/dev/ttyACM1 \
     --robot.port2=/dev/ttyACM2 \
     --robot.port3=/dev/ttyACM0 \
-    --robot.cameras="{head: {type: opencv, index_or_path: /dev/video4, width: 640, height: 480, fps: 30, fourcc: MJPG}, left_wrist: {type: opencv, index_or_path: /dev/video2, width: 640, height: 480, fps: 30, fourcc: MJPG}, right_wrist: {type: opencv, index_or_path: /dev/video0, width: 640, height: 480, fps: 30, fourcc: MJPG}}" \
+    # Wrist cameras addressed by stable /dev/v4l/by-path (see CAMERA SETUP section above) —
+    # these match config_xlerobot.py's defaults, override only if your USB topology differs.
+    --robot.cameras="{head: {type: intelrealsense, serial_number_or_name: 342222071125, width: 640, height: 480, fps: 30, use_depth: true}, left_wrist: {type: opencv, index_or_path: /dev/v4l/by-path/platform-3610000.usb-usb-0:2.4.2:1.0-video-index0, width: 640, height: 360, fps: 30, fourcc: MJPG}, right_wrist: {type: opencv, index_or_path: /dev/v4l/by-path/platform-3610000.usb-usb-0:2.4.3:1.0-video-index0, width: 640, height: 360, fps: 30, fourcc: MJPG}}" \
+    # Head RGB+depth uses the RealSense SDK serial (not /dev/video*). Wrist cams use by-path.
 
 
 

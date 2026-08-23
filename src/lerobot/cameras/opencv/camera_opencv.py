@@ -290,12 +290,13 @@ class OpenCVCamera(Camera):
             # If MJPG failed and we're on Linux, try to set it via v4l2-ctl as a fallback
             # Note: This is best-effort; the camera may already be opened so v4l2-ctl might fail
             # The udev rule from setup_camera_formats.sh should handle this at boot time
-            if platform.system() == "Linux" and self.config.fourcc == "MJPG" and isinstance(self.index_or_path, str) and self.index_or_path.startswith("/dev/video"):
+            device = str(self.index_or_path)
+            if platform.system() == "Linux" and self.config.fourcc == "MJPG" and device.startswith("/dev/"):
                 try:
                     import subprocess
                     # Try to set format (may fail if camera is already opened, that's OK)
                     result = subprocess.run(
-                        ["v4l2-ctl", "-d", self.index_or_path, "--set-fmt-video", 
+                        ["v4l2-ctl", "-d", device, "--set-fmt-video",
                          f"width={self.capture_width},height={self.capture_height},pixelformat=MJPG"],
                         capture_output=True,
                         timeout=2.0

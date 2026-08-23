@@ -53,6 +53,7 @@ lerobot-teleoperate \
 
 """
 
+import inspect
 import logging
 import time
 from dataclasses import asdict, dataclass
@@ -78,6 +79,7 @@ from lerobot.robots import (  # noqa: F401
     hope_jr,
     koch_follower,
     make_robot_from_config,
+    ob15,
     omx_follower,
     openarm_follower,
     reachy2,
@@ -161,20 +163,46 @@ def teleop_loop(
     display_len = max(len(key) for key in robot.action_features)
     start = time.perf_counter()
 
+    # Stream cameras to the VR headset (xlerobot_vr only) if the teleoperator opted in.
+    stream_cameras_to_vr = bool(getattr(teleop.config, "stream_cameras_to_vr", False))
+
     # Frame counter for camera reads (read cameras every Nth frame for visualization)
     frame_counter = 0
-    # When display_data=True, read cameras every frame so Rerun gets full FPS (30 Hz).
-    # When display_data=False, no need to read cameras for control.
-    camera_read_interval = 1 if display_data else 2
+    if display_data:
+        # Read cameras every frame so Rerun gets full FPS (30 Hz).
+        camera_read_interval = 1
+    elif stream_cameras_to_vr:
+        # Only read cameras as often as the VR stream actually needs (teleop.send_camera_frames()
+        # rate-limits sends to camera_stream_fps regardless, so reading faster than that just adds
+        # control-loop latency for no benefit — and on this robot, hammering a flaky camera every
+        # tick can stall the whole control loop, not just the display path).
+        camera_stream_fps = float(getattr(teleop.config, "camera_stream_fps", 10.0))
+        camera_read_interval = max(1, round(fps / max(camera_stream_fps, 1e-6)))
+    else:
+        # No need to read cameras for control.
+        camera_read_interval = 2
     last_camera_obs = {}
+
+    # Only xlerobot's get_observation() accepts skip_cameras/skip_depth today; other robots use
+    # the base no-arg signature and would raise TypeError if we passed these kwargs unconditionally.
+    robot_supports_skip_kwargs = "skip_depth" in inspect.signature(robot.get_observation).parameters
 
     while True:
         loop_start = time.perf_counter()
 
         # Get robot observation - skip cameras for control loop (faster) unless displaying
-        read_cameras_this_frame = (frame_counter % camera_read_interval == 0) if display_data else False
-        obs = robot.get_observation(skip_cameras=not read_cameras_this_frame, skip_depth=True)
-        
+        # or streaming to the VR headset
+        read_cameras_this_frame = (
+            (frame_counter % camera_read_interval == 0) if (display_data or stream_cameras_to_vr) else False
+        )
+        if robot_supports_skip_kwargs:
+            # Depth follows the same read cadence as color (skipped whenever cameras are skipped).
+            obs = robot.get_observation(
+                skip_cameras=not read_cameras_this_frame, skip_depth=not read_cameras_this_frame
+            )
+        else:
+            obs = robot.get_observation()
+
         # Merge camera data from last read if we skipped cameras this frame
         if not read_cameras_this_frame and last_camera_obs:
             obs.update(last_camera_obs)
@@ -187,6 +215,8 @@ def teleop_loop(
         # Update teleop's observation cache to avoid double reads (for VR teleop)
         if hasattr(teleop, 'update_observation_cache'):
             teleop.update_observation_cache(obs)
+        if stream_cameras_to_vr and hasattr(teleop, 'send_camera_frames'):
+            teleop.send_camera_frames(obs)
         if robot.name == "unitree_g1":
             teleop.send_feedback(obs)
 

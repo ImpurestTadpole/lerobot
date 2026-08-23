@@ -61,11 +61,9 @@ class XLerobot(Robot):
         # alpha ~0.3 ≈ few frames at 30 Hz; lower = smoother, higher = snappier.
         self._base_vel_alpha = 0.35
         self._base_vel_smooth = {"x.vel": 0.0, "y.vel": 0.0, "theta.vel": 0.0}
-        # Define three speed levels and a current index
         self.speed_levels = [
-            {"xy": 0.1, "theta": 30},  # slow
-            {"xy": 0.2, "theta": 60},  # medium
-            {"xy": 0.3, "theta": 90},  # fast
+            {"xy": xy, "theta": th}
+            for xy, th in zip(config.base_speed_xy, config.base_speed_theta_deg, strict=True)
         ]
         self.speed_index = 0  # Start at slow
         norm_mode_body = MotorNormMode.DEGREES if config.use_degrees else MotorNormMode.RANGE_M100_100
@@ -111,14 +109,16 @@ class XLerobot(Robot):
                 "right_arm_wrist_flex": self.calibration.get("right_arm_wrist_flex"),
                 "right_arm_wrist_roll": self.calibration.get("right_arm_wrist_roll"),
                 "right_arm_gripper": self.calibration.get("right_arm_gripper"),
-                "head_pan": self.calibration.get("head_pan"),
-                "head_tilt": self.calibration.get("head_tilt"),
             }
+            if config.use_head:
+                calibration2["head_pan"] = self.calibration.get("head_pan")
+                calibration2["head_tilt"] = self.calibration.get("head_tilt")
         else:
             calibration2 = self.calibration
 
-        # Build bus2 motors: right arm (1-6) + head (7-8) + optional lift (9) when enabled on bus2.
-        # Lift motor must be in the bus at construction so the bus's _id_to_model_dict includes it.
+        # Build bus2 motors: right arm (1-6) + head (7-8, if use_head) + optional lift (9) when
+        # enabled on bus2. Lift motor must be in the bus at construction so the bus's
+        # _id_to_model_dict includes it. OB15 has no head motors on bus2 (use_head=False).
         bus2_motors = {
             "right_arm_shoulder_pan": Motor(1, "sts3215", norm_mode_body),
             "right_arm_shoulder_lift": Motor(2, "sts3215", norm_mode_body),
@@ -126,9 +126,10 @@ class XLerobot(Robot):
             "right_arm_wrist_flex": Motor(4, "sts3215", norm_mode_body),
             "right_arm_wrist_roll": Motor(5, "sts3215", norm_mode_body),
             "right_arm_gripper": Motor(6, "sts3215", MotorNormMode.RANGE_0_100),
-            "head_pan": Motor(7, "sts3215", norm_mode_body),
-            "head_tilt": Motor(8, "sts3215", norm_mode_body),
         }
+        if config.use_head:
+            bus2_motors["head_pan"] = Motor(7, "sts3215", norm_mode_body)
+            bus2_motors["head_tilt"] = Motor(8, "sts3215", norm_mode_body)
         if self.config.lift_axis.enabled and self.config.lift_axis.bus == "bus2":
             # Use RANGE_M100_100 for velocity control (lift axis uses velocity mode)
             # This normalizes velocity to [-100, 100] range automatically at the bus level
@@ -171,12 +172,10 @@ class XLerobot(Robot):
                 "right_arm_wrist_flex.pos",
                 "right_arm_wrist_roll.pos",
                 "right_arm_gripper.pos",
-                "head_pan.pos",
-                "head_tilt.pos",
-                "x.vel",
-                "y.vel",
-                "theta.vel",
         )
+        if self.config.use_head:
+            keys = (*keys, "head_pan.pos", "head_tilt.pos")
+        keys = (*keys, "x.vel", "y.vel", "theta.vel")
         if self.lift_axis.enabled:
             # Only expose height_mm — not raw velocity — matching every other joint's .pos convention.
             # The P-controller in lift_axis.apply_action() converts height_mm targets to motor
@@ -357,33 +356,34 @@ class XLerobot(Robot):
                 range_max=range_maxes_right[name],
             )
         
-        # calib head motors (on bus2)
-        self.bus2.disable_torque(self.head_motors)
-        for name in self.head_motors:
-            self.bus2.write("Operating_Mode", name, OperatingMode.POSITION.value)
-        
-        input(
-            "Move head motors to the middle of their range of motion and press ENTER...."
-        )
-        
-        homing_offsets_head = self.bus2.set_half_turn_homings(self.head_motors)
-        
-        print(
-            f"Move head pan and tilt through their "
-            "entire ranges of motion.\nRecording positions. Press ENTER to stop..."
-        )
-        range_mins_head, range_maxes_head = self.bus2.record_ranges_of_motion(self.head_motors)
-        
+        # calib head motors (on bus2) — skipped entirely when use_head=False (e.g. OB15)
         calibration_head = {}
-        for name in self.head_motors:
-            motor = self.bus2.motors[name]
-            calibration_head[name] = MotorCalibration(
-                id=motor.id,
-                drive_mode=0,
-                homing_offset=homing_offsets_head[name],
-                range_min=range_mins_head[name],
-                range_max=range_maxes_head[name],
+        if self.head_motors:
+            self.bus2.disable_torque(self.head_motors)
+            for name in self.head_motors:
+                self.bus2.write("Operating_Mode", name, OperatingMode.POSITION.value)
+
+            input(
+                "Move head motors to the middle of their range of motion and press ENTER...."
             )
+
+            homing_offsets_head = self.bus2.set_half_turn_homings(self.head_motors)
+
+            print(
+                f"Move head pan and tilt through their "
+                "entire ranges of motion.\nRecording positions. Press ENTER to stop..."
+            )
+            range_mins_head, range_maxes_head = self.bus2.record_ranges_of_motion(self.head_motors)
+
+            for name in self.head_motors:
+                motor = self.bus2.motors[name]
+                calibration_head[name] = MotorCalibration(
+                    id=motor.id,
+                    drive_mode=0,
+                    homing_offset=homing_offsets_head[name],
+                    range_min=range_mins_head[name],
+                    range_max=range_maxes_head[name],
+                )
         
         # calib base motors (on bus1)
         print("Base wheels use full turn mode, setting range to 0-4095...")
@@ -735,7 +735,7 @@ class XLerobot(Robot):
             """Read right arm positions and head positions from bus2"""
             t0 = time.perf_counter()
             right_arm_pos = self.bus2.sync_read("Present_Position", self.right_arm_motors)
-            head_pos = self.bus2.sync_read("Present_Position", self.head_motors)
+            head_pos = self.bus2.sync_read("Present_Position", self.head_motors) if self.head_motors else {}
             
             # Read lift axis if enabled and on bus2
             lift_pos = None
@@ -822,16 +822,27 @@ class XLerobot(Robot):
                 cam_key, color_frame, depth_frame = future.result()
                 if color_frame is not None:
                     obs_dict[cam_key] = color_frame
+                cam = self.cameras.get(cam_key)
+                cam_expects_depth = not skip_depth and hasattr(cam, "use_depth") and cam.use_depth
                 if depth_frame is not None:
                     # Ensure depth has a channel dimension to match dataset feature (H, W, 1)
                     try:
-                        import numpy as np  # Local import to avoid top-level dependency if not needed
                         if depth_frame.ndim == 2:
                             depth_frame = np.expand_dims(depth_frame, axis=-1)
                     except Exception as e:
                         logger.warning(f"⚠️  Failed to reshape depth frame for camera '{cam_key}': {e}")
                     # Add depth frame with "_depth" suffix
                     obs_dict[f"{cam_key}_depth"] = depth_frame
+                elif cam_expects_depth:
+                    # The dataset schema always includes "{cam_key}_depth" whenever the camera has
+                    # use_depth=True, so a missing read (e.g. depth stream not warmed up yet right
+                    # after connect) must still produce a placeholder of the right shape/dtype —
+                    # otherwise dataset.add_frame() raises "Missing features" and aborts recording.
+                    height = getattr(cam, "height", None)
+                    width = getattr(cam, "width", None)
+                    if height and width:
+                        logger.debug(f"⚠️  No depth frame for camera '{cam_key}' this tick, using zero placeholder")
+                        obs_dict[f"{cam_key}_depth"] = np.zeros((height, width, 1), dtype=np.uint16)
                     
             cam_dt_ms = (time.perf_counter() - cam_start) * 1e3
             logger.debug(f"📷 Camera capture: {cam_dt_ms:.1f}ms")
@@ -861,7 +872,14 @@ class XLerobot(Robot):
         
         left_arm_pos = {k: v for k, v in action.items() if k.startswith("left_arm_") and k.endswith(".pos")}
         right_arm_pos = {k: v for k, v in action.items() if k.startswith("right_arm_") and k.endswith(".pos")}
-        head_pos = {k: v for k, v in action.items() if k.startswith("head_") and k.endswith(".pos")}
+        # Drop head keys when this variant has no head motors (e.g. OB15) — teleop/policies may
+        # still send head_pan.pos/head_tilt.pos unconditionally (shared action schema), but bus2
+        # has no such motors registered, so writing them would KeyError.
+        head_pos = (
+            {k: v for k, v in action.items() if k.startswith("head_") and k.endswith(".pos")}
+            if self.config.use_head
+            else {}
+        )
         # Base: read raw body-frame cmds (0 if key absent) so EMA decays every tick.
         base_goal_vel_raw = {k: float(action.get(k, 0.0)) for k in ("x.vel", "y.vel", "theta.vel")}
         base_goal_vel_smooth = self._smooth_base_vel(base_goal_vel_raw)

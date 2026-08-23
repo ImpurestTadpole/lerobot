@@ -47,20 +47,27 @@ class LiftAxisConfig:
 
     kp_vel: float = 300.0
     v_max: int = 2000
-    on_target_mm: float = 1.0
+    on_target_mm: float = 2.0       # Zone A boundary — within this → stop
     dir_sign: int = 1
 
-    # --- ADDED: three new fields, all off by default ---
+    # Three-zone deadband controller parameters.
+    # Zone B kicks in when abs(err) < near_target_threshold_mm — the STS3215
+    # stalls below ~150-250 raw ticks so we floor the command at v_min_effective.
+    # Calibrated on physical hardware (both arms attached) via
+    # scripts/deadband_calibration.py on 2026-08-16; came out symmetric (101/101)
+    # rather than the asymmetric split originally assumed in lift_fix.md.
+    near_target_threshold_mm: float = 15.0   # Zone B outer boundary
+    v_min_effective_up: int = 101            # raw ticks; ascending fights gravity
+    v_min_effective_down: int = 101          # raw ticks; gravity helps descent
+
+    # Hard velocity cap on the policy height_mm path only.
+    # Teleop vel path is uncapped so manual control keeps full speed.
+    # 0.4 = 800 raw ticks max from policy (40% of v_max=2000).
+    max_cmd_vel_frac: float = 0.4
 
     # Auto-home on first configure() call (triggered by robot.connect()).
     # Set True for inference. Leave False for data collection.
     home_on_connect: bool = True
-
-    # Hard velocity cap on the policy height_mm path only.
-    # Teleop vel path is uncapped so manual control keeps full speed.
-    # 0.10 = 200 raw units max from policy (10% of v_max=2000).
-    # Increase to 0.30 for tasks that need faster lift movement.
-    max_cmd_vel_frac: float = 0.4
 
     # Freeze lift at home position after homing.
     # Set True for stationary tasks (tool_pickup, block_sorting).
@@ -227,7 +234,6 @@ class LiftAxis:
         key_v = f"{self.cfg.name}.vel"
 
         if key_h in action:
-            # ADDED Layer 1: block until homed — prevents blind soft limits
             if not self._homed:
                 logger.warning(
                     "LiftAxis: height_mm command blocked — lift not homed. "
@@ -236,31 +242,55 @@ class LiftAxis:
                 self._bus.write("Goal_Velocity", self.cfg.name, 0)
                 return
 
-            # ADDED Layer 3: frozen → hold stored target, ignore policy
             target_mm = (
                 self._freeze_target_mm if self._frozen else float(action[key_h])
             )
 
-            cur_mm = self._cached_height_mm
-            err = target_mm - cur_mm
-            if abs(err) <= self.cfg.on_target_mm:
-                v_cmd = 0.0
+            # Three-zone P controller (fixes stale-position + deadband stall bugs):
+            #
+            # Zone A  |err| <= on_target_mm          → stop, on target
+            # Zone B  |err| <  near_target_threshold  → floor at v_min_effective
+            # Zone C  |err| >= near_target_threshold  → kp*err clamped to v_limit
+            #
+            # Fresh position read on every call; _cached_height_mm is kept updated
+            # as a side-effect so observation values stay consistent.
+            self._update_extended_ticks()
+            if self.cfg.home_at_top:
+                cur_mm = (self._z0_deg - self._extended_deg()) * self._mm_per_deg
             else:
-                v_cmd = self.cfg.kp_vel * err
-                # ADDED Layer 2: hard cap on policy path only
-                v_limit = int(self.cfg.v_max * self.cfg.max_cmd_vel_frac)
-                v_cmd = max(-v_limit, min(v_limit, v_cmd))
+                cur_mm = (self._extended_deg() - self._z0_deg) * self._mm_per_deg
+            self._cached_height_mm = cur_mm
 
-            # Original soft limits — unchanged
-            if (cur_mm >= self.cfg.soft_max_mm and v_cmd > 0) or (
-                cur_mm <= self.cfg.soft_min_mm and v_cmd < 0
-            ):
-                v_cmd = 0.0
+            err = target_mm - cur_mm
+            abs_err = abs(err)
 
-            sign = -1 if self.cfg.home_at_top else 1
-            self._bus.write(
-                "Goal_Velocity", self.cfg.name, int(sign * self.cfg.dir_sign * v_cmd)
-            )
+            # Soft limits — clamp at range boundaries regardless of zone
+            at_ceiling = cur_mm <= self.cfg.soft_min_mm and err < 0
+            at_floor = cur_mm >= self.cfg.soft_max_mm and err > 0
+            if at_ceiling or at_floor:
+                self._bus.write("Goal_Velocity", self.cfg.name, 0)
+            elif abs_err <= self.cfg.on_target_mm:
+                # Zone A
+                self._bus.write("Goal_Velocity", self.cfg.name, 0)
+            else:
+                if abs_err < self.cfg.near_target_threshold_mm:
+                    # Zone B — floor velocity to overcome motor deadband.
+                    # With home_at_top=True: err > 0 means physically descending
+                    # (higher mm value); gravity assists, so use the smaller v_min.
+                    if err > 0:
+                        v_cmd = float(self.cfg.v_min_effective_down)
+                    else:
+                        v_cmd = -float(self.cfg.v_min_effective_up)
+                else:
+                    # Zone C — proportional term, capped
+                    v_limit = int(self.cfg.v_max * self.cfg.max_cmd_vel_frac)
+                    v_cmd = self.cfg.kp_vel * err
+                    v_cmd = max(-float(v_limit), min(float(v_limit), v_cmd))
+
+                sign = -1 if self.cfg.home_at_top else 1
+                self._bus.write(
+                    "Goal_Velocity", self.cfg.name, int(sign * self.cfg.dir_sign * v_cmd)
+                )
 
         if key_v in action:
             # ADDED Layer 3 for teleop path

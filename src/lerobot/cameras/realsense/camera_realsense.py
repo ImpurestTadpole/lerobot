@@ -16,6 +16,8 @@
 Provides the RealSenseCamera class for capturing frames from Intel RealSense cameras.
 """
 
+from __future__ import annotations
+
 import logging
 import sys
 import time
@@ -29,7 +31,11 @@ from numpy.typing import NDArray  # type: ignore  # TODO: add type stubs for num
 from lerobot.utils.import_utils import _pyrealsense2_available, require_package
 
 if TYPE_CHECKING or _pyrealsense2_available:
-    import pyrealsense2 as rs
+    try:
+        import pyrealsense2 as rs
+    except (ImportError, OSError):
+        # OSError covers GLIBC version mismatches (e.g. wheel built for newer glibc)
+        rs = None
 else:
     rs = None
 
@@ -116,7 +122,21 @@ class RealSenseCamera(Camera):
         Args:
             config: The configuration settings for the camera.
         """
-        require_package(pkg_name, extra="intelrealsense", import_name="pyrealsense2")
+        rs_mod = rs
+        if rs_mod is None:
+            # pip metadata can claim pyrealsense2 is installed while the .so fails to load
+            # (e.g. GLIBC mismatch). require_package alone is not enough — try import here.
+            require_package(pkg_name, extra="intelrealsense", import_name="pyrealsense2")
+            try:
+                import pyrealsense2 as rs_mod
+            except (ImportError, OSError) as e:
+                raise ImportError(
+                    "pyrealsense2 could not be loaded. On Jetson/Ubuntu 22.04, PyPI wheels may "
+                    "require a newer GLIBC than the system provides. Options: (1) install librealsense "
+                    "and matching bindings from apt/ROS, or (2) use OpenCVCameraConfig for the D435i "
+                    "RGB stream via V4L2 (/dev/video*)."
+                ) from e
+        self._rs = rs_mod
         super().__init__(config)
 
         self.config = config
@@ -131,8 +151,8 @@ class RealSenseCamera(Camera):
         self.use_depth = config.use_depth
         self.warmup_s = config.warmup_s
 
-        self.rs_pipeline: rs.pipeline | None = None
-        self.rs_profile: rs.pipeline_profile | None = None
+        self.rs_pipeline = None
+        self.rs_profile = None
 
         self.thread: Thread | None = None
         self.stop_event: Event | None = None
@@ -177,6 +197,7 @@ class RealSenseCamera(Camera):
             RuntimeError: If the pipeline starts but fails to apply requested settings.
         """
 
+        rs = self._rs
         self.rs_pipeline = rs.pipeline()
         rs_config = rs.config()
         self._configure_rs_pipeline_config(rs_config)
@@ -221,19 +242,26 @@ class RealSenseCamera(Camera):
             ImportError: If pyrealsense2 is not installed.
         """
         found_cameras_info = []
-        context = rs.context()
+        try:
+            import pyrealsense2 as rs_mod
+        except (ImportError, OSError) as e:
+            raise OSError(
+                "pyrealsense2 is required for RealSenseCamera.find_cameras(). "
+                "Install lerobot[intelrealsense] or use system librealsense bindings."
+            ) from e
+        context = rs_mod.context()
         devices = context.query_devices()
 
         for device in devices:
             camera_info = {
-                "name": device.get_info(rs.camera_info.name),
+                "name": device.get_info(rs_mod.camera_info.name),
                 "type": "RealSense",
-                "id": device.get_info(rs.camera_info.serial_number),
-                "firmware_version": device.get_info(rs.camera_info.firmware_version),
-                "usb_type_descriptor": device.get_info(rs.camera_info.usb_type_descriptor),
-                "physical_port": device.get_info(rs.camera_info.physical_port),
-                "product_id": device.get_info(rs.camera_info.product_id),
-                "product_line": device.get_info(rs.camera_info.product_line),
+                "id": device.get_info(rs_mod.camera_info.serial_number),
+                "firmware_version": device.get_info(rs_mod.camera_info.firmware_version),
+                "usb_type_descriptor": device.get_info(rs_mod.camera_info.usb_type_descriptor),
+                "physical_port": device.get_info(rs_mod.camera_info.physical_port),
+                "product_id": device.get_info(rs_mod.camera_info.product_id),
+                "product_line": device.get_info(rs_mod.camera_info.product_line),
             }
 
             # Get stream profiles for each sensor
@@ -269,13 +297,13 @@ class RealSenseCamera(Camera):
             )
 
         if len(found_devices) > 1:
-            serial_numbers = [dev["serial_number"] for dev in found_devices]
+            serial_numbers = [str(dev["id"]) for dev in found_devices]
             raise ValueError(
                 f"Multiple RealSense cameras found with name '{name}'. "
                 f"Please use a unique serial number instead. Found SNs: {serial_numbers}"
             )
 
-        serial_number = str(found_devices[0]["serial_number"])
+        serial_number = str(found_devices[0]["id"])
         return serial_number
 
     def _configure_rs_pipeline_config(self, rs_config: Any) -> None:
@@ -284,7 +312,9 @@ class RealSenseCamera(Camera):
         RealSense cameras support specific resolutions (e.g., 640x480, 1280x720, 1920x1080).
         If the requested resolution isn't supported, we use 640x480 and resize in postprocessing.
         """
-        rs.config.enable_device(rs_config, self.serial_number)
+        rs = self._rs
+        serial = str(self.serial_number)
+        rs.config.enable_device(rs_config, serial)
 
         if self.width and self.height and self.fps:
             rs_config.enable_stream(
@@ -313,7 +343,7 @@ class RealSenseCamera(Camera):
         if self.rs_profile is None:
             raise RuntimeError(f"{self}: rs_profile must be initialized before use.")
 
-        stream = self.rs_profile.get_stream(rs.stream.color).as_video_stream_profile()
+        stream = self.rs_profile.get_stream(self._rs.stream.color).as_video_stream_profile()
 
         if self.fps is None:
             self.fps = stream.fps()

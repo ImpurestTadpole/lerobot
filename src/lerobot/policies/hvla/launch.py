@@ -30,6 +30,7 @@ from lerobot.policies.hvla.ipc import (
 )
 from lerobot.policies.hvla.logging_utils import setup_process_logging
 from lerobot.policies.hvla.s1_process import _resolve_hvla_robot_config_path
+from lerobot.policies.hvla.torch_device import resolve_hvla_device
 
 logger = logging.getLogger(__name__)
 
@@ -42,7 +43,11 @@ def main():
     parser.add_argument("--task", required=True)
     parser.add_argument("--robot-config", default=None)
     parser.add_argument("--fps", type=int, default=30)
-    parser.add_argument("--device", default="cuda")
+    parser.add_argument(
+        "--device",
+        default="auto",
+        help="Torch device: auto (cuda → mps → cpu), cuda, cpu, mps, cuda:0, ...",
+    )
     parser.add_argument("--resize-images", default="224x224")
     parser.add_argument("--temporal-ensemble-coeff", type=float, default=None)
     parser.add_argument("--n-action-steps", type=int, default=None)
@@ -174,6 +179,9 @@ def main():
     # (validated later, after attempting to attach)
 
     setup_process_logging()
+
+    args.device = resolve_hvla_device(args.device)
+    logger.info("HVLA S1 torch device: %s", args.device)
 
     # Fail fast before SHM / S2 spawn — avoids leaked shared_memory when robot JSON is missing
     try:

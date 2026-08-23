@@ -119,9 +119,23 @@ _motorbridge_smart_servo_available = is_package_available(
     "motorbridge-smart-servo", import_name="motorbridge_smart_servo"
 )
 _unitree_sdk_available = is_package_available("unitree-sdk2py", "unitree_sdk2py")
-_pyrealsense2_available = is_package_available("pyrealsense2") or is_package_available(
-    "pyrealsense2-macosx", import_name="pyrealsense2"
-)
+def _check_pyrealsense2_available() -> bool:
+    """Check pyrealsense2 is importable.
+
+    Uses a direct import test rather than relying solely on dist-info metadata.
+    This handles system-installed packages (e.g. from ROS/apt) that lack a
+    pip dist-info directory, and guards against GLIBC/ABI mismatches where
+    the dist-info exists but the .so crashes on load.
+    """
+    try:
+        import pyrealsense2  # noqa: F401
+
+        return True
+    except (ImportError, OSError):
+        return False
+
+
+_pyrealsense2_available = _check_pyrealsense2_available()
 _zmq_available = is_package_available("pyzmq", import_name="zmq")
 _hebi_available = is_package_available("hebi-py", import_name="hebi")
 _teleop_available = is_package_available("teleop")
