@@ -48,7 +48,7 @@ import torch
 from pydantic import BaseModel, Field
 from transformers import AutoConfig, AutoProcessor
 
-from lerobot.datasets import LeRobotDataset
+from lerobot.datasets import LeRobotDataset, resolve_episode_indices
 
 
 def _device_map_arg(device: str) -> str | dict[str, int] | None:
@@ -1630,8 +1630,8 @@ def main():
     parser.add_argument(
         "--output-dir",
         type=str,
-        default="./subtask_viz",
-        help="Output directory for visualizations (default: ./subtask_viz)",
+        default="outputs/subtask_viz",
+        help="Output directory for visualizations (default: outputs/subtask_viz)",
     )
 
     args = parser.parse_args()
@@ -1688,7 +1688,10 @@ def main():
     torch_dtype = {"bfloat16": torch.bfloat16, "float16": torch.float16, "float32": torch.float32}[args.dtype]
 
     # Determine episodes
-    episode_indices = args.episodes or list(range(dataset.meta.total_episodes))
+    resolved_episodes = resolve_episode_indices(args.episodes, dataset.meta.total_episodes)
+    episode_indices = (
+        resolved_episodes if resolved_episodes is not None else list(range(dataset.meta.total_episodes))
+    )
 
     existing_annotations = load_annotations_from_dataset(dataset.root, prefix="sparse")
     if args.skip_existing:

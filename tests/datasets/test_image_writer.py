@@ -93,21 +93,9 @@ def test_image_array_to_pil_image_pytorch_format(img_array_factory):
 
 
 def test_image_array_to_pil_image_single_channel(img_array_factory):
-    """Test that single channel arrays without is_depth flag raise error for RGB context."""
     img_array = img_array_factory(channels=1)
-    # Single channel arrays should raise error when not explicitly marked as depth
-    with pytest.raises((NotImplementedError, ValueError)):
+    with pytest.raises(ValueError, match="Unsupported single-channel image dtype"):
         image_array_to_pil_image(img_array)
-
-
-def test_image_array_to_pil_image_single_channel_as_depth(img_array_factory):
-    """Test that single channel arrays work when is_depth=True."""
-    # Create a proper depth array (float32 in meters)
-    img_array = np.random.uniform(0.5, 5.0, (1, 100, 100)).astype(np.float32)
-    result_image = image_array_to_pil_image(img_array, is_depth=True)
-    assert isinstance(result_image, Image.Image)
-    assert result_image.size == (100, 100)
-    assert result_image.mode == "I;16"
 
 
 def test_image_array_to_pil_image_4_channels(img_array_factory):
@@ -356,7 +344,7 @@ def test_with_different_image_formats(tmp_path, img_array_factory):
     writer = AsyncImageWriter()
     try:
         image_array = img_array_factory()
-        formats = ["png", "jpeg", "bmp"]
+        formats = ["png", "tiff", "tif"]
         for fmt in formats:
             fpath = tmp_path / f"test_image.{fmt}"
             write_image(image_array, fpath)

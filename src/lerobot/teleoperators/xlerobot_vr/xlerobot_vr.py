@@ -37,7 +37,7 @@ import numpy as np
 from lerobot.model.SO101Robot import SO101Kinematics
 
 from ..teleoperator import Teleoperator
-from .configuration_xlerobot_vr import XLerobotVRTeleopConfig
+from .configuration_xlerobot_vr import DEFAULT_VR_BUTTON_MAP, XLerobotVRTeleopConfig
 
 # Setup logging
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(name)s - %(levelname)s - %(message)s')
@@ -46,15 +46,17 @@ logger = logging.getLogger(__name__)
 # Check VR Monitor availability
 VR_AVAILABLE = True
 try:
-    # Dynamically import VR Monitor 
-    from .vr_monitor import VRMonitor
+    # Dynamically import VR Monitor
+    from .vr_monitor import VRMonitor, set_xlevr_path
 except ImportError as e:
     VR_AVAILABLE = False
     VRMonitor = None
+    set_xlevr_path = None
     logging.warning(f"VR Monitor not available: {e}")
 except Exception as e:
     VR_AVAILABLE = False
     VRMonitor = None
+    set_xlevr_path = None
     logging.warning(f"Could not import VR Monitor: {e}")
 
 
@@ -792,7 +794,11 @@ class XLerobotVRTeleop(Teleoperator):
         # Depth-view toggle state (see _update_depth_toggle / send_camera_frames)
         self._depth_view_enabled = False
         self._prev_right_thumbstick_click = False
-        
+
+        # Intervention state — toggled by the button_map's "toggle_intervention" action
+        # (RIGHT A by default), read by s1_process / DAgger via get_teleop_events()
+        self._intervention_active = False
+
         self.logs = {}
 
     @property
@@ -849,6 +855,8 @@ class XLerobotVRTeleop(Teleoperator):
 
         try:
             logger.info("🔧 Initializing VR monitor...")
+            if getattr(self.config, "xlevr_path", None) and set_xlevr_path is not None:
+                set_xlevr_path(self.config.xlevr_path)
             self.vr_monitor = VRMonitor()
             
             # Use timeout mechanism to avoid infinite waiting
@@ -882,7 +890,7 @@ class XLerobotVRTeleop(Teleoperator):
             self._connected = True
             
             # Initialize VR event handler
-            self.vr_event_handler = VREventHandler(self.vr_monitor)
+            self.vr_event_handler = VREventHandler(self.vr_monitor, button_map=self.config.button_map)
             logger.info("🎮 VR event handler initialized")
             
             # Store robot reference for use in get_action
@@ -1268,32 +1276,42 @@ class XLerobotVRTeleop(Teleoperator):
         except Exception as e:
             logger.debug(f"Low frequency event update failed: {e}")  # Downgrade to debug to avoid disrupting main flow
 
-    def send_feedback(self) -> None:
-        """Send feedback - optimized version, reduce blocking wait"""
-        if not self.vr_monitor:
-            logger.warning("VR monitor not available for feedback")
-            return
+    def send_feedback(self, feedback: dict | None = None) -> None:
+        """Accept inverse-follow position feedback from s1_process.py.
 
-        max_attempts = 200  # Maximum 200 attempts
+        For a physical leader arm this would drive the leader motors to mirror
+        the follower. VR has no physical leader, so the position dict is ignored.
+        The original startup-wait behaviour (polling for first VR packet) has been
+        moved to _wait_for_vr_data() and is called once during connect().
+        """
+        pass  # VR controller — no haptic or inverse-follow feedback path
+
+    def _wait_for_vr_data(self, timeout_s: float = 100.0) -> bool:
+        """Block until at least one VR packet with position data is received.
+
+        Called once during connect() to confirm the VR headset is streaming.
+        Returns True if data arrived within timeout, False otherwise.
+        """
+        if not self.vr_monitor:
+            return False
+        deadline = time.monotonic() + timeout_s
         attempt = 0
-        
-        while attempt < max_attempts:
+        while time.monotonic() < deadline:
             try:
                 dual_goals = self.vr_monitor.get_latest_goal_nowait()
                 right_goal = dual_goals.get("right") if isinstance(dual_goals, dict) else None
                 meta = _safe_metadata(right_goal) if right_goal else {}
                 vr_pos = meta.get("vr_position")
                 if isinstance(vr_pos, (list, tuple)) and len(vr_pos) >= 3 and sum(vr_pos) != 0:
-                    logger.info("VR controller data received")
-                    return
+                    logger.info("VR controller data received (attempt %d)", attempt + 1)
+                    return True
             except Exception as e:
-                logger.warning(f"Error getting VR data: {e}")
-            
+                logger.warning("Error getting VR data: %s", e)
             attempt += 1
-            logger.info(f'Waiting for VR controller data (attempt {attempt}/{max_attempts})')
-            time.sleep(0.5)  # Reduce wait time from 8 seconds to 0.5 seconds
-        
+            logger.info("Waiting for VR controller data (attempt %d)", attempt)
+            time.sleep(0.5)
         logger.warning("Timeout waiting for VR controller data")
+        return False
 
     def configure(self) -> None:
         pass
@@ -1330,6 +1348,93 @@ class XLerobotVRTeleop(Teleoperator):
 
         return action
     
+    # ------------------------------------------------------------------
+    # s1_process.py intervention interface
+    # ------------------------------------------------------------------
+
+    def get_teleop_events(self) -> dict:
+        """Return TeleopEvents dict consumed by rollout strategies (e.g. DAgger with
+        ``input_device="teleop"``) and s1_process.py each control loop.
+
+        IS_INTERVENTION reflects the toggle state driven by whichever physical button
+        is bound to the ``"toggle_intervention"`` action in ``button_map`` (RIGHT A by
+        default). STOP_SESSION and UPLOAD_REQUESTED surface the ``"stop_session"`` and
+        ``"upload_dataset"`` button_map actions, so a DAgger session can be stopped or
+        pushed to the Hub entirely from the VR controllers without a keyboard fallback.
+        UPLOAD_REQUESTED is one-shot: it is cleared immediately after being read here.
+        Refresh VR goals first so the state is never more than one frame stale.
+        """
+        from lerobot.teleoperators.utils import TeleopEvents
+
+        # Refresh button state from latest VR packet (same pattern as get_vr_events)
+        if self.vr_event_handler is not None and self.vr_monitor is not None:
+            try:
+                dual_goals = self.vr_monitor.get_latest_goal_nowait()
+                if isinstance(dual_goals, dict):
+                    self._update_events_inline(dual_goals.get("left"), dual_goals.get("right"))
+            except Exception as e:
+                logger.debug("get_teleop_events VR refresh failed (non-critical): %s", e)
+
+        # Sync top-level flag from the event handler's toggle state
+        old_active = self._intervention_active
+        stop_session = False
+        upload_requested = False
+        if self.vr_event_handler is not None:
+            self._intervention_active = self.vr_event_handler._intervention_active
+            stop_session = bool(self.vr_event_handler.events.get("stop_recording", False))
+            upload_requested = bool(self.vr_event_handler.events.get("upload_requested", False))
+            if upload_requested:
+                self.vr_event_handler.events["upload_requested"] = False
+
+        # On intervention start: snap IK targets to current robot joint positions.
+        # s1_process.py runs a servo-sync loop that calls teleop.get_action() and
+        # compares it to the follower's last position. Without recalibration the VR
+        # IK targets may have drifted, causing a 5-second timeout on every handover.
+        if self._intervention_active and not old_active and self.robot is not None:
+            try:
+                robot_obs = self.robot.get_observation()
+                self.calibrate(robot_obs)
+                logger.info("[VR] Arm controllers recalibrated to robot position (intervention start)")
+            except Exception as e:
+                logger.warning("[VR] Arm recalibration on intervention start failed: %s", e)
+
+        return {
+            TeleopEvents.IS_INTERVENTION: self._intervention_active,
+            TeleopEvents.STOP_SESSION: stop_session,
+            TeleopEvents.UPLOAD_REQUESTED: upload_requested,
+        }
+
+    def reset_intervention(self) -> None:
+        """Clear intervention state at the start of each episode.
+
+        NOTE: this also clears the RIGHT A physical-button edge cache, since that
+        is the default "toggle_intervention" binding. If ``button_map`` is
+        customised to drive "toggle_intervention" from a different physical
+        button, that button's own edge cache is reset the same way on its next
+        press/release cycle, so a stale edge here is harmless.
+        """
+        self._intervention_active = False
+        if self.vr_event_handler is not None:
+            self.vr_event_handler._intervention_active = False
+            # Also clear the A-button prev state so first press in new episode is a clean edge
+            self.vr_event_handler.prev_states['right_button_a'] = False
+            self.vr_event_handler.prev_states['right_a_last_press_ts'] = 0.0
+        logger.debug("[VR] Intervention state reset for new episode")
+
+    def enable_torque(self) -> None:
+        """No-op: VR has no physical leader arm whose torque needs managing.
+        The follower robot keeps its own torque on; s1_process calls this when
+        returning from intervention — safe to ignore for VR."""
+        pass
+
+    def disable_torque(self) -> None:
+        """No-op: VR has no physical leader arm whose torque needs managing.
+        s1_process calls this at intervention start so the human can grab the
+        leader arm without fighting it — not applicable for VR."""
+        pass
+
+    # ------------------------------------------------------------------
+
     def get_vr_events(self):
         """Get VR event status.
 
@@ -1369,6 +1474,7 @@ class XLerobotVRTeleop(Teleoperator):
                 "stop_recording": False,
                 "reset_position": False,
                 "back_position": False,
+                "upload_requested": False,
             }
     
     def reset_vr_events(self):
@@ -1403,6 +1509,7 @@ def init_vr_listener(teleop_vr):
             "stop_recording": False,
             "reset_position": False,
             "back_position": False,
+            "upload_requested": False,
         }
     
     # Print control guide
@@ -1427,18 +1534,35 @@ def init_vr_listener(teleop_vr):
 
 class VREventHandler:
     """
-    VR event handler, specifically handles recording control events
-    Use left VR controller to replace keyboard control
+    VR event handler: turns discrete controller button presses into session /
+    DAgger control events (episode control, intervention handover, dataset
+    upload), driven by a "<left|right>.<button>" -> semantic-action ``button_map``
+    (see ``DEFAULT_VR_BUTTON_MAP`` in ``configuration_xlerobot_vr.py``).
+
+    Continuous motion (trigger -> gripper, thumbstick -> base/lift, controller
+    pose -> arm IK) is handled elsewhere and is not affected by ``button_map``.
     """
-    
-    def __init__(self, vr_monitor):
+
+    # Recognised semantic actions and how they're applied are documented on
+    # ``_dispatch_semantic``. "reset_position" is the only self-clearing one
+    # (true for exactly the call where its rising edge is detected); every
+    # other semantic is sticky until an external consumer clears it (matches
+    # legacy behaviour of exit_early/rerecord_episode/stop_recording).
+    _SELF_CLEARING_SEMANTICS = frozenset({"reset_position"})
+
+    def __init__(self, vr_monitor, button_map: dict[str, str] | None = None):
         self.vr_monitor = vr_monitor
+        # NOTE: check `is None`, not truthiness -- an explicitly empty `{}` must
+        # disable all session/DAgger buttons rather than silently falling back
+        # to the defaults.
+        self.button_map = dict(button_map) if button_map is not None else dict(DEFAULT_VR_BUTTON_MAP)
         self.events = {
-            "exit_early": False,      # Left controller right: Exit loop early (original right arrow key)
-            "rerecord_episode": False, # Left controller left: Re-record episode (original left arrow key)
-            "stop_recording": False,   # Left controller up: Stop recording (original ESC key)
-            "reset_position": False,   # Left controller down: Reset robot (new feature)
-            "back_position": False,    # In the bucket (new feature)
+            "exit_early": False,       # Episode: exit loop early (save & continue)
+            "rerecord_episode": False, # Episode: discard and re-record
+            "stop_recording": False,   # Session: stop recording / rollout
+            "reset_position": False,   # Robot: reset to rest pose (self-clearing pulse)
+            "back_position": False,    # Vestigial; never set True, kept for API compatibility
+            "upload_requested": False, # DAgger: push dataset to Hub on demand
         }
         self.prev_states = {
             'thumbstick_x': 0,
@@ -1452,11 +1576,21 @@ class VREventHandler:
             # Right controller buttons
             'right_button_b': False,
             'right_b_last_press_ts': 0.0,
+            'right_button_a': False,
+            'right_a_last_press_ts': 0.0,
+            'right_button_thumbstick': False,
+            'right_thumbstick_last_press_ts': 0.0,
             # Snapshots for debug
             'buttons_snapshot': {},
             'right_buttons_snapshot': {},
         }
         self.threshold = 0.7  # Thumbstick trigger threshold
+        # Debounce window for edge-triggered buttons that use the missing-packet
+        # guard (right-hand buttons); prevents double-fires from noisy packets.
+        self._edge_cooldown_s = 0.5
+        # Intervention toggle state, driven by whichever button_map key maps to
+        # "toggle_intervention" (RIGHT A by default).
+        self._intervention_active = False
         
     def update_events(self):
         """Update VR event status"""
@@ -1478,96 +1612,151 @@ class VREventHandler:
             logger.error(f"VR事件更新失败: {e}")
             
         return self.events
-    
+
+    def _dispatch_semantic(self, semantic: str | None, controller: str, button: str) -> None:
+        """Apply a one-shot semantic action on a button's rising edge.
+
+        ``reset_position`` is handled by the caller directly (self-clearing),
+        so it never reaches this dispatcher.
+        """
+        if semantic == "rerecord_episode":
+            logger.info("🎮 VR %s.%s pressed -> Re-record current episode", controller, button)
+            self.events["rerecord_episode"] = True
+            self.events["exit_early"] = True
+        elif semantic == "exit_early":
+            logger.info("🎮 VR %s.%s pressed -> Finish episode early", controller, button)
+            self.events["exit_early"] = True
+        elif semantic == "stop_session":
+            logger.info("🎮 VR %s.%s pressed -> Stop recording", controller, button)
+            self.events["stop_recording"] = True
+        elif semantic == "upload_dataset":
+            logger.info("🎮 VR %s.%s pressed -> Dataset upload requested", controller, button)
+            self.events["upload_requested"] = True
+        elif semantic == "toggle_intervention":
+            self._intervention_active = not self._intervention_active
+            state_str = "ON (human)" if self._intervention_active else "OFF (policy)"
+            logger.info("🎮 VR %s.%s pressed -> Intervention %s", controller, button, state_str)
+        elif semantic is not None:
+            logger.debug("VR %s.%s is mapped to unknown semantic action %r", controller, button, semantic)
+
+    def _process_button(
+        self,
+        controller: str,
+        button: str,
+        pressed: bool,
+        prev_key: str,
+        ts_key: str | None = None,
+        guard_missing: bool = False,
+        raw_buttons: dict | None = None,
+    ) -> None:
+        """Edge-detect one physical button and dispatch its ``button_map`` action.
+
+        Args:
+            controller: "left" or "right".
+            button: raw button name as it appears in the VR packet (x, y, a, b,
+                menu, thumbstick).
+            pressed: current (possibly stale/missing) pressed state.
+            prev_key: ``prev_states`` key tracking this button's last pressed state.
+            ts_key: ``prev_states`` key tracking this button's last-fire timestamp,
+                used for debouncing. ``None`` disables debouncing (legacy left-hand
+                buttons never debounced).
+            guard_missing: if True, a packet that omits ``button`` from
+                ``raw_buttons`` is treated as "unchanged" rather than "released"
+                (legacy behaviour for the right-hand buttons only).
+            raw_buttons: the raw ``buttons`` dict for this controller, required
+                when ``guard_missing`` is True.
+        """
+        prev_pressed = bool(self.prev_states.get(prev_key, False))
+        if guard_missing and raw_buttons is not None and button not in raw_buttons:
+            pressed = prev_pressed
+
+        semantic = self.button_map.get(f"{controller}.{button}")
+        is_edge = pressed and not prev_pressed
+
+        if semantic in self._SELF_CLEARING_SEMANTICS:
+            # Momentary pulse: true only for the exact call where the edge fires.
+            self.events["reset_position"] = is_edge
+            if not is_edge:
+                self.events["back_position"] = False
+            if is_edge:
+                logger.debug("🎮 VR %s.%s pressed -> Reset robot", controller, button)
+        elif is_edge and ts_key is not None:
+            now = time.monotonic()
+            last_ts = float(self.prev_states.get(ts_key, 0.0) or 0.0)
+            if (now - last_ts) > self._edge_cooldown_s:
+                self._dispatch_semantic(semantic, controller, button)
+                self.prev_states[ts_key] = now
+        elif is_edge:
+            self._dispatch_semantic(semantic, controller, button)
+
+        self.prev_states[prev_key] = pressed
+
     def _process_left_controller(self, metadata):
-        """Process left controller input."""
+        """Process left controller input (session/DAgger buttons per ``button_map``)."""
         buttons = _safe_buttons(metadata)
-        button_x = bool(buttons.get('x', False))
-        button_y = bool(buttons.get('y', False))
-        button_thumbstick = bool(buttons.get('thumbstick', False))
-        button_menu = bool(buttons.get('menu', False))
 
         # Log raw left button states whenever they change, for mapping debug
         prev_buttons_snapshot = self.prev_states.get('buttons_snapshot', {})
         if buttons != prev_buttons_snapshot:
             logger.debug(f"🎮 LEFT raw buttons: {buttons}")
 
-        # Episode control mapping (requested):
-        #   - LEFT X button -> Restart (re-record) current episode
-        #   - LEFT Y button -> Restart (re-record) current episode
-        if (button_x and not self.prev_states.get('button_x', False)) or (
-            button_y and not self.prev_states.get('button_y', False)
-        ):
-            which = "X" if button_x else "Y"
-            logger.info(f"🎮 VR LEFT {which} button pressed -> Re-record current episode")
-            self.events["rerecord_episode"] = True
-            self.events["exit_early"] = True
+        # IMPORTANT: Do NOT map thumbstick *movement* to session events.
+        # The left thumbstick X axis is used for base rotation, so only the
+        # click (button) is bound here, not the analog axis.
+        self._process_button("left", "x", bool(buttons.get('x', False)), "button_x")
+        self._process_button("left", "y", bool(buttons.get('y', False)), "button_y")
+        self._process_button("left", "menu", bool(buttons.get('menu', False)), "button_menu")
+        self._process_button(
+            "left", "thumbstick", bool(buttons.get('thumbstick', False)), "button_thumbstick"
+        )
 
-        # IMPORTANT: Do NOT map thumbstick *movement* to episode control events.
-        # The left thumbstick X axis is used for base rotation, so mapping it to `exit_early`
-        # causes accidental episode termination when rotating the robot.
-        #
-        # Explicit buttons only:
-        # - LEFT Menu -> Stop recording (sticky)
-        # - LEFT Thumbstick click -> Reset robot (instantaneous)
-        if button_menu and not self.prev_states.get('button_menu', False):
-            logger.info("🎮 VR LEFT menu button pressed -> Stop recording")
-            self.events["stop_recording"] = True
-
-        if button_thumbstick and not self.prev_states.get('button_thumbstick', False):
-            logger.debug("🎮 VR LEFT thumbstick button pressed -> Reset robot")
-            self.events["reset_position"] = True
-        else:
-            self.events["reset_position"] = False  # Reset event is instantaneous
-            self.events["back_position"] = False
-        
         # Detect trigger key events
         trigger = _safe_trigger(metadata) > 0.5
-        
-        # Update status
-        self.prev_states.update({
-            'trigger': trigger,
-            'button_x': button_x,
-            'button_y': button_y,
-            'button_thumbstick': button_thumbstick,
-            'button_menu': button_menu,
-            'buttons_snapshot': buttons,
-        })
+
+        self.prev_states['trigger'] = trigger
+        self.prev_states['buttons_snapshot'] = buttons
 
     def _process_right_controller(self, metadata):
-        """Process right-hand controller input for episode control (B button = finish early)."""
+        """Process right-hand controller input (session/DAgger buttons per ``button_map``)."""
         buttons = _safe_buttons(metadata)
-        prev_button_b = bool(self.prev_states.get('right_button_b', False))
-
-        # Some packets can omit button fields or send an empty dict {}.
-        # Treat missing 'b' as "unchanged" to avoid false release->press edges.
-        if "b" in buttons:
-            button_b = bool(buttons.get('b', False))  # Right B button
-        else:
-            button_b = prev_button_b
 
         prev_right_snapshot = self.prev_states.get('right_buttons_snapshot', {})
         if buttons != prev_right_snapshot:
             logger.debug(f"🎮 RIGHT raw buttons: {buttons}")
 
-        # Requested mapping:
-        #   - RIGHT B button -> finish episode early (save and continue to next episode)
-        # Debounce: ignore repeated edges within a short window to prevent episode spillover.
-        now = time.monotonic()
-        last_ts = float(self.prev_states.get("right_b_last_press_ts", 0.0) or 0.0)
-        cooldown_s = 0.5
+        # Some packets can omit button fields entirely (e.g. {}); guard_missing
+        # treats those as "unchanged" rather than "released" to avoid false
+        # release->press edges, and the cooldown debounces noisy double-fires.
+        self._process_button(
+            "right",
+            "b",
+            bool(buttons.get('b', False)),
+            "right_button_b",
+            ts_key="right_b_last_press_ts",
+            guard_missing=True,
+            raw_buttons=buttons,
+        )
+        self._process_button(
+            "right",
+            "a",
+            bool(buttons.get('a', False)),
+            "right_button_a",
+            ts_key="right_a_last_press_ts",
+            guard_missing=True,
+            raw_buttons=buttons,
+        )
+        self._process_button(
+            "right",
+            "thumbstick",
+            bool(buttons.get('thumbstick', False)),
+            "right_button_thumbstick",
+            ts_key="right_thumbstick_last_press_ts",
+            guard_missing=True,
+            raw_buttons=buttons,
+        )
 
-        if button_b and (not prev_button_b) and (now - last_ts) > cooldown_s:
-            logger.info("🎮 VR RIGHT B button pressed -> Finish episode early")
-            self.events["exit_early"] = True
-            self.prev_states["right_b_last_press_ts"] = now
-
-        # Only overwrite the stored state when the packet explicitly contained 'b',
-        # otherwise keep previous to avoid flapping on {} packets.
-        if "b" in buttons:
-            self.prev_states['right_button_b'] = button_b
         self.prev_states['right_buttons_snapshot'] = buttons
-    
+
     def reset_events(self):
         """Reset all event status"""
         for key in self.events:
@@ -1578,30 +1767,59 @@ class VREventHandler:
         """Get current event status"""
         return self.events.copy()
     
+    # Human-readable labels for the printed guide, kept separate from the
+    # semantic action names used internally / in ``button_map``.
+    _SEMANTIC_LABELS = {
+        "rerecord_episode": "Restart (re-record) current episode",
+        "exit_early": "Finish episode early (save & next)",
+        "stop_session": "Stop recording / session",
+        "reset_position": "Reset robot to rest pose",
+        "toggle_intervention": "Toggle intervention ON/OFF (DAgger handover)",
+        "upload_dataset": "Upload dataset to Hub on demand",
+    }
+    _BUTTON_LABELS = {
+        "left.x": "LEFT X button",
+        "left.y": "LEFT Y button",
+        "left.menu": "LEFT Menu button",
+        "left.thumbstick": "LEFT Thumbstick click",
+        "right.a": "RIGHT A button",
+        "right.b": "RIGHT B button",
+        "right.thumbstick": "RIGHT Thumbstick click",
+    }
+
     def print_control_guide(self):
-        """Print VR control guide"""
-        guide = """
-        ╔══════════════════════════════════════════════════════════════╗
-        ║          🎮 XLerobot VR Control Guide 🎮                    ║
-        ╠══════════════════════════════════════════════════════════════╣
-        ║  ARM CONTROL (Both controllers):                             ║
-        ║  ├─ Grip button: Hold to control arm position                ║
-        ║  ├─ Trigger: Gripper open (squeeze) / closed (release)       ║
-        ║  └─ Move controller: Control arm position & wrist rotation   ║
-        ╠══════════════════════════════════════════════════════════════╣
-        ║  BASE CONTROL (Thumbsticks - works anytime):                 ║
-        ║  ├─ RIGHT thumbstick ↑↓: Forward / Backward                   ║
-        ║  ├─ RIGHT thumbstick ←→: Left / Right lateral                 ║
-        ║  └─ LEFT thumbstick ←→: Rotate left / Rotate right           ║
-        ╠══════════════════════════════════════════════════════════════╣
-        ║  LIFT AXIS (if enabled on robot):                            ║
-        ║  └─ LEFT thumbstick ↑↓: Lift up / Lift down                 ║
-        ╠══════════════════════════════════════════════════════════════╣
-        ║  EPISODE CONTROL (Buttons only):                             ║
-        ║  ├─ LEFT X/Y button: Restart (re-record) current episode     ║
-        ║  ├─ RIGHT B button: Finish episode early (save & next)        ║
-        ║  ├─ LEFT Menu button: Stop recording                          ║
-        ║  └─ LEFT Thumbstick click: Reset robot                        ║
-        ╚══════════════════════════════════════════════════════════════╝
+        """Print VR control guide.
+
+        The session/DAgger button section reflects the live ``button_map`` (so a
+        remapped ``--teleop.button_map`` shows up here too); motion bindings are
+        fixed and always shown as-is.
+        """
+        button_lines = "\n".join(
+            f"          - {self._BUTTON_LABELS.get(key, key)}: "
+            f"{self._SEMANTIC_LABELS.get(action, action)}"
+            for key, action in self.button_map.items()
+        )
+        guide = f"""
+        ================== XLerobot VR Control Guide ==================
+        ARM CONTROL (Both controllers):
+          - Grip button: Hold to control arm position
+          - Trigger: Gripper open (squeeze) / closed (release)
+          - Move controller: Control arm position & wrist rotation
+        -----------------------------------------------------------------
+        BASE CONTROL (Thumbsticks - works anytime):
+          - RIGHT thumbstick up/down: Forward / Backward
+          - RIGHT thumbstick left/right: Left / Right lateral
+          - LEFT thumbstick left/right: Rotate left / Rotate right
+        -----------------------------------------------------------------
+        LIFT AXIS (if enabled on robot):
+          - LEFT thumbstick up/down: Lift up / Lift down
+        -----------------------------------------------------------------
+        SESSION / DAGGER CONTROL (from button_map; override via
+        --teleop.button_map to remap without touching motion bindings):
+{button_lines}
+          When "toggle_intervention" is ON: VR controls the robot, the policy
+          is paused, and frames are recorded as interventions. OFF hands
+          control back to the policy.
+        ===================================================================
         """
         logger.info(guide)

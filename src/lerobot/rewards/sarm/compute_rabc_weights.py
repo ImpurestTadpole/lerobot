@@ -805,8 +805,8 @@ Examples:
     parser.add_argument(
         "--output-dir",
         type=str,
-        default="./sarm_viz",
-        help="Output directory for visualizations (default: ./sarm_viz)",
+        default="outputs/sarm_viz",
+        help="Output directory for visualizations (default: outputs/sarm_viz)",
     )
     parser.add_argument(
         "--push-to-hub",

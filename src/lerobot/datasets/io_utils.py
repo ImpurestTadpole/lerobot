@@ -20,6 +20,7 @@ import datasets
 import numpy as np
 import pandas
 import pandas as pd
+import pyarrow as pa
 import pyarrow.dataset as pa_ds
 import pyarrow.parquet as pq
 import torch
@@ -153,7 +154,7 @@ def cast_stats_to_numpy(stats: dict) -> dict[str, dict[str, np.ndarray]]:
     Returns:
         dict: The statistics dictionary with values cast to numpy arrays.
     """
-    stats = {key: np.array(value) for key, value in flatten_dict(stats).items()}
+    stats = {key: np.atleast_1d(np.array(value)) for key, value in flatten_dict(stats).items()}
     return unflatten_dict(stats)
 
 
@@ -209,21 +210,7 @@ def write_episodes(episodes: Dataset, local_dir: Path) -> None:
 
 
 def load_episodes(local_dir: Path) -> datasets.Dataset:
-    """Load ``meta/episodes`` shards into one Dataset.
-
-    Pandas concat avoids HF ``from_parquet`` multi-file schema merge failures when one shard
-    has all-null subtask columns and another has ``list<string>`` (e.g. after SARM writes).
-    """
-    ep_dir = local_dir / EPISODES_DIR
-    paths = sorted(ep_dir.glob("*/*.parquet"))
-    if len(paths) == 0:
-        raise FileNotFoundError(f"Provided directory does not contain any parquet file: {ep_dir}")
-    dfs = [pd.read_parquet(p) for p in paths]
-    df = pd.concat(dfs, ignore_index=True)
-    if "episode_index" in df.columns:
-        df = df.sort_values("episode_index", kind="mergesort").reset_index(drop=True)
-    with SuppressProgressBars():
-        episodes = Dataset.from_pandas(df, preserve_index=False)
+    episodes = load_nested_dataset(local_dir / EPISODES_DIR)
     # Select episode features/columns containing references to episode data and videos
     # (e.g. tasks, dataset_from_index, dataset_to_index, data/chunk_index, data/file_index, etc.)
     # This is to speedup access to these data, instead of having to load episode stats.
@@ -239,38 +226,55 @@ def load_image_as_numpy(
     Args:
         fpath (str | Path): Path to the image file.
         dtype (np.dtype): The desired data type of the output array. If floating,
-            pixels are scaled to [0, 1].
+            pixels are scaled to [0, 1]. Only used for RGB images.
         channel_first (bool): If True, converts the image to (C, H, W) format.
             Otherwise, it remains in (H, W, C) format.
 
     Returns:
         np.ndarray: The image as a numpy array.
     """
-    img = PILImage.open(fpath).convert("RGB")
-    img_array = np.array(img, dtype=dtype)
+    is_depth = fpath.endswith(".tiff") or fpath.endswith(".tif")
+    if is_depth:
+        # Preserve the native depth dtype (uint16 -> "I;16", float32 -> "F").
+        img = PILImage.open(fpath)
+        img_array = np.array(img)
+    else:
+        img = PILImage.open(fpath).convert("RGB")
+        img_array = np.array(img, dtype=dtype)
+        if np.issubdtype(dtype, np.floating):
+            img_array /= 255.0
     if channel_first:  # (H, W, C) -> (C, H, W)
-        img_array = np.transpose(img_array, (2, 0, 1))
-    if np.issubdtype(dtype, np.floating):
-        img_array /= 255.0
+        img_array = img_array[np.newaxis, ...] if img_array.ndim == 2 else np.transpose(img_array, (2, 0, 1))
     return img_array
 
 
-def hf_transform_to_torch(
-    items_dict: dict[str, list[Any]], features: dict | None = None
-) -> dict[str, list[torch.Tensor | str]]:
+# PIL modes for 16-bit unsigned depth maps.
+UINT16_PIL_MODES = {"I;16", "I;16B", "I;16L"}
+
+
+def pil_to_chw_tensor(img: PILImage.Image) -> torch.Tensor:
+    """Convert a PIL image to a channel-first tensor.
+
+    ``uint16`` depth maps become ``float32 (1, H, W)`` in native units (``ToTensor``
+    would overflow them to ``int16``); all other modes use the standard ``ToTensor`` path.
+    """
+    if img.mode in UINT16_PIL_MODES:
+        return torch.from_numpy(np.array(img, dtype=np.float32))[None, ...]
+    return transforms.ToTensor()(img)
+
+
+def hf_transform_to_torch(items_dict: dict[str, list[Any]]) -> dict[str, list[torch.Tensor | str]]:
     """Convert a batch from a Hugging Face dataset to torch tensors.
 
     This transform function converts items from Hugging Face dataset format (pyarrow)
-    to torch tensors. Importantly, images are converted from PIL objects (H, W, C, uint8)
-    to a torch image representation (C, H, W, float32) in the range [0, 1]. Depth images
-    are converted from uint16 (mm) to float32 (meters) when features identifies them as
-    dtype "depth". Other types are converted to torch.tensor.
+    to torch tensors. RGB images are converted from PIL objects (H, W, C, uint8)
+    to a torch image representation (C, H, W, float32) in the range [0, 1]. Depth
+    maps are returned as float32 (1, H, W) in their native units. Other
+    types are converted to torch.tensor.
 
     Args:
         items_dict (dict): A dictionary representing a batch of data from a
             Hugging Face dataset.
-        features (dict | None): Optional features dictionary to identify depth images.
-            If provided, depth images will be converted to meters instead of [0, 1].
 
     Returns:
         dict: The batch with items converted to torch tensors.
@@ -280,15 +284,7 @@ def hf_transform_to_torch(
             continue
         first_item = items_dict[key][0]
         if isinstance(first_item, PILImage.Image):
-            is_depth = features is not None and features.get(key, {}).get("dtype") == "depth"
-            if is_depth:
-                items_dict[key] = [
-                    torch.from_numpy(np.array(img, dtype=np.float32)).unsqueeze(0) / 1000.0
-                    for img in items_dict[key]
-                ]
-            else:
-                to_tensor = transforms.ToTensor()
-                items_dict[key] = [to_tensor(img) for img in items_dict[key]]
+            items_dict[key] = [pil_to_chw_tensor(img) for img in items_dict[key]]
         elif first_item is None or isinstance(first_item, dict):
             pass
         else:
@@ -296,21 +292,49 @@ def hf_transform_to_torch(
     return items_dict
 
 
+def write_table_one_row_group_per_episode(table: pa.Table, path: Path) -> None:
+    """Write ``table`` with one parquet row group per episode (in episode order).
+
+    Keeps shards random-access friendly (``read_row_group(i)`` fetches episode i),
+    mirroring the recording writer. ``table`` must carry a contiguous
+    ``episode_index`` column.
+    """
+    episode_index = table.column("episode_index").to_numpy(zero_copy_only=False)
+    starts = np.concatenate(([0], np.nonzero(np.diff(episode_index))[0] + 1))
+    writer = pq.ParquetWriter(str(path), table.schema, compression="snappy", use_dictionary=True)
+    try:
+        for start, stop in zip(starts, np.append(starts[1:], len(episode_index)), strict=True):
+            writer.write_table(table.slice(start, stop - start))  # one episode -> one row group
+    finally:
+        writer.close()
+
+
 def to_parquet_with_hf_images(
     df: pandas.DataFrame, path: Path, features: datasets.Features | None = None
 ) -> None:
-    """This function correctly writes to parquet a panda DataFrame that contains images encoded by HF dataset.
-    This way, it can be loaded by HF dataset and correctly formatted images are returned.
+    """Write a DataFrame with HF-encoded images to parquet, one row group per episode.
 
-    Args:
-        df: DataFrame to write to parquet.
-        path: Path to write the parquet file.
-        features: Optional HuggingFace Features schema. If provided, ensures image columns
-                  are properly typed as Image() in the parquet schema.
+    Images are embedded into the arrow table first (``ParquetWriter.write_table``
+    does not embed external image files like ``Dataset.to_parquet`` does).
+    ``features`` types image columns as ``Image()`` in the parquet schema.
     """
-    # TODO(qlhoest): replace this weird synthax by `df.to_parquet(path)` only
     ds = datasets.Dataset.from_dict(df.to_dict(orient="list"), features=features)
-    ds.to_parquet(path)
+    ds = embed_images(ds)
+    table = ds.with_format("arrow")[:]
+    if "episode_index" in table.column_names:
+        write_table_one_row_group_per_episode(table, path)
+    else:
+        # No episode boundaries to align row groups to — keep a single write.
+        pq.write_table(table, str(path))
+
+
+def to_parquet_one_row_group_per_episode(df: pandas.DataFrame, path: Path) -> None:
+    """Write a (non-image) DataFrame to parquet with one row group per episode."""
+    table = pa.Table.from_pandas(df, preserve_index=False)
+    if "episode_index" in table.column_names:
+        write_table_one_row_group_per_episode(table, path)
+    else:
+        pq.write_table(table, str(path))
 
 
 def item_to_torch(item: dict) -> dict:
@@ -326,7 +350,11 @@ def item_to_torch(item: dict) -> dict:
     """
     skip_keys = {"task", *LANGUAGE_COLUMNS}
     for key, val in item.items():
-        if isinstance(val, (np.ndarray | list)) and key not in skip_keys:
+        if key in skip_keys:
+            continue
+        if isinstance(val, PILImage.Image):
+            item[key] = pil_to_chw_tensor(val)
+        elif isinstance(val, (np.ndarray | list)):
             # Convert numpy arrays and lists to torch tensors
             item[key] = torch.tensor(val)
     return item

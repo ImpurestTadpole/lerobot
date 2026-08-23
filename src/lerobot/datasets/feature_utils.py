@@ -14,13 +14,14 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 import logging
+from copy import deepcopy
 from pprint import pformat
 
 import datasets
 import numpy as np
 from PIL import Image as PILImage
 
-from lerobot.configs import VIDEO_ENCODER_INFO_KEYS
+from lerobot.configs import VIDEO_ENCODER_INFO_KEYS, is_depth_map
 from lerobot.utils.constants import DEFAULT_FEATURES
 from lerobot.utils.utils import is_valid_numpy_dtype_string
 
@@ -63,9 +64,6 @@ def get_hf_features_from_features(features: dict) -> datasets.Features:
         elif ft["dtype"] == "video":
             continue
         elif ft["dtype"] == "image":
-            hf_features[key] = datasets.Image()
-        elif ft["dtype"] == "depth":
-            # Parquet uses Image{bytes,path} like RGB; HF has no scalar "depth" dtype.
             hf_features[key] = datasets.Image()
         elif ft["shape"] == (1,):
             hf_features[key] = datasets.Value(dtype=ft["dtype"])
@@ -125,23 +123,44 @@ def create_empty_dataset_info(
     )
 
 
+def canonicalize_depth_marker(feature: dict) -> None:
+    """Fold a feature's legacy depth marker into the canonical ``info['is_depth_map']``.
+
+    Depth maps can be flagged in three ways across dataset versions: the canonical
+    ``feature['info']['is_depth_map']``, the legacy ``feature['info']['video.is_depth_map']``,
+    or a legacy ``feature['video_info']['video.is_depth_map']`` in a separate dict. This mutates
+    ``feature`` in place, dropping the legacy keys.
+    """
+    info = feature.get("info") or {}
+    feature["info"] = info
+    video_info = feature.get("video_info")
+    depth = is_depth_map(feature)
+    info.pop("video.is_depth_map", None)
+    if isinstance(video_info, dict):
+        video_info.pop("video.is_depth_map", None)
+    if not video_info:
+        feature.pop("video_info", None)
+    info["is_depth_map"] = depth
+
+
 def features_equal_for_merge(features_a: dict[str, dict], features_b: dict[str, dict]) -> bool:
     """Return whether two LeRobotDatasetMetadata ``features`` dicts are compatible for aggregation.
 
     For video features, keys under ``info`` related to video encoding parameters are ignored during
-    comparison as they do not prevent aggregation.
+    comparison as they do not prevent aggregation. The legacy depth marker (``video.is_depth_map``,
+    in ``info`` or a separate ``video_info`` dict) is canonicalized so datasets that only differ in
+    how they flag depth remain mergeable.
     """
 
-    def _without_encoder_info_keys(feature: dict) -> dict:
-        filtered = dict(feature)
-        filtered_info = filtered.get("info")
-        if isinstance(filtered_info, dict):
-            filtered["info"] = {
-                info_key: info_value
-                for info_key, info_value in filtered_info.items()
-                if info_key not in VIDEO_ENCODER_INFO_KEYS
-            }
-        return filtered
+    def _normalized(feature: dict) -> dict:
+        normalized = deepcopy(feature)
+        canonicalize_depth_marker(normalized)
+        normalized["info"] = {
+            info_key: info_value
+            for info_key, info_value in normalized["info"].items()
+            if info_key not in VIDEO_ENCODER_INFO_KEYS
+        }
+        return normalized
 
     if set(features_a) != set(features_b):
         return False
@@ -150,12 +169,7 @@ def features_equal_for_merge(features_a: dict[str, dict], features_b: dict[str, 
         fb_key = features_b[key]
         if fa_key.get("dtype") != fb_key.get("dtype"):
             return False
-        if fa_key.get("dtype") != "video":
-            if fa_key != fb_key:
-                return False
-            continue
-
-        if _without_encoder_info_keys(fa_key) != _without_encoder_info_keys(fb_key):
+        if _normalized(fa_key) != _normalized(fb_key):
             return False
     return True
 
@@ -290,8 +304,8 @@ def validate_feature_dtype_and_shape(
     expected_shape = feature["shape"]
     if is_valid_numpy_dtype_string(expected_dtype):
         return validate_feature_numpy_array(name, expected_dtype, expected_shape, value)
-    elif expected_dtype in ["image", "video", "depth"]:
-        return validate_feature_image_or_video(name, expected_shape, value, feature=feature)
+    elif expected_dtype in ["image", "video"]:
+        return validate_feature_image_or_video(name, expected_shape, value)
     elif expected_dtype == "string":
         return validate_feature_string(name, value)
     elif expected_dtype == "language":
@@ -331,10 +345,7 @@ def validate_feature_numpy_array(
 
 
 def validate_feature_image_or_video(
-    name: str,
-    expected_shape: list[int] | tuple[int, ...],
-    value: np.ndarray | PILImage.Image,
-    feature: dict | None = None,
+    name: str, expected_shape: list[str], value: np.ndarray | PILImage.Image
 ) -> str:
     """Validate a feature that is expected to be an image or video frame.
 
@@ -342,12 +353,8 @@ def validate_feature_image_or_video(
 
     Args:
         name (str): The name of the feature.
-        expected_shape: Expected spatial layout depends on ``feature["names"]`` when set:
-            ``["channel", "height", "width"]`` → (C, H, W);
-            ``["height", "width", "channel"]`` or ``["height", "width", "channels"]`` → (H, W, C).
-            If *feature* is omitted, (C, H, W) is assumed (backward compatible).
+        expected_shape (list[str]): The expected shape, e.g. (C, H, W) or (H, W, C).
         value: The image data to validate.
-        feature: Optional LeRobot feature dict (uses ``names`` for layout).
 
     Returns:
         str: An error message if validation fails, otherwise an empty string.
@@ -356,18 +363,9 @@ def validate_feature_image_or_video(
     error_message = ""
     if isinstance(value, np.ndarray):
         actual_shape = value.shape
-        names = list(feature.get("names", [])) if feature else []
-        if names in (["height", "width", "channels"], ["height", "width", "channel"]):
-            h, w, c = (int(expected_shape[0]), int(expected_shape[1]), int(expected_shape[2]))
-            chw, hwc = (c, h, w), (h, w, c)
-        else:
-            c, h, w = (int(expected_shape[0]), int(expected_shape[1]), int(expected_shape[2]))
-            chw, hwc = (c, h, w), (h, w, c)
-        if len(actual_shape) != 3 or (actual_shape != chw and actual_shape != hwc):
-            error_message += (
-                f"The feature '{name}' of shape '{actual_shape}' does not have the expected shape "
-                f"'{chw}' or '{hwc}'.\n"
-            )
+        c, h, w = expected_shape
+        if len(actual_shape) != 3 or (actual_shape != (c, h, w) and actual_shape != (h, w, c)):
+            error_message += f"The feature '{name}' of shape '{actual_shape}' does not have the expected shape '{(c, h, w)}' or '{(h, w, c)}'.\n"
     elif isinstance(value, PILImage.Image):
         pass
     else:

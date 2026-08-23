@@ -52,8 +52,8 @@ are merged in-place from their cache root. Use ``--realign-all-sources`` to alwa
 via ``_align_tmp_*``.
 
 **Note:** uploading **training checkpoints** (policies) is separate — use
-``--policy.push_to_hub`` in ``lerobot-train`` or ``upload_checkpoints.py`` in the repo
-root; this script only handles **datasets** (``repo_type="dataset"``).
+``--policy.push_to_hub`` in ``lerobot-train`` or ``python -m lerobot.upload_checkpoints``;
+this script only handles **datasets** (``repo_type="dataset"``).
 
 Usage (CLI):
     python src/lerobot/data_processing/co_training_utils.py \\
@@ -111,6 +111,7 @@ from tqdm import tqdm
 from lerobot.datasets.aggregate import aggregate_datasets
 from huggingface_hub.errors import RepositoryNotFoundError
 
+from lerobot.datasets.io_utils import load_stats, write_stats
 from lerobot.datasets.lerobot_dataset import LeRobotDataset, LeRobotDatasetMetadata
 from lerobot.datasets.utils import DEFAULT_TASKS_PATH
 from lerobot.datasets.video_utils import FrameTimestampError
@@ -143,12 +144,16 @@ def _compute_resample_indices(src_fps: int, target_fps: int, n_src_frames: int) 
     return [min(round(k * src_fps / target_fps), n_src_frames - 1) for k in range(n_target)]
 
 
-def _pad_vector(vec: np.ndarray, target_dim: int) -> np.ndarray:
-    """Resize *vec* along its last axis to *target_dim* (truncate or zero-pad).
+def _pad_vector(
+    vec: np.ndarray, target_dim: int, fill_values: np.ndarray | None = None
+) -> np.ndarray:
+    """Resize *vec* along its last axis to *target_dim* (truncate or pad).
 
-    If the source is longer (e.g. an extra ``gantry.vel``), keeps the leading
-    *target_dim* components — prefer :func:`_remap_vector_by_names` when metadata
-    lists ``names`` so the correct components are kept.
+    Padded components take *fill_values* (a length-*target_dim* vector) when
+    given, else 0. If the source is longer (e.g. an extra ``gantry.vel``),
+    keeps the leading *target_dim* components — prefer
+    :func:`_remap_vector_by_names` when metadata lists ``names`` so the correct
+    components are kept.
     """
     vec = np.asarray(vec, dtype=np.float32)
     current_dim = int(vec.shape[-1])
@@ -157,33 +162,149 @@ def _pad_vector(vec: np.ndarray, target_dim: int) -> np.ndarray:
     if current_dim == target_dim:
         return vec.copy()
     pad_width = [(0, 0)] * (vec.ndim - 1) + [(0, target_dim - current_dim)]
-    return np.pad(vec, pad_width, mode="constant", constant_values=0.0)
+    out = np.pad(vec, pad_width, mode="constant", constant_values=0.0)
+    if fill_values is not None and vec.ndim == 1:
+        out[current_dim:] = np.asarray(fill_values, dtype=np.float32)[current_dim:]
+    return out
 
 
 def _remap_vector_by_names(
     vec: np.ndarray,
     src_names: list[str] | None,
     ref_names: list[str],
+    fill_values: np.ndarray | None = None,
 ) -> np.ndarray:
     """Build a *len(ref_names)* vector by copying each ``ref_names[i]`` from *src_names*.
 
-    Drops source-only components (e.g. ``gantry.vel`` when the reference schema
-    stops at ``gantry.height_mm``). Falls back to :func:`_pad_vector` if
-    *src_names* is missing or its length does not match *vec*.
+    Components absent from *src_names* take *fill_values* (a length-
+    ``len(ref_names)`` vector) when given, else 0. Drops source-only components
+    (e.g. ``gantry.vel`` when the reference schema stops at
+    ``gantry.height_mm``). Falls back to :func:`_pad_vector` if *src_names* is
+    missing or its length does not match *vec*.
     """
     vec = np.asarray(vec, dtype=np.float32).reshape(-1)
     if src_names is None or len(src_names) != len(vec):
-        return _pad_vector(vec, len(ref_names))
+        return _pad_vector(vec, len(ref_names), fill_values=fill_values)
     by_name: dict[str, int] = {}
     for i, n in enumerate(src_names):
         if n not in by_name:
             by_name[n] = i
-    out = np.zeros(len(ref_names), dtype=np.float32)
+    if fill_values is not None:
+        out = np.asarray(fill_values, dtype=np.float32).copy()
+    else:
+        out = np.zeros(len(ref_names), dtype=np.float32)
     for i, name in enumerate(ref_names):
         j = by_name.get(name)
         if j is not None:
             out[i] = vec[j]
     return out
+
+
+# ---------------------------------------------------------------------------
+# Padding fill policies (see COTRAINING.md — co-training bias mitigation)
+# ---------------------------------------------------------------------------
+
+PAD_FILL_MODES = ("zero", "ref-mean", "state-copy")
+
+# Camera-key reconciliation policies for multi-source merges. "intersection"
+# (default, legacy behaviour) requires every source to provide every
+# canonical camera; a source missing one causes an error. "zero" instead
+# black-frame-fills any canonical camera a source doesn't natively have
+# (e.g. a single-arm robot merged with dual-arm robots that have a
+# right-wrist camera it structurally cannot provide).
+CAMERA_FILL_MODES = ("intersection", "zero")
+
+# Joint-name tokens that denote velocity dims; for those, 0 is semantically
+# correct ("stopped") and is kept in every fill mode.
+_VEL_NAME_TOKENS = (".vel", "_vel", "velocity")
+
+
+def _is_velocity_name(name: str) -> bool:
+    return any(tok in name for tok in _VEL_NAME_TOKENS)
+
+
+def _missing_dims(src_names: list[str] | None, src_dim: int, ref_names: list[str]) -> list[int]:
+    """Indices of *ref_names* that a source cannot provide (they get filled).
+
+    Without usable source names, alignment falls back to positional padding,
+    so the missing dims are the tail beyond the source vector length.
+    """
+    if src_names is None or len(src_names) != src_dim:
+        return list(range(min(src_dim, len(ref_names)), len(ref_names)))
+    src = set(src_names)
+    return [i for i, n in enumerate(ref_names) if n not in src]
+
+
+def _reference_fill_values(
+    ref_stats: dict[str, Any] | None,
+    feature_key: str,
+    ref_names: list[str],
+    pad_fill_mode: str,
+) -> np.ndarray:
+    """Fill vector for padded dims: reference per-dim mean, except velocity dims → 0.
+
+    Filling with the reference dataset's mean keeps the merged normalization
+    stats centred on the real joint distribution instead of dragging them
+    toward 0 (which can put the robot's true home/extreme positions far in the
+    normalized tails). Returns zeros for ``pad_fill_mode="zero"`` or when
+    reference stats are unavailable.
+    """
+    fill = np.zeros(len(ref_names), dtype=np.float32)
+    if pad_fill_mode == "zero" or ref_stats is None:
+        return fill
+    mean = (ref_stats.get(feature_key) or {}).get("mean")
+    if mean is None:
+        logger.warning(
+            "pad-fill-mode=%s: reference stats have no mean for %s; padded dims fall back to 0.",
+            pad_fill_mode, feature_key,
+        )
+        return fill
+    mean = np.asarray(mean, dtype=np.float32).reshape(-1)
+    if len(mean) != len(ref_names):
+        logger.warning(
+            "pad-fill-mode=%s: reference %s mean has %d dims, expected %d; padded dims fall back to 0.",
+            pad_fill_mode, feature_key, len(mean), len(ref_names),
+        )
+        return fill
+    for i, name in enumerate(ref_names):
+        if not _is_velocity_name(name):
+            fill[i] = mean[i]
+    return fill
+
+
+def _load_reference_stats(
+    repo_id: str, root: Path | str | None
+) -> dict[str, Any] | None:
+    """Per-feature stats (mean/std/min/max arrays) of the reference dataset."""
+    root_path = Path(root).expanduser() if root else None
+    meta = LeRobotDatasetMetadata(repo_id, root=root_path)
+    stats = meta.stats
+    if not stats:
+        logger.warning("Reference dataset %s has no stats; fill/override falls back to 0/no-op.", repo_id)
+        return None
+    return stats
+
+
+_ALIGN_OPTIONS_FILENAME = "cotrain_align_options.json"
+
+
+def _write_align_options(aligned_root: Path, pad_fill_mode: str) -> None:
+    opts_path = aligned_root / "meta" / _ALIGN_OPTIONS_FILENAME
+    opts_path.parent.mkdir(parents=True, exist_ok=True)
+    with open(opts_path, "w", encoding="utf-8") as f:
+        json.dump({"pad_fill_mode": pad_fill_mode}, f, indent=2)
+
+
+def _cached_pad_fill_mode(meta_dir: Path) -> str:
+    """Fill mode a cached aligned dataset was written with (pre-existing caches → zero)."""
+    opts_path = meta_dir / _ALIGN_OPTIONS_FILENAME
+    if not opts_path.is_file():
+        return "zero"
+    try:
+        with open(opts_path, encoding="utf-8") as f:
+            return json.load(f).get("pad_fill_mode", "zero")
+    except (json.JSONDecodeError, OSError):
+        return "zero"
 
 
 def _ensure_image_hwc_numpy(
@@ -318,16 +439,36 @@ def _alignment_artifacts_match(
     info_json: Path,
     target_features: dict[str, Any],
     effective_fps: int,
+    pad_fill_mode: str = "zero",
+    expected_total_episodes: int | None = None,
 ) -> bool:
-    """True if *info_json* matches the schema we would write with *target_features*."""
+    """True if *info_json* matches the schema we would write with *target_features*.
+
+    *expected_total_episodes*, when given, must equal the cached
+    ``total_episodes`` — schema alone (fps/names/camera shapes) can match a
+    dataset that was only *partially* written (e.g. the process was killed
+    mid-alignment): ``info.json``/``tasks.parquet`` are updated after every
+    single episode (see ``LeRobotDatasetMetadata.save_episode``), so a
+    50-of-95,658-episode partial run looks schema-valid without this check,
+    and would otherwise be silently accepted as "already aligned," truncating
+    that source in the merge with no error. Pass the source's real
+    ``total_episodes`` to catch this; omit only for callers that don't have
+    it (legacy behaviour).
+    """
     if not info_json.is_file():
         return False
     tasks_parquet = info_json.parent / Path(DEFAULT_TASKS_PATH).name
     if not tasks_parquet.is_file():
         return False
+    if _cached_pad_fill_mode(info_json.parent) != pad_fill_mode:
+        return False
     with open(info_json, encoding="utf-8") as f:
         cached = json.load(f)
     if int(cached.get("fps", -1)) != int(effective_fps):
+        return False
+    if expected_total_episodes is not None and int(cached.get("total_episodes", -1)) != int(
+        expected_total_episodes
+    ):
         return False
     cf = cached.get("features") or {}
     for key in ("observation.state", "action"):
@@ -601,6 +742,8 @@ def align_single_dataset(
     force_rebuild: bool = False,
     canonical_visual: dict[str, Any] | None = None,
     forced_effective_fps: int | None = None,
+    pad_fill_mode: str = "zero",
+    camera_fill_mode: str = "intersection",
 ) -> Path:
     """Download *source_repo* and write a feature-aligned copy to *output_root*.
 
@@ -619,8 +762,40 @@ def align_single_dataset(
     *canonical_visual* / *forced_effective_fps* are used by multi-source merge to
     force one shared schema across shards.
 
+    *pad_fill_mode* controls the values written into state/action dims the
+    source cannot provide (see ``PAD_FILL_MODES``):
+
+    - ``"zero"``      — constant 0 (legacy behaviour).
+    - ``"ref-mean"``  — the reference dataset's per-dim mean (velocity dims
+      stay 0), so padded dims sit at the centre of the real distribution
+      instead of dragging normalization stats toward 0.
+    - ``"state-copy"``— like ``ref-mean``, but each padded non-velocity
+      *action* dim copies the aligned *state* value of the same joint name
+      ("hold position" identity action) when that name exists in the state
+      schema.
+
+    Non-zero modes require *match_features_from* (the reference supplies the
+    joint names and stats).
+
+    *camera_fill_mode* controls what happens when this source has no native
+    equivalent for one of the canonical (post-remap) camera keys: ``"zero"``
+    writes an all-black frame of the target shape for every frame of every
+    episode; ``"intersection"`` (default) raises, since normally the caller
+    already restricted the canonical camera set to keys every source has.
+
     Returns the path to the aligned dataset root.
     """
+    if pad_fill_mode not in PAD_FILL_MODES:
+        raise ValueError(f"pad_fill_mode must be one of {PAD_FILL_MODES}, got {pad_fill_mode!r}")
+    if pad_fill_mode != "zero" and match_features_from is None:
+        raise ValueError(
+            f"pad_fill_mode={pad_fill_mode!r} needs --match-features-from (reference names + stats)."
+        )
+    if camera_fill_mode not in CAMERA_FILL_MODES:
+        raise ValueError(
+            f"camera_fill_mode must be one of {CAMERA_FILL_MODES}, got {camera_fill_mode!r}"
+        )
+
     logger.info("Loading source dataset: %s", source_repo)
     src_ds = LeRobotDataset(source_repo)
     src_fps = src_ds.meta.fps
@@ -638,6 +813,30 @@ def align_single_dataset(
         logger.info(
             "Copying state/action joint names from reference dataset %s",
             match_features_from,
+        )
+
+    # Fill vectors for padded state/action dims (zeros for pad_fill_mode="zero").
+    state_fill: np.ndarray | None = None
+    action_fill: np.ndarray | None = None
+    action_state_copy: list[tuple[int, int]] = []  # (action_dim, state_dim) pairs
+    if pad_fill_mode != "zero" and state_names is not None and action_names is not None:
+        ref_stats = _load_reference_stats(match_features_from, match_features_root)
+        state_fill = _reference_fill_values(
+            ref_stats, "observation.state", state_names, pad_fill_mode
+        )
+        action_fill = _reference_fill_values(ref_stats, "action", action_names, pad_fill_mode)
+        if pad_fill_mode == "state-copy":
+            src_ac_names = (src_meta.features.get("action") or {}).get("names")
+            src_ac_dim = int(src_meta.features["action"]["shape"][0])
+            state_pos = {n: i for i, n in enumerate(state_names)}
+            for i in _missing_dims(src_ac_names, src_ac_dim, action_names):
+                name = action_names[i]
+                if not _is_velocity_name(name) and name in state_pos:
+                    action_state_copy.append((i, state_pos[name]))
+        logger.info(
+            "pad-fill-mode=%s: padded dims take reference means (vel dims stay 0)%s.",
+            pad_fill_mode,
+            f"; {len(action_state_copy)} action dims copy same-name state" if action_state_copy else "",
         )
 
     if forced_effective_fps is not None:
@@ -664,6 +863,21 @@ def align_single_dataset(
         canonical_visual=canonical_visual,
     )
 
+    provided_cam_keys = _remapped_dst_keys_for_meta(src_meta, camera_remap)
+    missing_cam_keys = [k for k in target_cam_keys if k not in provided_cam_keys]
+    if missing_cam_keys:
+        if camera_fill_mode != "zero":
+            raise ValueError(
+                f"{source_repo} does not provide canonical camera key(s) {missing_cam_keys} "
+                "(after --camera-remap). Pass --camera-fill-mode zero to black-frame-fill "
+                "missing cameras, or adjust --camera-remap / --target-camera-keys."
+            )
+        logger.warning(
+            "%s: zero-filling missing camera(s) %s for every frame (source has no equivalent view).",
+            source_repo,
+            missing_cam_keys,
+        )
+
     resize_info = (
         f", images resized to {target_image_size[0]}×{target_image_size[1]}"
         if target_image_size is not None
@@ -688,17 +902,24 @@ def align_single_dataset(
             logger.warning("Force rebuild: removing %s", output_root)
             shutil.rmtree(output_root)
         elif info_json.is_file() and _alignment_artifacts_match(
-            info_json, target_features, effective_fps
+            info_json,
+            target_features,
+            effective_fps,
+            pad_fill_mode,
+            expected_total_episodes=src_meta.total_episodes,
         ):
             logger.info(
-                "Reusing completed aligned dataset at %s (metadata matches options).",
+                "Reusing completed aligned dataset at %s (metadata matches options, "
+                "all %d episodes confirmed present).",
                 output_root,
+                src_meta.total_episodes,
             )
             return output_root
         elif info_json.is_file():
             logger.warning(
-                "Removing stale aligned dataset (options changed, e.g. "
-                "--match-features-from or resolution): %s",
+                "Removing stale or incomplete aligned dataset (options changed, e.g. "
+                "--match-features-from or resolution, OR a prior run was interrupted "
+                "mid-alignment): %s",
                 output_root,
             )
             shutil.rmtree(output_root)
@@ -793,7 +1014,7 @@ def align_single_dataset(
                 src_st_names = src_st.get("names")
                 if state_names is not None:
                     aligned_st = _remap_vector_by_names(
-                        arr, src_st_names, state_names
+                        arr, src_st_names, state_names, fill_values=state_fill
                     )
                 else:
                     aligned_st = _pad_vector(arr.astype(np.float32), target_state_dim)
@@ -806,10 +1027,16 @@ def align_single_dataset(
                 src_ac_names = src_ac.get("names")
                 if action_names is not None:
                     aligned_ac = _remap_vector_by_names(
-                        arr, src_ac_names, action_names
+                        arr, src_ac_names, action_names, fill_values=action_fill
                     )
                 else:
                     aligned_ac = _pad_vector(arr.astype(np.float32), target_action_dim)
+                if action_state_copy:
+                    st = remapped.get("observation.state")
+                    if st is not None:
+                        st_arr = st.numpy() if isinstance(st, torch.Tensor) else np.asarray(st)
+                        for i_ac, i_st in action_state_copy:
+                            aligned_ac[i_ac] = st_arr[i_st]
                 remapped["action"] = torch.from_numpy(aligned_ac)
 
             # Keep only keys that belong to the target feature schema;
@@ -829,6 +1056,13 @@ def align_single_dataset(
                     frame[img_key] = _ensure_depth_chw_numpy(
                         frame[img_key], target_hw=target_image_size
                     )
+            for miss_key in missing_cam_keys:
+                feat = target_features[miss_key]
+                h, w = int(feat["shape"][0]), int(feat["shape"][1])
+                if feat.get("dtype") == "depth":
+                    frame[miss_key] = np.zeros((1, h, w), dtype=np.uint16)
+                else:
+                    frame[miss_key] = np.zeros((h, w, 3), dtype=np.uint8)
             frame["task"] = task_description
 
             aligned_ds.add_frame(frame)
@@ -852,8 +1086,157 @@ def align_single_dataset(
 
     ep_pbar.close()
     aligned_ds.finalize()
+    _write_align_options(output_root, pad_fill_mode)
     logger.info("Aligned dataset written to: %s", output_root)
     return output_root
+
+
+# ---------------------------------------------------------------------------
+# Co-train source manifest + padded-stats override
+# ---------------------------------------------------------------------------
+
+COTRAIN_SOURCES_FILENAME = "cotrain_sources.json"
+
+
+def _episodes_in_root(root: Path) -> int:
+    with open(root / "meta" / "info.json", encoding="utf-8") as f:
+        return int(json.load(f)["total_episodes"])
+
+
+def _write_cotrain_sources_manifest(
+    merged_root: Path,
+    entries: list[dict[str, Any]],
+    reference_repo: str | None,
+    pad_fill_mode: str,
+    state_names: list[str] | None,
+    action_names: list[str] | None,
+) -> Path:
+    """Write ``meta/cotrain_sources.json`` mapping merged episode ranges → sources.
+
+    ``aggregate_datasets()`` concatenates shards in order, so each source owns a
+    contiguous ``[episode_start, episode_end)`` range in the merged dataset.
+    The manifest records which state/action dims were padded per source; it is
+    consumed by the ``source`` sample weighter (down-weight external episodes
+    during training) and by :func:`_override_padded_stats`.
+    """
+    start = 0
+    for e in entries:
+        e["episode_start"] = start
+        e["episode_end"] = start + e.pop("num_episodes")
+        start = e["episode_end"]
+    manifest = {
+        "reference_repo": reference_repo,
+        "pad_fill_mode": pad_fill_mode,
+        "state_names": state_names,
+        "action_names": action_names,
+        "total_episodes": start,
+        "sources": entries,
+    }
+    path = merged_root / "meta" / COTRAIN_SOURCES_FILENAME
+    path.parent.mkdir(parents=True, exist_ok=True)
+    with open(path, "w", encoding="utf-8") as f:
+        json.dump(manifest, f, indent=2)
+    logger.info("Wrote co-train source manifest: %s", path)
+    return path
+
+
+def _override_padded_stats(
+    merged_root: Path,
+    entries: list[dict[str, Any]],
+    reference_repo: str,
+    reference_root: Path | str | None,
+    state_names: list[str],
+    action_names: list[str],
+) -> None:
+    """Overwrite merged stats for padded dims with the reference dataset's stats.
+
+    Padded external data contributes constants to the padded dims, dragging the
+    merged mean/std/min/max away from the robot's real motion range — which
+    normalizes real motion into outliers at train time. This replaces those
+    per-dim entries with stats computed from your own embodiment's data only.
+    """
+    ref_stats = _load_reference_stats(reference_repo, reference_root)
+    if ref_stats is None:
+        logger.warning("--override-padded-stats skipped: reference has no stats.")
+        return
+    merged_stats = load_stats(merged_root)
+    if merged_stats is None:
+        logger.warning("--override-padded-stats skipped: merged dataset has no meta/stats.json.")
+        return
+
+    for feature_key, names, dims_key in (
+        ("observation.state", state_names, "padded_state_dims"),
+        ("action", action_names, "padded_action_dims"),
+    ):
+        padded: set[int] = set()
+        for e in entries:
+            padded.update(e.get(dims_key) or [])
+        if not padded:
+            continue
+        ref_feat = ref_stats.get(feature_key) or {}
+        merged_feat = merged_stats.get(feature_key) or {}
+        overridden: list[str] = []
+        for stat_key in ("mean", "std", "min", "max"):
+            ref_arr = ref_feat.get(stat_key)
+            dst_arr = merged_feat.get(stat_key)
+            if ref_arr is None or dst_arr is None:
+                continue
+            ref_arr = np.asarray(ref_arr, dtype=np.float64).reshape(-1)
+            dst_arr = np.asarray(dst_arr, dtype=np.float64).reshape(-1)
+            if len(ref_arr) != len(names) or len(dst_arr) != len(names):
+                logger.warning(
+                    "--override-padded-stats: %s/%s dim mismatch (ref=%d merged=%d names=%d); skipped.",
+                    feature_key, stat_key, len(ref_arr), len(dst_arr), len(names),
+                )
+                continue
+            for i in sorted(padded):
+                dst_arr[i] = ref_arr[i]
+            merged_feat[stat_key] = dst_arr
+            overridden.append(stat_key)
+        if overridden:
+            logger.info(
+                "Overrode merged %s stats (%s) for padded dims %s with reference %s.",
+                feature_key,
+                "/".join(overridden),
+                [names[i] for i in sorted(padded)],
+                reference_repo,
+            )
+
+    # Camera keys that are entirely zero-filled for some source (see
+    # --camera-fill-mode zero / padded_camera_keys) are a whole-feature-key
+    # problem, not a per-index one: the black frames contribute a whole
+    # constant image to the merged mean/std for that camera key, potentially
+    # dragging it toward black even though most sources have real footage.
+    # This is defensive hardening (see docs/missing_modality_support.md —
+    # VISUAL normalization is IDENTITY by default for pi0.5, so this doesn't
+    # affect current training, but keeps meta/stats.json itself honest for
+    # any future MEAN_STD use or downstream inspection).
+    padded_cam_keys: set[str] = set()
+    for e in entries:
+        padded_cam_keys.update(
+            f"observation.images.{k}" for k in (e.get("padded_camera_keys") or [])
+        )
+    for cam_key in sorted(padded_cam_keys):
+        ref_feat = ref_stats.get(cam_key)
+        merged_feat = merged_stats.get(cam_key)
+        if ref_feat is None or merged_feat is None:
+            logger.warning(
+                "--override-padded-stats: camera key %s missing from reference or merged "
+                "stats; skipped.",
+                cam_key,
+            )
+            continue
+        for stat_key in ("mean", "std", "min", "max"):
+            if stat_key in ref_feat:
+                merged_feat[stat_key] = np.asarray(ref_feat[stat_key], dtype=np.float64)
+        logger.info(
+            "Overrode merged %s stats (mean/std/min/max) with reference %s (zero-filled "
+            "for at least one source).",
+            cam_key,
+            reference_repo,
+        )
+
+    write_stats(merged_stats, merged_root)
 
 
 # ---------------------------------------------------------------------------
@@ -878,6 +1261,12 @@ _DEFAULT_CAMERA_REMAP: dict[str, str] = {
     "rgb_images.front": "head",
     "rgb_images.left": "left_wrist",
     "rgb_images.right": "right_wrist",
+    # DROID (single-arm; exterior_2_left has no canonical slot and is
+    # intentionally left unmapped so it's dropped, not merged in as a
+    # fourth camera key every other source would then need to be
+    # zero-filled for).
+    "wrist_left": "left_wrist",
+    "exterior_1_left": "head",
 }
 
 
@@ -897,6 +1286,10 @@ def align_datasets_for_cotraining(
     force_rebuild: bool = False,
     skip_missing_sources: bool = False,
     realign_all_sources: bool = False,
+    pad_fill_mode: str = "zero",
+    override_padded_stats: bool = False,
+    target_camera_keys: list[str] | None = None,
+    camera_fill_mode: str = "intersection",
 ) -> Path:
     """Align all *source_repos* and merge into one local dataset at *output_root*.
 
@@ -919,14 +1312,47 @@ def align_datasets_for_cotraining(
     If *skip_missing_sources* is True, repos that are missing locally and return
     Hub 404 are logged and skipped; otherwise loading metadata raises immediately.
 
-    When several sources are merged, camera keys are the **intersection** of
-    remapped ``observation.images.*`` keys (so e.g. depth-only streams are dropped
-    unless every dataset has them). Resolution is the minimum H×W across sources
-    unless *target_image_size* is set. All shards share one fps and identical
-    video ``info`` (including codec) so ``aggregate_datasets()`` metadata checks pass.
+    When several sources are merged, camera keys default to the **intersection**
+    of remapped ``observation.images.*`` keys (so e.g. depth-only streams are
+    dropped unless every dataset has them). Resolution is the minimum H×W
+    across sources unless *target_image_size* is set. All shards share one fps
+    and identical video ``info`` (including codec) so ``aggregate_datasets()``
+    metadata checks pass.
+
+    Pass *target_camera_keys* (e.g. ``["head", "left_wrist", "right_wrist"]``)
+    to fix the canonical camera set explicitly instead of deriving it from the
+    intersection/union of sources — any source camera that doesn't remap into
+    this set is dropped (e.g. DROID's second exterior view). Combine with
+    *camera_fill_mode="zero"* so a source that structurally lacks one of these
+    cameras (e.g. a single-arm robot merged with dual-arm sources that have a
+    ``right_wrist`` camera) gets an all-black frame for it instead of raising.
+    Without *target_camera_keys*, *camera_fill_mode="zero"* instead takes the
+    **union** of every source's remapped camera keys as canonical, zero-filling
+    whichever ones each source is missing.
+
+    *pad_fill_mode* selects the constant written into state/action dims a
+    source cannot provide (``zero`` / ``ref-mean`` / ``state-copy``, see
+    :func:`align_single_dataset`). *override_padded_stats* rewrites the merged
+    ``meta/stats.json`` so padded dims keep the **reference repo's** stats
+    (your embodiment's real motion range) instead of stats polluted by
+    constant fills. A ``meta/cotrain_sources.json`` manifest (episode ranges +
+    padded dims per source) is always written to the merged dataset; the
+    ``source`` sample weighter consumes it at train time.
 
     Returns the path to the merged dataset root.
     """
+    if pad_fill_mode not in PAD_FILL_MODES:
+        raise ValueError(f"pad_fill_mode must be one of {PAD_FILL_MODES}, got {pad_fill_mode!r}")
+    if (pad_fill_mode != "zero" or override_padded_stats) and match_features_from is None:
+        raise ValueError(
+            "--pad-fill-mode ref-mean/state-copy and --override-padded-stats require "
+            "--match-features-from (the reference supplies joint names and stats)."
+        )
+    if camera_fill_mode not in CAMERA_FILL_MODES:
+        raise ValueError(
+            f"camera_fill_mode must be one of {CAMERA_FILL_MODES}, got {camera_fill_mode!r}"
+        )
+
     if camera_remap is None:
         camera_remap = _DEFAULT_CAMERA_REMAP
 
@@ -937,6 +1363,7 @@ def align_datasets_for_cotraining(
 
     aligned_roots: list[Path] = []
     aligned_repo_ids: list[str] = []
+    manifest_entries: list[dict[str, Any]] = []
 
     mfeat_root = (
         Path(match_features_root).expanduser() if match_features_root else None
@@ -974,11 +1401,28 @@ def align_datasets_for_cotraining(
         )
 
     merge_fps = _merge_effective_fps(all_metas, target_fps)
-    canonical_cam_keys = _intersection_remapped_camera_keys(all_metas, camera_remap)
+
+    if target_camera_keys is not None:
+        canonical_cam_keys = sorted(f"observation.images.{k}" for k in target_camera_keys)
+        provided_anywhere = set.union(
+            *[_remapped_dst_keys_for_meta(m, camera_remap) for m in all_metas]
+        )
+        missing_everywhere = [k for k in canonical_cam_keys if k not in provided_anywhere]
+        if missing_everywhere:
+            raise ValueError(
+                f"--target-camera-keys includes key(s) {missing_everywhere} that no source "
+                "provides even after --camera-remap. Fix --camera-remap or drop the key."
+            )
+    elif camera_fill_mode == "zero":
+        canonical_cam_keys = sorted(
+            set.union(*[_remapped_dst_keys_for_meta(m, camera_remap) for m in all_metas])
+        )
+    else:
+        canonical_cam_keys = _intersection_remapped_camera_keys(all_metas, camera_remap)
     if not canonical_cam_keys:
         raise ValueError(
             "No observation.images.* keys are shared by all sources after --camera-remap; "
-            "cannot merge. Adjust --camera-remap or --source-repos."
+            "cannot merge. Adjust --camera-remap, --target-camera-keys, or --source-repos."
         )
 
     auto_hw = _min_hw_for_merge(all_metas, camera_remap, set(canonical_cam_keys))
@@ -995,10 +1439,12 @@ def align_datasets_for_cotraining(
             merge_fps,
         )
         logger.info(
-            "Merge-safe visual schema: keys=%s, size=%s, fps=%d (intersection across sources).",
+            "Merge-safe visual schema: keys=%s, size=%s, fps=%d (camera_fill_mode=%s%s).",
             canonical_cam_keys,
             unified_hw,
             merge_fps,
+            camera_fill_mode,
+            ", explicit target_camera_keys" if target_camera_keys is not None else "",
         )
 
     _src_pbar = tqdm(
@@ -1013,6 +1459,23 @@ def align_datasets_for_cotraining(
         _src_pbar.set_postfix_str(
             f"{i + 1}/{len(resolved)} {src_repo}",
             refresh=False,
+        )
+        padded_state_dims: list[int] = []
+        padded_action_dims: list[int] = []
+        if state_names is not None and action_names is not None:
+            src_st = src_meta.features.get("observation.state") or {}
+            src_ac = src_meta.features.get("action") or {}
+            padded_state_dims = _missing_dims(
+                src_st.get("names"), int((src_st.get("shape") or (0,))[0]), state_names
+            )
+            padded_action_dims = _missing_dims(
+                src_ac.get("names"), int((src_ac.get("shape") or (0,))[0]), action_names
+            )
+        provided_cam_keys = _remapped_dst_keys_for_meta(src_meta, camera_remap)
+        padded_camera_keys = sorted(
+            k.removeprefix("observation.images.")
+            for k in canonical_cam_keys
+            if k not in provided_cam_keys
         )
         safe_name = src_repo.replace("/", "__")
         aligned_repo_id = f"{target_repo_id}_src{i}_{safe_name}"
@@ -1044,6 +1507,14 @@ def align_datasets_for_cotraining(
             )
             aligned_roots.append(Path(src_meta.root))
             aligned_repo_ids.append(src_repo)
+            manifest_entries.append({
+                "repo_id": src_repo,
+                "native": not (padded_state_dims or padded_action_dims or padded_camera_keys),
+                "num_episodes": int(src_meta.total_episodes),
+                "padded_state_dims": padded_state_dims,
+                "padded_action_dims": padded_action_dims,
+                "padded_camera_keys": padded_camera_keys,
+            })
             continue
 
         if force_rebuild and aligned_root.exists():
@@ -1051,14 +1522,23 @@ def align_datasets_for_cotraining(
             shutil.rmtree(aligned_root)
 
         cache_matches = info_json.is_file() and _alignment_artifacts_match(
-            info_json, target_features, merge_fps
+            info_json,
+            target_features,
+            merge_fps,
+            pad_fill_mode,
+            expected_total_episodes=src_meta.total_episodes,
         )
         if not force_rebuild and cache_matches:
-            logger.info("Reusing already-aligned cache: %s", aligned_root)
+            logger.info(
+                "Reusing already-aligned cache: %s (all %d episodes confirmed present)",
+                aligned_root,
+                src_meta.total_episodes,
+            )
         else:
             if aligned_root.exists():
                 logger.warning(
-                    "Rebuilding align cache %s (stale vs current options).",
+                    "Rebuilding align cache %s (stale vs current options, or a prior run "
+                    "was interrupted mid-alignment).",
                     aligned_root,
                 )
                 shutil.rmtree(aligned_root)
@@ -1077,10 +1557,20 @@ def align_datasets_for_cotraining(
                 force_rebuild=False,
                 canonical_visual=canonical_visual,
                 forced_effective_fps=merge_fps if canonical_visual is not None else None,
+                pad_fill_mode=pad_fill_mode,
+                camera_fill_mode=camera_fill_mode,
             )
 
         aligned_roots.append(aligned_root)
         aligned_repo_ids.append(aligned_repo_id)
+        manifest_entries.append({
+            "repo_id": src_repo,
+            "native": not (padded_state_dims or padded_action_dims or padded_camera_keys),
+            "num_episodes": _episodes_in_root(aligned_root),
+            "padded_state_dims": padded_state_dims,
+            "padded_action_dims": padded_action_dims,
+            "padded_camera_keys": padded_camera_keys,
+        })
 
     if not aligned_repo_ids:
         raise ValueError(
@@ -1096,17 +1586,45 @@ def align_datasets_for_cotraining(
             shutil.copytree(aligned_roots[0], output_root)
         merged_root = output_root
     else:
-        logger.info(
-            "Merging %d aligned datasets with aggregate_datasets() …",
-            len(aligned_repo_ids),
-        )
-        aggregate_datasets(
-            repo_ids=aligned_repo_ids,
-            aggr_repo_id=target_repo_id,
-            roots=aligned_roots,
-            aggr_root=output_root,
-        )
+        _merged_info = output_root / "meta" / "info.json"
+        if output_root.exists() and _merged_info.is_file() and not force_rebuild:
+            logger.info(
+                "Output %s already exists — skipping aggregation (use --force-rebuild to regenerate).",
+                output_root,
+            )
+        else:
+            if output_root.exists():
+                shutil.rmtree(output_root)
+            logger.info(
+                "Merging %d aligned datasets with aggregate_datasets() …",
+                len(aligned_repo_ids),
+            )
+            aggregate_datasets(
+                repo_ids=aligned_repo_ids,
+                aggr_repo_id=target_repo_id,
+                roots=aligned_roots,
+                aggr_root=output_root,
+            )
         merged_root = output_root
+
+    _write_cotrain_sources_manifest(
+        merged_root,
+        manifest_entries,
+        reference_repo=match_features_from,
+        pad_fill_mode=pad_fill_mode,
+        state_names=state_names,
+        action_names=action_names,
+    )
+
+    if override_padded_stats and state_names is not None and action_names is not None:
+        _override_padded_stats(
+            merged_root,
+            manifest_entries,
+            reference_repo=match_features_from,
+            reference_root=mfeat_root,
+            state_names=state_names,
+            action_names=action_names,
+        )
 
     if push_to_hub:
         tasks_path = merged_root / DEFAULT_TASKS_PATH
@@ -1294,6 +1812,53 @@ def main() -> None:
             "used in-place and only copied during aggregate_datasets()."
         ),
     )
+    parser.add_argument(
+        "--pad-fill-mode",
+        choices=PAD_FILL_MODES,
+        default="zero",
+        help=(
+            "Value written into state/action dims a source cannot provide. "
+            "'zero': constant 0 (legacy). 'ref-mean': reference dataset's per-dim "
+            "mean (velocity dims stay 0) so padded dims sit at the centre of your "
+            "real joint distribution. 'state-copy': like ref-mean, plus padded "
+            "non-velocity action dims copy the same-name state value (identity "
+            "'hold position' action). Non-zero modes require --match-features-from."
+        ),
+    )
+    parser.add_argument(
+        "--override-padded-stats",
+        action="store_true",
+        help=(
+            "After merging, rewrite meta/stats.json so dims padded in any source "
+            "keep the --match-features-from repo's mean/std/min/max (your "
+            "embodiment's real motion range) instead of stats diluted by the "
+            "constant fills. Recommended whenever external sources pad dims."
+        ),
+    )
+    parser.add_argument(
+        "--target-camera-keys",
+        type=str,
+        default=None,
+        help=(
+            "Comma-separated canonical camera keys, e.g. 'head,left_wrist,right_wrist'. "
+            "Fixes the merged schema explicitly instead of deriving it from the "
+            "intersection/union of --source-repos; any source camera that doesn't remap "
+            "into this set is dropped. Combine with --camera-fill-mode zero so a source "
+            "structurally missing one of these cameras gets a black frame instead of an error."
+        ),
+    )
+    parser.add_argument(
+        "--camera-fill-mode",
+        choices=CAMERA_FILL_MODES,
+        default="intersection",
+        help=(
+            "'intersection' (default): every source must provide every canonical camera "
+            "(after --camera-remap / --target-camera-keys), or alignment raises. "
+            "'zero': sources missing a canonical camera get an all-black frame for it "
+            "instead — e.g. a single-arm source merged with dual-arm sources that have "
+            "a right_wrist camera it cannot provide."
+        ),
+    )
 
     args = parser.parse_args()
 
@@ -1335,6 +1900,14 @@ def main() -> None:
         force_rebuild=args.force_rebuild,
         skip_missing_sources=args.skip_missing_sources,
         realign_all_sources=args.realign_all_sources,
+        pad_fill_mode=args.pad_fill_mode,
+        override_padded_stats=args.override_padded_stats,
+        target_camera_keys=(
+            [k.strip() for k in args.target_camera_keys.split(",") if k.strip()]
+            if args.target_camera_keys
+            else None
+        ),
+        camera_fill_mode=args.camera_fill_mode,
     )
 
 

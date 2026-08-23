@@ -603,8 +603,10 @@ def run_s1(
         from lerobot.teleoperators.utils import make_teleoperator_from_config
         teleop_cfg = draccus.decode(TeleoperatorConfig, teleop_config_dict)
         teleop = make_teleoperator_from_config(teleop_cfg)
-        teleop.connect()
-        logger.info("S1: Teleop connected (intervention enabled, press SPACE to toggle)")
+        # Pass robot so VR-based teleops can calibrate arm controllers from initial obs.
+        # Physical leader arms ignore this argument.
+        teleop.connect(robot=robot)
+        logger.info("S1: Teleop connected (intervention enabled, press SPACE / RIGHT A button to toggle)")
 
     # Note: S2 wait happens after inference thread starts (below),
     # because the inference thread publishes images that S2 needs.

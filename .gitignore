@@ -177,3 +177,25 @@ outputs/
 *.xml
 *.part
 patched_preprocessor.json
+
+# Local analysis artifacts (SARM/subtask visualizations, prediction plots)
+*subtask_viz/
+*_sarm_predictions/
+
+# Editor settings
+.cursor/
+
+# Workflow UI runtime state (generated scripts, logs, run state)
+workflows/
+
+# SARM/annotation visualization outputs (defaults now under outputs/)
+sarm_predictions/
+sarm_viz/
+subtask_viz/
+
+# Local planning / analysis notes
+docs/upstream_merge_plan.md
+docs/dataset_composition_audit.md
+docs/missing_modality_fixes_validation.md
+docs/missing_modality_support.md
+docs/worldmodel_synthetic_data_investigation.md

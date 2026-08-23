@@ -48,18 +48,31 @@ import grpc
 import torch
 
 from lerobot.cameras.opencv import OpenCVCameraConfig  # noqa: F401
-from lerobot.cameras.realsense import RealSenseCameraConfig  # noqa: F401
+from lerobot.cameras.zmq.configuration_zmq import ZMQCameraConfig  # noqa: F401
+
+# `lerobot.cameras.realsense` imports pyrealsense2 eagerly whenever the package is merely
+# installed, and on some platforms it is installed but not loadable (e.g. a Jetson wheel built
+# against a newer glibc). Probe the dependency itself rather than the camera module, so a missing
+# realsense only costs us that camera type, while any other import error still surfaces.
+try:
+    import pyrealsense2  # noqa: F401
+except ImportError as e:
+    logging.warning("realsense camera type unavailable: pyrealsense2 failed to import (%s)", e)
+else:
+    from lerobot.cameras.realsense import RealSenseCameraConfig  # noqa: F401
+
 from lerobot.robots import (  # noqa: F401
     Robot,
     RobotConfig,
     bi_so_follower,
     koch_follower,
     make_robot_from_config,
+    ob15,
     omx_follower,
     so_follower,
-    xlerobot,
+    unitree_g1,
 )
-from lerobot.robots.xlerobot.config_xlerobot import XLerobotConfig  # noqa: F401
+from lerobot.robots.ob15.config_ob15 import OB15Config  # noqa: F401
 from lerobot.transport import (
     services_pb2,  # type: ignore
     services_pb2_grpc,  # type: ignore
@@ -295,7 +308,7 @@ class RobotClient:
                     elif isinstance(location, torch.device) and location.type == 'cuda':
                         location = torch.device('cpu')
                     return original_restore(storage, location)
-                
+
                 torch.serialization.default_restore_location = cpu_restore_location
                 try:
                     timed_actions = pickle.loads(actions_chunk.data)  # nosec
@@ -388,7 +401,7 @@ class RobotClient:
         """
         action_features_list = list(self.robot.action_features)
         action = {}
-        
+
         # Use available action dimensions from the policy
         for i, key in enumerate(action_features_list):
             if i < action_tensor.shape[0]:
@@ -396,7 +409,7 @@ class RobotClient:
             else:
                 # For dimensions beyond policy output, set to 0 (no movement)
                 action[key] = 0.0
-        
+
         return action
 
     def control_loop_action(self, verbose: bool = False) -> dict[str, Any]:

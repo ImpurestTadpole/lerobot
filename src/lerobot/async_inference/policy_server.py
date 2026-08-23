@@ -39,11 +39,11 @@ import grpc
 import torch
 
 from lerobot.configs.types import RTCAttentionSchedule
+from lerobot.lerobot_types import PolicyAction
 from lerobot.policies import get_policy_class, make_pre_post_processors
 from lerobot.policies.rtc.configuration_rtc import RTCConfig
 from lerobot.policies.utils import populate_queues
 from lerobot.processor import (
-    PolicyAction,
     PolicyProcessorPipeline,
 )
 from lerobot.transport import (
@@ -51,7 +51,6 @@ from lerobot.transport import (
     services_pb2_grpc,  # type: ignore
 )
 from lerobot.transport.utils import receive_bytes_in_chunks
-from lerobot.types import PolicyAction
 from lerobot.utils.constants import (
     OBS_ENV_STATE,
     OBS_IMAGES,

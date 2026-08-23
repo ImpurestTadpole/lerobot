@@ -38,6 +38,9 @@ lerobot-record \\
     --display_data=true
 ```
 
+To stream the data to Foxglove instead of Rerun, add ``--display_mode=foxglove`` (then connect the
+Foxglove app to ``ws://127.0.0.1:8765``; override the port with ``--display_port=<port>``).
+
 Example recording with bimanual so100:
 ```shell
 lerobot-record \\
@@ -79,9 +82,9 @@ lerobot-record \\
     --dataset.single_task="Grab the cube" \\
     --dataset.streaming_encoding=true \\
     --dataset.encoder_threads=2 \\
-    --dataset.camera_encoder.vcodec=h264 \\
-    --dataset.camera_encoder.preset=fast \\
-    --dataset.camera_encoder.extra_options={"tune": "film", "profile:v": "high", "bf": 2} \\
+    --dataset.rgb_encoder.vcodec=h264 \\
+    --dataset.rgb_encoder.preset=fast \\
+    --dataset.rgb_encoder.extra_options={"tune": "film", "profile:v": "high", "bf": 2} \\
     --display_data=true
 ```
 """
@@ -97,11 +100,7 @@ from lerobot.cameras.opencv import OpenCVCameraConfig  # noqa: F401
 from lerobot.cameras.reachy2_camera import Reachy2CameraConfig  # noqa: F401
 from lerobot.cameras.realsense import RealSenseCameraConfig  # noqa: F401
 from lerobot.cameras.zmq import ZMQCameraConfig  # noqa: F401
-from lerobot.common.control_utils import (
-    init_keyboard_listener,
-    is_headless,
-    sanity_check_dataset_robot_compatibility,
-)
+from lerobot.common.control_utils import sanity_check_dataset_robot_compatibility
 from lerobot.configs import parser
 from lerobot.configs.dataset import DatasetRecordConfig
 from lerobot.datasets import (
@@ -120,10 +119,12 @@ from lerobot.processor import (
 from lerobot.robots import (  # noqa: F401
     Robot,
     RobotConfig,
+    bi_gem_follower,
     bi_openarm_follower,
     bi_rebot_b601_follower,
     bi_so_follower,
     earthrover_mini_plus,
+    gem_follower,
     hope_jr,
     koch_follower,
     make_robot_from_config,
@@ -134,12 +135,12 @@ from lerobot.robots import (  # noqa: F401
     rebot_b601_follower,
     so_follower,
     unitree_g1 as unitree_g1_robot,
-    xlerobot,
 )
 from lerobot.teleoperators import (  # noqa: F401
     Teleoperator,
     TeleoperatorConfig,
     bi_openarm_leader,
+    bi_openarm_mini,
     bi_rebot_102_leader,
     bi_so_leader,
     homunculus,
@@ -157,14 +158,19 @@ from lerobot.teleoperators import (  # noqa: F401
 from lerobot.teleoperators.keyboard import KeyboardTeleop
 from lerobot.teleoperators.xlerobot_vr.xlerobot_vr import XLerobotVRTeleop, init_vr_listener
 from lerobot.utils.constants import ACTION, OBS_STR
+from lerobot.utils.cycle_timer import CycleTimer
 from lerobot.utils.feature_utils import build_dataset_frame, combine_feature_dicts
 from lerobot.utils.import_utils import register_third_party_plugins
-from lerobot.utils.robot_utils import precise_sleep
+from lerobot.utils.keyboard_input import init_keyboard_listener
 from lerobot.utils.utils import (
     init_logging,
     log_say,
 )
-from lerobot.utils.visualization_utils import init_rerun, log_rerun_data, start_viz_thread, stop_viz_thread
+from lerobot.utils.visualization_utils import (
+    init_visualization,
+    log_visualization_data,
+    shutdown_visualization,
+)
 
 
 @dataclass
@@ -175,11 +181,14 @@ class RecordConfig:
     teleop: TeleoperatorConfig | None = None
     # Display all cameras on screen
     display_data: bool = False
-    # Display data on a remote Rerun server
+    # Visualization backend used when display_data is True: "rerun" or "foxglove".
+    display_mode: str = "rerun"
+    # For "rerun": IP of a remote server to send to. For "foxglove": interface to bind the WebSocket
+    # server to (127.0.0.1 for local only, 0.0.0.0 for all interfaces).
     display_ip: str | None = None
-    # Port of the remote Rerun server
+    # For "rerun": port of the remote server. For "foxglove": port to bind the WebSocket server to.
     display_port: int | None = None
-    # Whether to  display compressed images in Rerun
+    # Whether to display compressed (JPEG) images instead of raw frames
     display_compressed_images: bool = True
     # Use vocal synthesis to read events.
     play_sounds: bool = True
@@ -240,8 +249,19 @@ def record_loop(
     control_time_s: int | None = None,
     single_task: str | None = None,
     display_data: bool = False,
+    display_mode: str = "rerun",
     display_compressed_images: bool = False,
+    timer: CycleTimer | None = None,
 ):
+    """Drive the robot from the teleoperator at *fps*, optionally recording each frame.
+
+    *timer* lets a caller that runs several phases — :func:`record` records one episode
+    per call, with an unrecorded reset phase in between — keep one
+    :class:`~lerobot.utils.cycle_timer.CycleTimer` across all of them, so the cadence
+    statistics span the whole session and are reported per episode.  Without it each
+    call gets a private timer: identical pacing and identical slow-loop warnings, just
+    no end-of-run summary, since a single phase has no run to summarise.
+    """
     if dataset is not None and dataset.fps != fps:
         raise ValueError(f"The dataset fps should be equal to requested fps ({dataset.fps} != {fps}).")
 
@@ -270,27 +290,27 @@ def record_loop(
                 "For multi-teleop, the list must contain exactly one KeyboardTeleop and one arm teleoperator. Currently only supported for LeKiwi robot."
             )
 
-    control_interval = 1 / fps
+    if timer is None:
+        timer = CycleTimer(fps, records_data=dataset is not None)
 
     no_action_count = 0
     timestamp = 0
     start_episode_t = time.perf_counter()
     last_status_print = 0  # Track when we last printed status
-    
+
     # Hz rate tracking
     loop_times = []
     last_hz_print = time.perf_counter()
     hz_print_interval = 1.0  # Print Hz rate every 1 second
     prev_loop_start = time.perf_counter()  # Track previous loop start time
     frame_idx = 0  # For throttling visualization
-    
+
     # Depth read throttling: set to 1 to read depth every frame.
     # For training with depth, it's usually better to keep depth time-aligned to RGB/actions.
     depth_read_interval = 1  # Read depth every frame
-
-    # Only xlerobot's get_observation() accepts skip_cameras/skip_depth today; other robots use
+    # Only some robots' get_observation() accepts skip_cameras/skip_depth kwargs; other robots use
     # the base no-arg signature and would raise TypeError if we passed these kwargs unconditionally.
-    robot_supports_skip_kwargs = "skip_depth" in inspect.signature(robot.get_observation).parameters
+    robot_supports_depth_throttle = "skip_depth" in inspect.signature(robot.get_observation).parameters
 
     # Last known-good frame per camera key (color + depth). Used to backfill a camera's frame
     # for this tick whenever it's missing from `obs` — either because depth was intentionally
@@ -298,12 +318,14 @@ def record_loop(
     # transient USB dropout on a wrist camera). Without this, a single flaky read would leave the
     # key out of the frame entirely and crash the whole recording session at dataset.add_frame().
     camera_obs_keys = list(robot.cameras.keys()) if hasattr(robot, "cameras") else []
-    camera_obs_keys += [f"{k}_depth" for k, cam in getattr(robot, "cameras", {}).items() if getattr(cam, "use_depth", False)]
+    camera_obs_keys += [
+        f"{k}_depth" for k, cam in getattr(robot, "cameras", {}).items() if getattr(cam, "use_depth", False)
+    ]
     last_camera_obs = {}
 
     while timestamp < control_time_s:
         start_loop_t = time.perf_counter()
-        
+
         # Measure time since last loop (for Hz calculation)
         if prev_loop_start > 0:
             loop_period = start_loop_t - prev_loop_start
@@ -315,104 +337,118 @@ def record_loop(
             vr_events = teleop.get_vr_events()
             events.update(vr_events)
 
+        # Checked before `tick()`: this iteration is not a control tick, so it should not
+        # be timed as one.
         if events["exit_early"]:
             events["exit_early"] = False
             break
 
-        # Get robot observation - skip depth reads on some frames for performance
-        # We still read color cameras every frame for the dataset
-        if robot_supports_skip_kwargs:
-            read_depth_this_frame = (frame_idx % depth_read_interval == 0)
-            obs = robot.get_observation(skip_cameras=False, skip_depth=not read_depth_this_frame)
-        else:
-            obs = robot.get_observation()
+        timer.tick()
 
-        # Backfill any camera key missing from this tick's obs (depth intentionally skipped
-        # above, or a real read failure e.g. a transient USB dropout) with the last known-good
-        # frame for that camera, and record whatever's present now as the new "last good" value.
-        for cam_key in camera_obs_keys:
-            if cam_key in obs:
-                last_camera_obs[cam_key] = obs[cam_key]
-            elif cam_key in last_camera_obs:
-                obs[cam_key] = last_camera_obs[cam_key]
-                logging.debug(f"Camera key '{cam_key}' missing this tick, reusing last known-good frame")
+        with timer.section("observe"):
+            if robot_supports_depth_throttle:
+                # Get robot observation - skip depth reads on some frames for performance.
+                # We still read color cameras every frame for the dataset.
+                read_depth_this_frame = frame_idx % depth_read_interval == 0
+                obs = robot.get_observation(skip_cameras=False, skip_depth=not read_depth_this_frame)
+            else:
+                # Get robot observation
+                obs = robot.get_observation()
 
-        # Applies a pipeline to the raw robot observation, default is IdentityProcessor
-        obs_processed = robot_observation_processor(obs)
+            # Backfill any camera key missing from this tick's obs (depth intentionally skipped
+            # above, or a real read failure e.g. a transient USB dropout) with the last known-good
+            # frame for that camera, and record whatever's present now as the new "last good" value.
+            for cam_key in camera_obs_keys:
+                if cam_key in obs:
+                    last_camera_obs[cam_key] = obs[cam_key]
+                elif cam_key in last_camera_obs:
+                    obs[cam_key] = last_camera_obs[cam_key]
+                    logging.debug(f"Camera key '{cam_key}' missing this tick, reusing last known-good frame")
 
-        if dataset is not None:
-            observation_frame = build_dataset_frame(dataset.features, obs_processed, prefix=OBS_STR)
+        with timer.section("process_obs"):
+            # Applies a pipeline to the raw robot observation, default is IdentityProcessor
+            obs_processed = robot_observation_processor(obs)
 
-        # Get action from teleop
-        if isinstance(teleop, Teleoperator):
-            if hasattr(teleop, "update_observation_cache"):
-                teleop.update_observation_cache(obs)
-            if getattr(teleop.config, "stream_cameras_to_vr", False) and hasattr(teleop, "send_camera_frames"):
-                teleop.send_camera_frames(obs)
-            act = teleop.get_action()
-            if robot.name == "unitree_g1":
-                teleop.send_feedback(obs)
+            if dataset is not None:
+                observation_frame = build_dataset_frame(dataset.features, obs_processed, prefix=OBS_STR)
 
-            # Applies a pipeline to the raw teleop action, default is IdentityProcessor
-            act_processed_teleop = teleop_action_processor((act, obs))
-            action_values = act_processed_teleop
-            robot_action_to_send = robot_action_processor((act_processed_teleop, obs))
+        with timer.section("teleop"):
+            # Get action from teleop
+            if isinstance(teleop, Teleoperator):
+                if hasattr(teleop, "update_observation_cache"):
+                    teleop.update_observation_cache(obs)
+                if getattr(teleop.config, "stream_cameras_to_vr", False) and hasattr(
+                    teleop, "send_camera_frames"
+                ):
+                    teleop.send_camera_frames(obs)
+                act = teleop.get_action()
+                if robot.name == "unitree_g1":
+                    teleop.send_feedback(obs)
 
-        elif isinstance(teleop, list):
-            arm_action = teleop_arm.get_action()
-            arm_action = {f"arm_{k}": v for k, v in arm_action.items()}
-            keyboard_action = teleop_keyboard.get_action()
-            base_action = robot._from_keyboard_to_base_action(keyboard_action)
-            act = {**arm_action, **base_action} if len(base_action) > 0 else arm_action
-            act_processed_teleop = teleop_action_processor((act, obs))
-            action_values = act_processed_teleop
-            robot_action_to_send = robot_action_processor((act_processed_teleop, obs))
-        else:
-            no_action_count += 1
-            if no_action_count == 1 or no_action_count % 10 == 0:
-                logging.warning(
-                    "No teleoperator provided, skipping action generation. "
-                    "This is likely to happen when resetting the environment without a teleop device. "
-                    "The robot won't be at its rest position at the start of the next episode."
-                )
+                # Applies a pipeline to the raw teleop action, default is IdentityProcessor
+                act_processed_teleop = teleop_action_processor((act, obs))
+                action_values = act_processed_teleop
+                robot_action_to_send = robot_action_processor((act_processed_teleop, obs))
+
+            elif isinstance(teleop, list):
+                arm_action = teleop_arm.get_action()
+                arm_action = {f"arm_{k}": v for k, v in arm_action.items()}
+                keyboard_action = teleop_keyboard.get_action()
+                base_action = robot._from_keyboard_to_base_action(keyboard_action)
+                act = {**arm_action, **base_action} if len(base_action) > 0 else arm_action
+                act_processed_teleop = teleop_action_processor((act, obs))
+                action_values = act_processed_teleop
+                robot_action_to_send = robot_action_processor((act_processed_teleop, obs))
+            else:
+                robot_action_to_send = None
+                no_action_count += 1
+                if no_action_count == 1 or no_action_count % 10 == 0:
+                    logging.warning(
+                        "No teleoperator provided, skipping action generation. "
+                        "This is likely to happen when resetting the environment without a teleop device. "
+                        "The robot won't be at its rest position at the start of the next episode."
+                    )
+
+        # Nothing to send and nothing to record, but the phase still has to be paced and
+        # still has to end: `continue`ing straight past the tail of the loop body used to
+        # spin at full CPU speed on a `control_time_s` that never advanced.
+        if robot_action_to_send is None:
+            timer.wait()
+            timestamp = time.perf_counter() - start_episode_t
             continue
 
-        # Send action to robot
-        # Action can eventually be clipped using `max_relative_target`,
-        # so action actually sent is saved in the dataset. action = postprocessor.process(action)
-        # TODO(steven, pepijn, adil): we should use a pipeline step to clip the action, so the sent action is the action that we input to the robot.
-        _sent_action = robot.send_action(robot_action_to_send)
-        
+        with timer.section("send"):
+            # Send action to robot
+            # Action can eventually be clipped using `max_relative_target`,
+            # so action actually sent is saved in the dataset. action = postprocessor.process(action)
+            # TODO(steven, pepijn, adil): we should use a pipeline step to clip the action, so the sent action is the action that we input to the robot.
+            _sent_action = robot.send_action(robot_action_to_send)
+
         # Use the actually sent action for logging (includes normalization, clipping, etc.)
         action_values = _sent_action
 
         # Write to dataset
         if dataset is not None:
-            action_frame = build_dataset_frame(dataset.features, action_values, prefix=ACTION)
-            frame = {**observation_frame, **action_frame, "task": single_task}
-            dataset.add_frame(frame)
+            with timer.section("record"):
+                action_frame = build_dataset_frame(dataset.features, action_values, prefix=ACTION)
+                frame = {**observation_frame, **action_frame, "task": single_task}
+                dataset.add_frame(frame)
 
         # Visualization runs in a background thread - this call is non-blocking.
         # Frames are dropped if the worker is still busy (queue size = 1).
         if display_data:
-            # Depth keys are included here; visualization_utils.log_rerun_data skips them by
-            # default (set RERUN_SKIP_DEPTH=false to show depth in the Rerun viewer).
-            log_rerun_data(
-                observation=obs_processed, action=action_values, compress_images=display_compressed_images
-            )
+            with timer.section("telemetry"):
+                log_visualization_data(
+                    display_mode,
+                    observation=obs_processed,
+                    action=action_values,
+                    compress_images=display_compressed_images,
+                )
 
-        dt_s = time.perf_counter() - start_loop_t
-
-        sleep_time_s: float = control_interval - dt_s
-        if sleep_time_s < 0:
-            logging.warning(
-                f"Record loop is running slower ({1 / dt_s:.1f} Hz) than the target FPS ({fps} Hz). Dataset frames might be dropped and robot control might be unstable. Common causes are: 1) Camera FPS not keeping up 2) Policy inference taking too long 3) CPU starvation"
-            )
-
-        precise_sleep(max(sleep_time_s, 0.0))
+        timer.wait()
 
         timestamp = time.perf_counter() - start_episode_t
-        
+
         # Print Hz rate every second
         current_time = time.perf_counter()
         if current_time - last_hz_print >= hz_print_interval:
@@ -452,7 +488,7 @@ def record_loop(
 
         # Increment frame index for visualization and depth throttling
         frame_idx += 1
-        
+
         # Print episode progress every 5 seconds
         if dataset is not None and timestamp - last_status_print >= 5.0:
             elapsed_min = int(timestamp // 60)
@@ -460,7 +496,7 @@ def record_loop(
             remaining_sec = max(0, int(control_time_s - timestamp))
             remaining_min = remaining_sec // 60
             remaining_sec = remaining_sec % 60
-            
+
             logging.info(
                 f"📹 Episode {dataset.num_episodes} | "
                 f"Time: {elapsed_min:02d}:{elapsed_sec:02d} / "
@@ -480,8 +516,9 @@ def record(
     init_logging()
     logging.info(pformat(asdict(cfg)))
     if cfg.display_data:
-        init_rerun(session_name="recording", ip=cfg.display_ip, port=cfg.display_port)
-        start_viz_thread()
+        init_visualization(
+            cfg.display_mode, session_name="recording", ip=cfg.display_ip, port=cfg.display_port
+        )
     display_compressed_images = (
         True
         if (cfg.display_data and cfg.display_ip is not None and cfg.display_port is not None)
@@ -519,6 +556,11 @@ def record(
 
     dataset = None
     listener = None
+    # One timer for the whole session, so its statistics describe the recording rather
+    # than one episode's slice of it.  The reset phases below deliberately run on their
+    # own private timers: they write no frames, so folding their ticks in would dilute
+    # every number that answers "did I record at `fps`?".
+    timer = CycleTimer(cfg.dataset.fps)
 
     try:
         if cfg.resume:
@@ -528,7 +570,8 @@ def record(
                     cfg.dataset.repo_id,
                     root=cfg.dataset.root,
                     batch_encoding_size=cfg.dataset.video_encoding_batch_size,
-                    camera_encoder=cfg.dataset.camera_encoder,
+                    rgb_encoder=cfg.dataset.rgb_encoder,
+                    depth_encoder=cfg.dataset.depth_encoder,
                     encoder_threads=cfg.dataset.encoder_threads,
                     streaming_encoding=cfg.dataset.streaming_encoding,
                     encoder_queue_maxsize=cfg.dataset.encoder_queue_maxsize,
@@ -564,19 +607,22 @@ def record(
                 image_writer_processes=cfg.dataset.num_image_writer_processes,
                 image_writer_threads=cfg.dataset.num_image_writer_threads_per_camera * len(robot.cameras),
                 batch_encoding_size=cfg.dataset.video_encoding_batch_size,
-                camera_encoder=cfg.dataset.camera_encoder,
+                rgb_encoder=cfg.dataset.rgb_encoder,
+                depth_encoder=cfg.dataset.depth_encoder,
                 encoder_threads=cfg.dataset.encoder_threads,
                 streaming_encoding=cfg.dataset.streaming_encoding,
                 encoder_queue_maxsize=cfg.dataset.encoder_queue_maxsize,
             )
 
-        robot.connect()
+        # Connect the teleoperator before the robot so the robot isn't left idle (and possibly
+        # tripping a firmware watchdog) during teleop init. Matches lerobot_teleoperate.py.
         if teleop is not None:
             # For XLerobot VR, pass the robot reference so get_action() can compute real commands
             if isinstance(teleop, XLerobotVRTeleop):
                 teleop.connect(robot=robot)
             else:
                 teleop.connect()
+        robot.connect()
 
         # Use VR listener if VR teleop, otherwise use keyboard listener
         if isinstance(teleop, XLerobotVRTeleop):
@@ -586,7 +632,7 @@ def record(
 
         if not cfg.dataset.streaming_encoding:
             logging.info(
-                "Streaming encoding is disabled. If you have capable hardware, consider enabling it for way faster episode saving. --dataset.streaming_encoding=true --dataset.encoder_threads=2 # --dataset.camera_encoder.vcodec=auto. More info in the documentation: https://huggingface.co/docs/lerobot/streaming_video_encoding"
+                "Streaming encoding is disabled. If you have capable hardware, consider enabling it for way faster episode saving. --dataset.streaming_encoding=true --dataset.encoder_threads=2 # --dataset.rgb_encoder.vcodec=auto. More info in the documentation: https://huggingface.co/docs/lerobot/streaming_video_encoding"
             )
 
         with VideoEncodingManager(dataset):
@@ -606,7 +652,7 @@ def record(
                     teleop.vr_event_handler.events["exit_early"] = False
 
                 log_say(
-                    f"Recording episode {dataset.num_episodes + 1} / {dataset.num_episodes + cfg.dataset.num_episodes - recorded_episodes}", 
+                    f"Recording episode {dataset.num_episodes + 1} / {dataset.num_episodes + cfg.dataset.num_episodes - recorded_episodes}",
                     cfg.play_sounds
                 )
                 logging.info(
@@ -630,7 +676,9 @@ def record(
                     control_time_s=cfg.dataset.episode_time_s,
                     single_task=cfg.dataset.single_task,
                     display_data=cfg.display_data,
+                    display_mode=cfg.display_mode,
                     display_compressed_images=display_compressed_images,
+                    timer=timer,
                 )
                 if isinstance(teleop, Teleoperator) and hasattr(teleop, "send_episode_event"):
                     teleop.send_episode_event("stop")
@@ -645,10 +693,13 @@ def record(
                         teleop.vr_event_handler.events["rerecord_episode"] = False
                         teleop.vr_event_handler.events["exit_early"] = False
                     dataset.clear_episode_buffer()
+                    timer.log_episode_summary("discarded episode")
+                    timer.restart()
                     continue
-                
+
                 # Save episode immediately before reset phase so an interrupt during reset
                 # doesn't lose the episode.
+                episode_index = dataset.num_episodes
                 dataset.save_episode()
                 recorded_episodes += 1
 
@@ -656,6 +707,13 @@ def record(
                     f"✅ Episode {dataset.num_episodes} saved! "
                     f"({recorded_episodes}/{cfg.dataset.num_episodes} episodes done)"
                 )
+                # Close the window on the episode just saved.  The digest is emitted on
+                # the next episode's first tick, so the reset phase, `save_episode` and
+                # the spoken prompts in between are excluded from the cadence instead of
+                # being charged to whichever episode they sit next to.  `restart()` then
+                # exempts that first tick, whose cameras have been idle for seconds.
+                timer.log_episode_summary(f"episode {episode_index}")
+                timer.restart()
 
                 # Execute a few seconds without recording to give time to manually reset the environment
                 # Skip reset for the last episode to be recorded
@@ -673,12 +731,17 @@ def record(
                         control_time_s=cfg.dataset.reset_time_s,
                         single_task=cfg.dataset.single_task,
                         display_data=cfg.display_data,
+                        display_mode=cfg.display_mode,
                     )
     finally:
+        # First, and in `finally`: ^C is how most recording sessions end, and the summary
+        # is most useful before the video encoding and the hub upload scroll it away.
+        timer.log_run_summary()
+
         log_say("Stop recording", cfg.play_sounds, blocking=True)
 
         if cfg.display_data:
-            stop_viz_thread()
+            shutdown_visualization(cfg.display_mode)
 
         if dataset:
             dataset.finalize()
@@ -688,7 +751,7 @@ def record(
         if teleop and teleop.is_connected:
             teleop.disconnect()
 
-        if not is_headless() and listener:
+        if listener is not None:
             listener.stop()
 
         if cfg.dataset.push_to_hub:
