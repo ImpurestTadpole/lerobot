@@ -172,7 +172,13 @@ class RealSenseCamera(Camera):
         self.latest_color_frame: NDArray[Any] | None = None
         self.latest_depth_frame: NDArray[Any] | None = None
         self.latest_timestamp: float | None = None
+        # Separate events per stream: _read_loop sets both together on every captured frame, but
+        # async_read() and async_read_depth() must be able to consume color and depth independently.
+        # A single shared event meant async_read() (color) cleared it, so the async_read_depth() call
+        # immediately following it (as robots do to build one observation) always had to block for an
+        # entire extra hardware frame period instead of returning the frame that was already buffered.
         self.new_frame_event: Event = Event()
+        self.new_depth_frame_event: Event = Event()
 
         self.rotation: int | None = get_cv2_rotation(config.rotation)
 
@@ -458,7 +464,10 @@ class RealSenseCamera(Camera):
         if self.thread is None or not self.thread.is_alive():
             raise RuntimeError(f"{self} read thread is not running.")
 
-        self.new_frame_event.clear()
+        if read_depth:
+            self.new_depth_frame_event.clear()
+        else:
+            self.new_frame_event.clear()
         return self._async_read(timeout_ms=10000, read_depth=read_depth)
 
     def _get_color_sensor(self) -> "rs.sensor":
@@ -735,6 +744,7 @@ class RealSenseCamera(Camera):
                         self.latest_depth_frame = processed_depth_frame
                     self.latest_timestamp = capture_time
                 self.new_frame_event.set()
+                self.new_depth_frame_event.set()
                 failure_count = 0
 
             except DeviceNotConnectedError:
@@ -773,6 +783,7 @@ class RealSenseCamera(Camera):
             self.latest_depth_frame = None
             self.latest_timestamp = None
             self.new_frame_event.clear()
+            self.new_depth_frame_event.clear()
 
     def _cleanup_resources(self) -> None:
         """Stop background reads and stop the pipeline, including after partial setup."""
@@ -800,7 +811,8 @@ class RealSenseCamera(Camera):
         if self.thread is None or not self.thread.is_alive():
             raise RuntimeError(f"{self} read thread is not running.")
 
-        if not self.new_frame_event.wait(timeout=timeout_ms / 1000.0):
+        event = self.new_depth_frame_event if read_depth else self.new_frame_event
+        if not event.wait(timeout=timeout_ms / 1000.0):
             raise TimeoutError(
                 f"Timed out waiting for frame from camera {self} after {timeout_ms} ms. "
                 f"Read thread alive: {self.thread.is_alive()}."
@@ -808,7 +820,7 @@ class RealSenseCamera(Camera):
 
         with self.frame_lock:
             frame = self.latest_depth_frame if read_depth else self.latest_color_frame
-            self.new_frame_event.clear()
+            event.clear()
 
         if frame is None:
             raise RuntimeError(f"Internal error: Event set but no frame available for {self}.")
