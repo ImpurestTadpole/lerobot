@@ -21,6 +21,7 @@ importing from here directly. Requires the ``viz`` extra (``pip install 'lerobot
 
 import numbers
 import os
+import signal
 
 import numpy as np
 
@@ -70,7 +71,16 @@ def shutdown_rerun() -> None:
     require_package("rerun-sdk", extra="viz", import_name="rerun")
     import rerun as rr
 
-    rr.rerun_shutdown()
+    # If the viewer was never reached (e.g. no `rerun` process listening), this call blocks for a
+    # while retrying the flush. A second Ctrl-C landing mid-native-teardown there hits the Rust FFI
+    # outside of Python's exception handling and aborts the process instead of raising. Ignore SIGINT
+    # for the duration of the call so a double Ctrl-C can't hit that window — the first Ctrl-C already
+    # broke out of the control loop, which is all a normal teleop shutdown needs.
+    previous_handler = signal.signal(signal.SIGINT, signal.SIG_IGN)
+    try:
+        rr.rerun_shutdown()
+    finally:
+        signal.signal(signal.SIGINT, previous_handler)
 
 
 def _build_blueprint(observation_paths: set[str], action_paths: set[str], image_paths: set[str]):
