@@ -787,9 +787,17 @@ class XLerobotVRTeleop(Teleoperator):
         # Lift velocity smoothing state (smoothed_y, smoothed_vel) for get_vr_lift_action
         self._lift_state = {}
 
-        # Camera-to-headset streaming state (see send_camera_frames)
+        # Camera-to-headset streaming state (see send_camera_frames). The actual JPEG
+        # encode+send work runs on a dedicated background thread (_camera_stream_worker_loop)
+        # so it never blocks the control loop — send_camera_frames() itself just hands off the
+        # latest obs and returns immediately. See _start_camera_stream_thread.
         self._last_camera_stream_time = 0.0
         self._camera_frame_inflight: dict[str, bool] = {}
+        self._camera_stream_thread: threading.Thread | None = None
+        self._camera_stream_stop_event: threading.Event | None = None
+        self._camera_stream_new_obs_event = threading.Event()
+        self._camera_stream_lock = threading.Lock()
+        self._camera_stream_latest_obs: dict[str, Any] | None = None
 
         # Depth-view toggle state (see _update_depth_toggle / send_camera_frames)
         self._depth_view_enabled = False
@@ -896,6 +904,9 @@ class XLerobotVRTeleop(Teleoperator):
             # Store robot reference for use in get_action
             self.robot = robot
 
+            if self.config.stream_cameras_to_vr:
+                self._start_camera_stream_thread()
+
             if calibrate and robot is not None and robot.is_connected:
                 robot_obs = robot.get_observation()
                 self.calibrate(robot_obs)
@@ -988,21 +999,83 @@ class XLerobotVRTeleop(Teleoperator):
         else:
             self._camera_frame_inflight.pop(key, None)
 
+    def _start_camera_stream_thread(self) -> None:
+        """Starts the background worker that encodes/sends VR camera frames.
+
+        No-op if already running. See ``_camera_stream_worker_loop`` for why this work is kept
+        off the control-loop thread.
+        """
+        if self._camera_stream_thread is not None and self._camera_stream_thread.is_alive():
+            return
+        self._camera_stream_stop_event = threading.Event()
+        self._camera_stream_thread = threading.Thread(
+            target=self._camera_stream_worker_loop, name="vr_camera_stream", daemon=True
+        )
+        self._camera_stream_thread.start()
+
+    def _stop_camera_stream_thread(self) -> None:
+        """Signals the camera-stream worker to stop and waits for it to exit."""
+        if self._camera_stream_stop_event is not None:
+            self._camera_stream_stop_event.set()
+        self._camera_stream_new_obs_event.set()  # wake the worker if it's blocked in wait()
+        if self._camera_stream_thread is not None and self._camera_stream_thread.is_alive():
+            self._camera_stream_thread.join(timeout=2.0)
+        self._camera_stream_thread = None
+        self._camera_stream_stop_event = None
+
+    def _camera_stream_worker_loop(self) -> None:
+        """Background thread: encodes+sends the latest obs handed off by send_camera_frames().
+
+        JPEG-encoding (and the resize/colormap/color-convert that precede it) is pure CPU work
+        that used to run synchronously inside record_loop's hot path once per control tick,
+        directly gating the achievable control rate. This loop instead pulls whatever the most
+        recent observation is whenever it's free, so a slow encode only delays the VR preview
+        (which was already rate-limited and frame-dropping, see below) and never the robot's
+        control loop.
+        """
+        stop_event = self._camera_stream_stop_event
+        assert stop_event is not None
+        while not stop_event.is_set():
+            got_new = self._camera_stream_new_obs_event.wait(timeout=0.5)
+            if not got_new:
+                continue
+            self._camera_stream_new_obs_event.clear()
+            if stop_event.is_set():
+                break
+            with self._camera_stream_lock:
+                obs = self._camera_stream_latest_obs
+            if obs is None:
+                continue
+            try:
+                self._encode_and_send_camera_frames(obs)
+            except Exception:
+                logger.exception("[VR] camera stream worker failed to encode/send frames")
+
     def send_camera_frames(self, obs: dict[str, Any]) -> None:
         """
-        JPEG-encode the robot's camera frames from `obs` and push them to the VR headset for
-        live display while teleoperating. Opt-in via config.stream_cameras_to_vr; a no-op
-        otherwise. Rate-limited to config.camera_stream_fps and drops a camera's frame instead
-        of queuing it if that camera's previous frame hasn't finished sending yet, so this never
-        blocks the control loop.
+        Hands off the robot's camera frames from `obs` to the background camera-stream worker
+        (see ``_camera_stream_worker_loop``) for JPEG-encoding and sending to the VR headset.
+        Opt-in via config.stream_cameras_to_vr; a no-op otherwise. Never blocks: this just stores
+        a reference and signals the worker, so it's safe to call every control tick regardless of
+        camera_stream_fps or encode cost.
+        """
+        if not self.config.stream_cameras_to_vr or self.vr_monitor is None:
+            return
+        with self._camera_stream_lock:
+            self._camera_stream_latest_obs = obs
+        self._camera_stream_new_obs_event.set()
+
+    def _encode_and_send_camera_frames(self, obs: dict[str, Any]) -> None:
+        """Rate-limited JPEG-encode + send of one obs snapshot. Runs on the camera-stream worker
+        thread (see ``_camera_stream_worker_loop``), never on the control-loop thread.
+
+        Rate-limited to config.camera_stream_fps and drops a camera's frame instead of queuing
+        it if that camera's previous frame hasn't finished sending yet.
 
         Depth frames (keys ending "_depth") are only encoded/sent when the operator has toggled
         the depth view on (RIGHT thumbstick click, see _update_depth_toggle) — encoding depth
         every tick regardless would add CPU cost for a view most sessions never look at.
         """
-        if not self.config.stream_cameras_to_vr or self.vr_monitor is None:
-            return
-
         now = time.perf_counter()
         min_interval = 1.0 / max(self.config.camera_stream_fps, 1e-6)
         if now - self._last_camera_stream_time < min_interval:
@@ -1358,14 +1431,16 @@ class XLerobotVRTeleop(Teleoperator):
             )
         
         try:
+            self._stop_camera_stream_thread()
+
             if self.vr_monitor:
                 # VR Monitor usually runs in a thread, stop the thread
                 pass
-            
+
             self._connected = False
             self._calibrated = False
             print("[VR] Disconnected")
-            
+
         except Exception as e:
             print(f"[VR] Error during disconnect: {e}")
 
