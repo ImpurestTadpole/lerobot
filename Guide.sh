@@ -107,16 +107,17 @@ git remote -v                 # Verify remote URL
 # TELEOPERATION
 # =============================================================================
 # ON JETSON:
+# VR-only control (no local/remote Rerun viewer needed — camera frames still stream to the
+# headset via teleop.stream_cameras_to_vr, which defaults to on). Add --display_data=true only
+# if you actually have a Rerun viewer to look at (see RECORDING section below for that setup).
 lerobot-teleoperate \
     --robot.type=xlerobot \
-    --teleop.type=xlerobot_vr \
-    --display_data=true
+    --teleop.type=xlerobot_vr
 
 # OB15 (XLerobot without head pan/tilt — 15D action space, no head_pan/head_tilt keys):
 lerobot-teleoperate \
     --robot.type=ob15 \
-    --teleop.type=xlerobot_vr \
-    --display_data=true
+    --teleop.type=xlerobot_vr
 
 
 # -----------------------------------------------------------------------------
