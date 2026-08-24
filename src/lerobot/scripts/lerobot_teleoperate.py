@@ -155,6 +155,11 @@ class TeleoperateConfig:
     display_port: int | None = None
     # Whether to display compressed (JPEG) images instead of raw frames
     display_compressed_images: bool = False
+    # Camera (+ depth) read rate while display_data is on. Decoupled from the control loop fps:
+    # a full camera+depth read can cost far more than one control tick's budget (e.g. ~100-130ms on
+    # RGBD robots), so forcing it every tick drags the whole control loop down to camera speed for no
+    # visualization benefit — Rerun doesn't need updates faster than this anyway.
+    display_camera_fps: float = 15.0
 
 
 def teleop_loop(
@@ -168,6 +173,7 @@ def teleop_loop(
     display_mode: str = "rerun",
     duration: float | None = None,
     display_compressed_images: bool = False,
+    display_camera_fps: float = 15.0,
 ):
     """
     This function continuously reads actions from a teleoperation device, processes them through optional
@@ -201,8 +207,10 @@ def teleop_loop(
     # Frame counter for camera reads (read cameras every Nth frame for visualization)
     frame_counter = 0
     if display_data:
-        # Read cameras every frame so Rerun gets full FPS (30 Hz).
-        camera_read_interval = 1
+        # Read cameras (+ depth) at display_camera_fps, not the control loop's fps: a full read
+        # costs far more than one control tick's budget on RGBD robots, so reading every tick would
+        # cap the whole control loop at camera speed for no visualization benefit.
+        camera_read_interval = max(1, round(fps / max(display_camera_fps, 1e-6)))
     elif stream_cameras_to_vr:
         # Only read cameras as often as the VR stream actually needs (teleop.send_camera_frames()
         # rate-limits sends to camera_stream_fps regardless, so reading faster than that just adds
@@ -345,6 +353,7 @@ def teleoperate(cfg: TeleoperateConfig):
             robot_action_processor=robot_action_processor,
             robot_observation_processor=robot_observation_processor,
             display_compressed_images=display_compressed_images,
+            display_camera_fps=cfg.display_camera_fps,
         )
     except KeyboardInterrupt:
         pass

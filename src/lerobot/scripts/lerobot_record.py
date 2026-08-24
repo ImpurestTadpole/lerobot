@@ -91,6 +91,7 @@ lerobot-record \\
 
 import inspect
 import logging
+import signal
 import time
 from dataclasses import asdict, dataclass
 from pprint import pformat
@@ -734,40 +735,50 @@ def record(
                         display_mode=cfg.display_mode,
                     )
     finally:
-        # First, and in `finally`: ^C is how most recording sessions end, and the summary
-        # is most useful before the video encoding and the hub upload scroll it away.
-        timer.log_run_summary()
+        # Ctrl-C is how most recording sessions end, and this teardown runs hardware disconnects,
+        # dataset finalize/encode, and TTS/network calls that must run to completion once started.
+        # A second Ctrl-C landing mid-call inside a native extension here (pyrealsense2, rerun,
+        # subprocess) aborts the whole process ("Aborted (core dumped)") instead of raising a
+        # catchable exception, losing whatever episodes were already recorded. The first Ctrl-C
+        # already communicated "stop"; ignore further ones until teardown finishes.
+        previous_sigint_handler = signal.signal(signal.SIGINT, signal.SIG_IGN)
+        try:
+            # First, and inside this guard: the summary is most useful before the video encoding
+            # and the hub upload scroll it away.
+            timer.log_run_summary()
 
-        log_say("Stop recording", cfg.play_sounds, blocking=True)
+            log_say("Stop recording", cfg.play_sounds, blocking=True)
 
-        if cfg.display_data:
-            shutdown_visualization(cfg.display_mode)
+            if cfg.display_data:
+                shutdown_visualization(cfg.display_mode)
 
-        if dataset:
-            dataset.finalize()
+            if dataset:
+                dataset.finalize()
 
-        if robot.is_connected:
-            robot.disconnect()
-        if teleop and teleop.is_connected:
-            teleop.disconnect()
+            if robot.is_connected:
+                robot.disconnect()
+            if teleop and teleop.is_connected:
+                teleop.disconnect()
 
-        if listener is not None:
-            listener.stop()
+            if listener is not None:
+                listener.stop()
 
-        if cfg.dataset.push_to_hub:
-            if dataset and dataset.num_episodes > 0:
-                try:
-                    dataset.push_to_hub(tags=cfg.dataset.tags, private=cfg.dataset.private)
-                    logging.info(f"✅ Dataset pushed to hub: {cfg.dataset.repo_id}")
-                except Exception as e:
-                    logging.warning(f"⚠️  Failed to push dataset to hub: {e}")
-            else:
-                logging.info(
-                    "Skipping push to hub: no episodes saved "
-                    "(recording was interrupted before saving any episodes)"
-                )
+            if cfg.dataset.push_to_hub:
+                if dataset and dataset.num_episodes > 0:
+                    try:
+                        dataset.push_to_hub(tags=cfg.dataset.tags, private=cfg.dataset.private)
+                        logging.info(f"✅ Dataset pushed to hub: {cfg.dataset.repo_id}")
+                    except Exception as e:
+                        logging.warning(f"⚠️  Failed to push dataset to hub: {e}")
+                else:
+                    logging.info(
+                        "Skipping push to hub: no episodes saved "
+                        "(recording was interrupted before saving any episodes)"
+                    )
 
-        log_say("Exiting", cfg.play_sounds)
+            log_say("Exiting", cfg.play_sounds)
+        finally:
+            signal.signal(signal.SIGINT, previous_sigint_handler)
     return dataset
 
 

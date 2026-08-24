@@ -1109,6 +1109,21 @@ class XLerobotVRTeleop(Teleoperator):
             action[key] = robot_obs.get(key, 0.0)
         return action
     
+    def _get_fallback_obs(self) -> dict[str, Any]:
+        """Observation for the noop-action fallback paths in get_action().
+
+        These paths run when VR data is momentarily unavailable, not when the caller wants a
+        deliberate fresh read, so they must not pay for one: lerobot_teleoperate.py /
+        lerobot_record.py already call update_observation_cache() with this tick's observation
+        before invoking get_action(), so the cache is at most a few ms old here. Calling
+        robot.get_observation() again in these branches was doing a full, uncached re-read of
+        every camera (the single biggest cost in the loop) just to build a noop action.
+        """
+        current_time = time.perf_counter()
+        if self._cached_obs is not None and (current_time - self._obs_cache_time) < self._obs_cache_duration:
+            return self._cached_obs
+        return self.robot.get_observation()
+
     def get_action(self) -> dict[str, Any]:
         """Get VR control action with detailed profiling"""
         total_start = time.perf_counter()
@@ -1128,26 +1143,26 @@ class XLerobotVRTeleop(Teleoperator):
         # Quick check VR monitoring status and robot reference
         if not self.vr_monitor or self.robot is None:
             try:
-                robot_obs = self.robot.get_observation() if self.robot else {}
+                robot_obs = self._get_fallback_obs() if self.robot else {}
                 action = self._get_noop_action(robot_obs, self.robot)
             except Exception:
                 action = {}
             self.logs["read_pos_dt_s"] = time.perf_counter() - total_start
             return action
-        
+
         # Get VR data once to avoid repeated calls
         vr_start = time.perf_counter()
         try:
             dual_goals = self.vr_monitor.get_latest_goal_nowait()
             if dual_goals is None:
                 try:
-                    robot_obs = self.robot.get_observation()
+                    robot_obs = self._get_fallback_obs()
                     action = self._get_noop_action(robot_obs, self.robot)
                 except Exception:
                     action = {}
                 self.logs["read_pos_dt_s"] = time.perf_counter() - total_start
                 return action
-                
+
             left_goal = dual_goals.get("left")
             right_goal = dual_goals.get("right")
             headset_goal = dual_goals.get("headset")
@@ -1157,7 +1172,7 @@ class XLerobotVRTeleop(Teleoperator):
         except Exception as e:
             logger.warning(f"VR data acquisition failed: {e}")
             try:
-                robot_obs = self.robot.get_observation()
+                robot_obs = self._get_fallback_obs()
                 action = self._get_noop_action(robot_obs, self.robot)
             except Exception:
                 action = {}
