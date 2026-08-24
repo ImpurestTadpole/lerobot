@@ -34,10 +34,21 @@ from ..config import TeleoperatorConfig
 #   reset_position       - reset the robot to its rest pose (momentary, held)
 #   toggle_intervention   - DAgger human/policy handover (RIGHT A today)
 #   upload_dataset        - push the recorded dataset to the Hub on demand
+#
+# LEFT MENU is special-cased in VREventHandler regardless of what it's mapped to here: a quick
+# tap dispatches its button_map semantic (stop_session by default) as usual, but holding it past
+# ~0.6s instead toggles VR passthrough and suppresses that tap semantic for the press. This isn't
+# remappable via button_map (it's tied to the physical left.menu button, not a semantic action).
+#
+# LEFT X is also special-cased: at the start of each episode attempt, lerobot_record.py arms a
+# "recording gate" (VREventHandler.reset_recording_gate()) and drives the robot without capturing
+# frames until X is pressed, so the operator can reposition things first. That first X press opens
+# the gate (and plays a status ding) instead of dispatching rerecord_episode; once the gate is
+# open, X reverts to its normal button_map semantic for the rest of the episode.
 DEFAULT_VR_BUTTON_MAP: dict[str, str] = {
-    "left.x": "rerecord_episode",
+    "left.x": "rerecord_episode",  # also opens the recording gate on the first press (see above)
     "left.y": "rerecord_episode",
-    "left.menu": "stop_session",
+    "left.menu": "stop_session",  # tap; long-press toggles passthrough instead (see above)
     "left.thumbstick": "reset_position",
     "right.b": "exit_early",
     "right.a": "toggle_intervention",

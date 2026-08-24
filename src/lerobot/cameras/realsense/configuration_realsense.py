@@ -44,6 +44,14 @@ class RealSenseCameraConfig(CameraConfig):
         color_mode: Color mode for image output (RGB or BGR). Defaults to RGB.
         use_rgb: Whether to enable the color stream. Defaults to True.
         use_depth: Whether to enable depth stream. Defaults to False.
+        depth_width: Requested frame width in pixels for the depth stream. Defaults to None,
+            which uses `width` (same resolution as color). Lower depth resolution reduces the
+            USB/hardware-sync cost of `try_wait_for_frames()` on every hardware frame — unlike
+            `depth_frame_interval`, which only skips decoding an already-arrived frame.
+        depth_height: Requested frame height in pixels for the depth stream. Defaults to None,
+            which uses `height` (same resolution as color).
+        depth_frame_interval: Decode a depth frame only every Nth hardware frame (color stays
+            full-rate). Lower CPU cost, lower depth temporal resolution. Defaults to 1 (every frame).
         rotation: Image rotation setting (0°, 90°, 180°, or 270°). Defaults to no rotation.
         warmup_s: Time reading frames before returning from connect (in seconds)
         exposure: Manual exposure value for the color sensor. When set, auto-exposure is
@@ -70,6 +78,15 @@ class RealSenseCameraConfig(CameraConfig):
     color_mode: ColorMode = ColorMode.RGB
     use_rgb: bool = True
     use_depth: bool = False
+    depth_width: int | None = None
+    depth_height: int | None = None
+    # Decode/postprocess a depth frame only every Nth hardware frame the background read thread
+    # sees (color stays at the full rate every frame). The RealSense SDK delivers a synced
+    # color+depth frameset per hardware frame regardless of this setting, so it doesn't reduce
+    # USB bandwidth — but decoding+postprocessing the depth frame (the actual CPU cost) is skipped
+    # on the other frames, which is where the real per-frame cost of use_depth=True comes from.
+    # 1 = every frame (highest depth temporal resolution, highest CPU cost).
+    depth_frame_interval: int = 1
     rotation: Cv2Rotation = Cv2Rotation.NO_ROTATION
     warmup_s: int = 1
     exposure: int | None = None
@@ -82,6 +99,17 @@ class RealSenseCameraConfig(CameraConfig):
 
         if not self.use_rgb and not self.use_depth:
             raise ValueError("At least one of `use_rgb` or `use_depth` must be enabled.")
+
+        if self.depth_frame_interval < 1:
+            raise ValueError(f"`depth_frame_interval` must be >= 1, got {self.depth_frame_interval}.")
+
+        depth_res_values = (self.depth_width, self.depth_height)
+        if any(v is not None for v in depth_res_values) and any(v is None for v in depth_res_values):
+            raise ValueError("`depth_width` and `depth_height` must either both be set, or both be None.")
+        if self.depth_width is not None and not self.use_depth:
+            raise ValueError("`depth_width`/`depth_height` require `use_depth=True`.")
+        if self.depth_width is not None and self.width is None:
+            raise ValueError("`depth_width`/`depth_height` require `width`/`height`/`fps` to also be set.")
 
         manual_color_options = {
             "exposure": self.exposure,

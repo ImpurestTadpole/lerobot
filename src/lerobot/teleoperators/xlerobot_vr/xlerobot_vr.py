@@ -1584,6 +1584,11 @@ class VREventHandler:
     # legacy behaviour of exit_early/rerecord_episode/stop_recording).
     _SELF_CLEARING_SEMANTICS = frozenset({"reset_position"})
 
+    # How long LEFT menu must be held before it's treated as a long-press (passthrough toggle)
+    # instead of a tap (its normal button_map semantic, dispatched on release). See
+    # ``_process_left_menu``.
+    _LONG_PRESS_S = 0.6
+
     def __init__(self, vr_monitor, button_map: dict[str, str] | None = None):
         self.vr_monitor = vr_monitor
         # NOTE: check `is None`, not truthiness -- an explicitly empty `{}` must
@@ -1597,7 +1602,13 @@ class VREventHandler:
             "reset_position": False,   # Robot: reset to rest pose (self-clearing pulse)
             "back_position": False,    # Vestigial; never set True, kept for API compatibility
             "upload_requested": False, # DAgger: push dataset to Hub on demand
+            "recording_gate_open": False,  # Self-clearing pulse: LEFT X opened the recording gate
         }
+        # When True, LEFT X opens the recording gate (see reset_recording_gate /
+        # _process_left_controller) instead of dispatching its normal button_map semantic
+        # (rerecord_episode by default). Set by the caller (lerobot_record.py) at the start of
+        # each episode attempt, before any recording begins.
+        self.awaiting_recording_start = False
         self.prev_states = {
             'thumbstick_x': 0,
             'thumbstick_y': 0,
@@ -1607,6 +1618,8 @@ class VREventHandler:
             'button_y': False,
             'button_thumbstick': False,
             'button_menu': False,
+            'menu_press_start_ts': 0.0,
+            'menu_long_press_fired': False,
             # Right controller buttons
             'right_button_b': False,
             'right_b_last_press_ts': 0.0,
@@ -1625,7 +1638,19 @@ class VREventHandler:
         # Intervention toggle state, driven by whichever button_map key maps to
         # "toggle_intervention" (RIGHT A by default).
         self._intervention_active = False
-        
+        # Passthrough toggle state, driven by holding LEFT menu (see _process_left_menu).
+        self._passthrough_enabled = False
+
+    def reset_recording_gate(self) -> None:
+        """Arm the recording gate: the next LEFT X press opens it instead of re-recording.
+
+        Called by lerobot_record.py at the start of each episode attempt, before any frames are
+        captured, so the operator can freely reposition the robot and only start the actual
+        recording once ready.
+        """
+        self.awaiting_recording_start = True
+        self.events["recording_gate_open"] = False
+
     def update_events(self):
         """Update VR event status"""
         if not self.vr_monitor:
@@ -1670,6 +1695,12 @@ class VREventHandler:
             self._intervention_active = not self._intervention_active
             state_str = "ON (human)" if self._intervention_active else "OFF (policy)"
             logger.info("🎮 VR %s.%s pressed -> Intervention %s", controller, button, state_str)
+        elif semantic == "toggle_passthrough":
+            self._passthrough_enabled = not self._passthrough_enabled
+            state_str = "ON" if self._passthrough_enabled else "OFF"
+            logger.info("🎮 VR %s.%s held -> Passthrough %s", controller, button, state_str)
+            if self.vr_monitor is not None:
+                self.vr_monitor.send_status({"passthrough_enabled": self._passthrough_enabled})
         elif semantic is not None:
             logger.debug("VR %s.%s is mapped to unknown semantic action %r", controller, button, semantic)
 
@@ -1725,6 +1756,55 @@ class VREventHandler:
 
         self.prev_states[prev_key] = pressed
 
+    def _process_left_menu(self, pressed: bool) -> None:
+        """Edge/hold-detect the LEFT menu button.
+
+        A tap dispatches its button_map semantic (stop_session by default) on release, same
+        outcome as any other button. Holding it past ``_LONG_PRESS_S`` instead fires
+        "toggle_passthrough" once, and suppresses the tap semantic for that press so a long
+        hold doesn't also stop the session. Handled separately from ``_process_button``
+        because it needs release-time dispatch and hold-duration tracking that the generic
+        edge-only path doesn't do.
+        """
+        now = time.monotonic()
+        prev_pressed = bool(self.prev_states.get('button_menu', False))
+        long_press_fired = bool(self.prev_states.get('menu_long_press_fired', False))
+
+        if pressed and not prev_pressed:
+            self.prev_states['menu_press_start_ts'] = now
+            self.prev_states['menu_long_press_fired'] = False
+        elif pressed and prev_pressed and not long_press_fired:
+            held_s = now - float(self.prev_states.get('menu_press_start_ts', now))
+            if held_s >= self._LONG_PRESS_S:
+                self.prev_states['menu_long_press_fired'] = True
+                self._dispatch_semantic("toggle_passthrough", "left", "menu")
+        elif not pressed and prev_pressed and not long_press_fired:
+            self._dispatch_semantic(self.button_map.get("left.menu"), "left", "menu")
+
+        self.prev_states['button_menu'] = pressed
+
+    def _process_left_x(self, pressed: bool) -> None:
+        """Edge-detect LEFT X, special-cased while ``awaiting_recording_start`` is set.
+
+        While the recording gate is armed (see ``reset_recording_gate``), a rising edge opens
+        the gate (self-clearing pulse on "recording_gate_open") instead of dispatching X's
+        normal button_map semantic (rerecord_episode by default) — pressing X is how the
+        operator says "start recording now" for that episode. Once the gate has opened for this
+        episode, X reverts to its normal behavior for the rest of the episode.
+        """
+        if self.awaiting_recording_start:
+            prev_pressed = bool(self.prev_states.get('button_x', False))
+            if pressed and not prev_pressed:
+                self.awaiting_recording_start = False
+                self.events["recording_gate_open"] = True
+                logger.info("🎮 VR left.x pressed -> Recording gate open")
+                if self.vr_monitor is not None:
+                    self.vr_monitor.send_status({"recording_enabled": True})
+            self.prev_states['button_x'] = pressed
+        else:
+            self.events["recording_gate_open"] = False
+            self._process_button("left", "x", pressed, "button_x")
+
     def _process_left_controller(self, metadata):
         """Process left controller input (session/DAgger buttons per ``button_map``)."""
         buttons = _safe_buttons(metadata)
@@ -1737,9 +1817,9 @@ class VREventHandler:
         # IMPORTANT: Do NOT map thumbstick *movement* to session events.
         # The left thumbstick X axis is used for base rotation, so only the
         # click (button) is bound here, not the analog axis.
-        self._process_button("left", "x", bool(buttons.get('x', False)), "button_x")
+        self._process_left_x(bool(buttons.get('x', False)))
         self._process_button("left", "y", bool(buttons.get('y', False)), "button_y")
-        self._process_button("left", "menu", bool(buttons.get('menu', False)), "button_menu")
+        self._process_left_menu(bool(buttons.get('menu', False)))
         self._process_button(
             "left", "thumbstick", bool(buttons.get('thumbstick', False)), "button_thumbstick"
         )
@@ -1854,6 +1934,12 @@ class VREventHandler:
           When "toggle_intervention" is ON: VR controls the robot, the policy
           is paused, and frames are recorded as interventions. OFF hands
           control back to the policy.
+        -----------------------------------------------------------------
+          - LEFT Menu button (hold ~{self._LONG_PRESS_S:.1f}s): Toggle VR passthrough
+            (tap instead for its normal button_map action above)
+          - LEFT X button: at the start of each episode, robot is driven but NOT recorded
+            until X is pressed once (plays a ding) — reposition freely first, then press X
+            to start capturing frames. After that, X reverts to its button_map action above.
         ===================================================================
         """
         logger.info(guide)

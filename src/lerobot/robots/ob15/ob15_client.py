@@ -103,7 +103,7 @@ class OB15Client(Robot):
     def _depth_cameras_ft(self) -> dict[str, tuple[int, int, int]]:
         """Depth features, keyed `{cam_name}_depth`, for cameras with `use_depth=True` (RealSense)."""
         return {
-            f"{name}_depth": (cfg.height, cfg.width, 1)
+            f"{name}_depth": (getattr(cfg, "depth_height", None) or cfg.height, getattr(cfg, "depth_width", None) or cfg.width, 1)
             for name, cfg in self.config.cameras.items()
             if getattr(cfg, "use_depth", False)
         }

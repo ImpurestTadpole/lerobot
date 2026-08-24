@@ -253,6 +253,7 @@ def record_loop(
     display_mode: str = "rerun",
     display_compressed_images: bool = False,
     timer: CycleTimer | None = None,
+    depth_read_interval: int = 1,
 ):
     """Drive the robot from the teleoperator at *fps*, optionally recording each frame.
 
@@ -306,9 +307,7 @@ def record_loop(
     prev_loop_start = time.perf_counter()  # Track previous loop start time
     frame_idx = 0  # For throttling visualization
 
-    # Depth read throttling: set to 1 to read depth every frame.
-    # For training with depth, it's usually better to keep depth time-aligned to RGB/actions.
-    depth_read_interval = 1  # Read depth every frame
+    # Depth read throttling: set via --dataset.depth_read_interval (1 = read depth every frame).
     # Only some robots' get_observation() accepts skip_cameras/skip_depth kwargs; other robots use
     # the base no-arg signature and would raise TypeError if we passed these kwargs unconditionally.
     robot_supports_depth_throttle = "skip_depth" in inspect.signature(robot.get_observation).parameters
@@ -663,6 +662,41 @@ def record(
                 # Used only for logging inside record_loop.
                 events["_episode_idx"] = recorded_episodes + 1
                 events["_episode_total"] = cfg.dataset.num_episodes
+
+                # VR-only: don't start capturing frames until the operator explicitly says so.
+                # This gives time to reposition the robot/scene after the reset phase without
+                # that repositioning ending up in the recorded episode. dataset=None below means
+                # the robot is driven exactly like a normal control loop, just nothing is saved.
+                if isinstance(teleop, XLerobotVRTeleop) and getattr(teleop, "vr_event_handler", None):
+                    teleop.vr_event_handler.reset_recording_gate()
+                    log_say("Press LEFT X to start recording", cfg.play_sounds)
+                    while not events.get("recording_gate_open") and not events["stop_recording"]:
+                        record_loop(
+                            robot=robot,
+                            events=events,
+                            fps=cfg.dataset.fps,
+                            teleop_action_processor=teleop_action_processor,
+                            robot_action_processor=robot_action_processor,
+                            robot_observation_processor=robot_observation_processor,
+                            teleop=teleop,
+                            control_time_s=0.5,
+                            single_task=cfg.dataset.single_task,
+                            display_data=cfg.display_data,
+                            display_mode=cfg.display_mode,
+                            depth_read_interval=cfg.dataset.depth_read_interval,
+                        )
+                    events["recording_gate_open"] = False
+                    if events["stop_recording"]:
+                        break
+                    # Same defensive clear as above: a stray rerecord/exit_early press during the
+                    # wait (e.g. LEFT Y) must not immediately discard the recording that's about
+                    # to start.
+                    events["rerecord_episode"] = False
+                    events["exit_early"] = False
+                    if getattr(teleop, "vr_event_handler", None):
+                        teleop.vr_event_handler.events["rerecord_episode"] = False
+                        teleop.vr_event_handler.events["exit_early"] = False
+
                 if isinstance(teleop, Teleoperator) and hasattr(teleop, "send_episode_event"):
                     teleop.send_episode_event("start")
                 record_loop(
@@ -680,6 +714,7 @@ def record(
                     display_mode=cfg.display_mode,
                     display_compressed_images=display_compressed_images,
                     timer=timer,
+                    depth_read_interval=cfg.dataset.depth_read_interval,
                 )
                 if isinstance(teleop, Teleoperator) and hasattr(teleop, "send_episode_event"):
                     teleop.send_episode_event("stop")
@@ -733,6 +768,7 @@ def record(
                         single_task=cfg.dataset.single_task,
                         display_data=cfg.display_data,
                         display_mode=cfg.display_mode,
+                        depth_read_interval=cfg.dataset.depth_read_interval,
                     )
     finally:
         # Ctrl-C is how most recording sessions end, and this teardown runs hardware disconnects,

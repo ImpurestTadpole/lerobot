@@ -158,6 +158,7 @@ class RealSenseCamera(Camera):
         self.color_mode = config.color_mode
         self.use_rgb = config.use_rgb
         self.use_depth = config.use_depth
+        self.depth_frame_interval = config.depth_frame_interval
         self.warmup_s = config.warmup_s
         self.exposure: int | None = config.exposure
         self.gain: int | None = config.gain
@@ -184,6 +185,8 @@ class RealSenseCamera(Camera):
 
         self.capture_width: int | None = None
         self.capture_height: int | None = None
+        self.depth_capture_width: int | None = None
+        self.depth_capture_height: int | None = None
         self._reset_connection_settings()
 
     def __str__(self) -> str:
@@ -196,8 +199,12 @@ class RealSenseCamera(Camera):
         self.height = self.config.height
         self.warmup_s = self.config.warmup_s
         self.capture_width, self.capture_height = self.width, self.height
+        self.depth_width = self.config.depth_width if self.config.depth_width is not None else self.width
+        self.depth_height = self.config.depth_height if self.config.depth_height is not None else self.height
+        self.depth_capture_width, self.depth_capture_height = self.depth_width, self.depth_height
         if self.rotation in [cv2.ROTATE_90_CLOCKWISE, cv2.ROTATE_90_COUNTERCLOCKWISE]:
             self.capture_width, self.capture_height = self.height, self.width
+            self.depth_capture_width, self.depth_capture_height = self.depth_height, self.depth_width
 
     @property
     def is_connected(self) -> bool:
@@ -420,7 +427,11 @@ class RealSenseCamera(Camera):
                 )
             if self.use_depth:
                 rs_config.enable_stream(
-                    rs.stream.depth, self.capture_width, self.capture_height, rs.format.z16, self.fps
+                    rs.stream.depth,
+                    self.depth_capture_width,
+                    self.depth_capture_height,
+                    rs.format.z16,
+                    self.fps,
                 )
         else:
             if self.use_rgb:
@@ -458,6 +469,12 @@ class RealSenseCamera(Camera):
             else:
                 self.width, self.height = actual_width, actual_height
                 self.capture_width, self.capture_height = actual_width, actual_height
+            # Auto-resolution mode enables the depth stream with no explicit resolution too (see
+            # _configure_rs_pipeline_config), so it lands on whatever the device defaults to —
+            # mirror color's just-detected dimensions here since we have no independent depth
+            # stream profile to read in this branch.
+            self.depth_width, self.depth_height = self.width, self.height
+            self.depth_capture_width, self.depth_capture_height = self.capture_width, self.capture_height
 
     def _read(self, read_depth: bool = False) -> NDArray[Any]:
         """Shared helper for :meth:`read`/:meth:`read_depth`: wait for a fresh color or depth frame."""
@@ -680,15 +697,17 @@ class RealSenseCamera(Camera):
 
         if depth_frame:
             h, w = image.shape
+            expected_w, expected_h = self.depth_capture_width, self.depth_capture_height
         else:
             h, w, c = image.shape
 
             if c != 3:
                 raise RuntimeError(f"{self} frame channels={c} do not match expected 3 channels (RGB/BGR).")
+            expected_w, expected_h = self.capture_width, self.capture_height
 
-        if h != self.capture_height or w != self.capture_width:
+        if h != expected_h or w != expected_w:
             raise RuntimeError(
-                f"{self} frame width={w} or height={h} do not match configured width={self.capture_width} or height={self.capture_height}."
+                f"{self} frame width={w} or height={h} do not match configured width={expected_w} or height={expected_h}."
             )
 
         processed_image = image
@@ -716,16 +735,25 @@ class RealSenseCamera(Camera):
             raise RuntimeError(f"{self}: stop_event is not initialized before starting read loop.")
 
         failure_count = 0
+        hardware_frame_count = 0
         while not stop_event.is_set():
             try:
                 frame = self._read_from_hardware()
+                hardware_frame_count += 1
+                # The RealSense SDK delivers a synced color+depth frameset per hardware frame
+                # regardless of depth_frame_interval (so this doesn't reduce USB bandwidth) — but
+                # decoding+postprocessing the depth frame is the actual CPU cost of use_depth=True,
+                # and that's what gets skipped on the other frames.
+                decode_depth_this_frame = (
+                    self.use_depth and hardware_frame_count % self.depth_frame_interval == 0
+                )
 
                 if self.use_rgb:
                     color_frame_raw = frame.get_color_frame()
                     color_frame = np.asanyarray(color_frame_raw.get_data())
                     processed_color_frame = self._postprocess_image(color_frame)
 
-                if self.use_depth:
+                if decode_depth_this_frame:
                     depth_frame_raw = frame.get_depth_frame()
                     depth_frame = np.asanyarray(depth_frame_raw.get_data())
                     processed_depth_frame = self._postprocess_image(depth_frame, depth_frame=True)
@@ -740,11 +768,12 @@ class RealSenseCamera(Camera):
                         break
                     if self.use_rgb:
                         self.latest_color_frame = processed_color_frame
-                    if self.use_depth:
+                    if decode_depth_this_frame:
                         self.latest_depth_frame = processed_depth_frame
                     self.latest_timestamp = capture_time
                 self.new_frame_event.set()
-                self.new_depth_frame_event.set()
+                if decode_depth_this_frame:
+                    self.new_depth_frame_event.set()
                 failure_count = 0
 
             except DeviceNotConnectedError:

@@ -45,9 +45,24 @@ def ob15_cameras_config() -> dict[str, CameraConfig]:
         # use_depth=True records observation.images.head_depth (H, W, 1) uint16 mm alongside
         # RGB — the "master dataset" strategy: capture 18 DOF + RGB-D once, then derive
         # RGB-only / reduced-DOF subsets for co-training with lerobot-extract-subset
-        # (see RGBD_IMPLEMENTATION_GUIDE.md and COTRAINING.md). Costs ~20-30 ms per frame
-        # on the RealSense read; set skip_depth=True in get_observation() for latency-
-        # critical teleop without recording.
+        # (see RGBD_IMPLEMENTATION_GUIDE.md and COTRAINING.md).
+        #
+        # depth_width/depth_height=424x240: the RealSense SDK's try_wait_for_frames() blocks for a
+        # SYNCED color+depth frameset every hardware frame regardless of depth_frame_interval below
+        # — that USB/hardware-sync cost can't be throttled away, only reduced by capturing depth at
+        # a lower resolution than color (D435i supports independent depth/color resolutions).
+        # 424x240 is a standard D400-series depth mode, close to color's 16:9 aspect (640x360).
+        #
+        # depth_frame_interval=3: on top of that, the background read thread
+        # (camera_realsense.py:_read_loop) decodes+postprocesses depth only every 3rd hardware
+        # frame (~10 Hz depth vs 30 Hz RGB) instead of every frame — the decode itself is a
+        # separate, smaller cost on top of the sync cost above. Control-loop cadence was measured
+        # dropping from ~30 Hz to ~15-29 Hz (alternating) with use_depth=True at matched
+        # resolution and depth_frame_interval=1; raise depth_frame_interval back to 1 for max
+        # depth temporal resolution if your loop can absorb it, or higher (5+) for more headroom.
+        # dataset.depth_read_interval (a separate --dataset.depth_read_interval CLI flag) further
+        # throttles how often a decoded depth frame gets copied into the recorded episode; all
+        # three (depth resolution, depth_frame_interval, dataset.depth_read_interval) compose.
         "head": RealSenseCameraConfig(
             serial_number_or_name="342222071125",
             fps=30,
@@ -55,7 +70,10 @@ def ob15_cameras_config() -> dict[str, CameraConfig]:
             height=360,
             color_mode=ColorMode.RGB,
             rotation=Cv2Rotation.NO_ROTATION,
-            use_depth=False,
+            use_depth=True,
+            depth_width=424,
+            depth_height=240,
+            depth_frame_interval=3,
         ),
 
         # IMAGE SIZE RECOMMENDATION:

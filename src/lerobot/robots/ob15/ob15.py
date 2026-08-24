@@ -64,7 +64,7 @@ class OB15(Robot):
         self.speed_levels = [
             {"xy": 0.1, "theta": 30},  # slow
             {"xy": 0.2, "theta": 60},  # medium
-            {"xy": 0.3, "theta": 90},  # fast
+            {"xy": 0.6, "theta": 180},  # fast
         ]
         self.speed_index = 0  # Start at slow
         norm_mode_body = MotorNormMode.DEGREES if config.use_degrees else MotorNormMode.RANGE_M100_100
@@ -211,9 +211,14 @@ class OB15(Robot):
         for cam_name, cam_config in self.config.cameras.items():
             # Add color camera
             features[cam_name] = (cam_config.height, cam_config.width, 3)
-            # Add depth camera if enabled (RealSense cameras)
+            # Add depth camera if enabled (RealSense cameras). Depth may be captured at a
+            # different resolution than color (see RealSenseCameraConfig.depth_width/depth_height)
+            # to cut the USB/hardware-sync cost of enabling depth; fall back to the color
+            # dimensions when unset, matching the camera's own default.
             if hasattr(cam_config, 'use_depth') and cam_config.use_depth:
-                features[f"{cam_name}_depth"] = (cam_config.height, cam_config.width, 1)
+                depth_height = getattr(cam_config, 'depth_height', None) or cam_config.height
+                depth_width = getattr(cam_config, 'depth_width', None) or cam_config.width
+                features[f"{cam_name}_depth"] = (depth_height, depth_width, 1)
         return features
 
     @cached_property
@@ -825,11 +830,18 @@ class OB15(Robot):
                 try:
                     if cam.is_connected:
                         color_frame = cam.async_read()
-                        # For RealSense cameras with depth enabled, also read depth (unless skipped)
+                        # For RealSense cameras with depth enabled, also read depth (unless skipped).
+                        # Non-blocking peek (read_latest_depth), not async_read_depth: with
+                        # depth_frame_interval > 1 the background thread only decodes a fresh
+                        # depth frame every Nth hardware frame, so waiting for the "new frame"
+                        # event (async_read_depth) would block this tick on the camera's slower
+                        # depth cadence instead of returning immediately with the latest buffered
+                        # frame (possibly a few ticks old — fine, same "last known-good" backfill
+                        # already used for other camera hiccups, see last_camera_obs below).
                         depth_frame = None
-                        if not skip_depth and hasattr(cam, 'use_depth') and cam.use_depth and hasattr(cam, 'async_read_depth'):
+                        if not skip_depth and hasattr(cam, 'use_depth') and cam.use_depth and hasattr(cam, 'read_latest_depth'):
                             try:
-                                depth_frame = cam.async_read_depth()
+                                depth_frame = cam.read_latest_depth(max_age_ms=1000)
                             except Exception as e:
                                 logger.debug(f"⚠️  Failed to read depth from camera '{cam_key}': {e}")
                         return cam_key, color_frame, depth_frame

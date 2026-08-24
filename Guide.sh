@@ -284,6 +284,23 @@ lerobot-record \
     --dataset.push_to_hub=false \
     --resume=true
 
+# Pick-up task dataset (current OB15 hardware — robot.type renamed xlerobot -> ob15;
+# teleop stays xlerobot_vr). Edit repo_id/single_task/num_episodes for your specific task.
+# --resume=true requires --dataset.root explicitly (writes to the Hub revision cache otherwise
+# refuses, to avoid corrupting it) — reuse the same root on every batch for the same repo_id.
+lerobot-record \
+    --robot.type=ob15 \
+    --teleop.type=xlerobot_vr \
+    --dataset.repo_id=${HF_USER}/pickup_task \
+    --dataset.root=$HOME/.cache/huggingface/lerobot/${HF_USER}/pickup_task \
+    --dataset.single_task="pick up the object and place it in the bin" \
+    --dataset.num_episodes=20 \
+    --dataset.episode_time_s=180 \
+    --dataset.reset_time_s=10 \
+    --dataset.fps=30 \
+    --dataset.push_to_hub=false \
+    --resume=true
+
 # Manually push to hub after recording:
 # HF_DATASETS_CACHE=/tmp bypasses any corrupt Arrow cache from a previous interrupted load
 HF_DATASETS_CACHE=/tmp/hf_datasets_tmp python -c "from lerobot.datasets.lerobot_dataset import LeRobotDataset; \
