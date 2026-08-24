@@ -55,7 +55,7 @@ def ob15_cameras_config() -> dict[str, CameraConfig]:
             height=360,
             color_mode=ColorMode.RGB,
             rotation=Cv2Rotation.NO_ROTATION,
-            use_depth=True,
+            use_depth=False,
         ),
 
         # IMAGE SIZE RECOMMENDATION:
@@ -85,7 +85,7 @@ def ob15_cameras_config() -> dict[str, CameraConfig]:
         # PERFORMANCE: MJPG format is critical for 30 Hz control rate
         # If MJPG fails (camera defaults to YUYV), run: ./setup_camera_formats.sh
         "left_wrist": OpenCVCameraConfig(
-            index_or_path="/dev/video8",  # Innomaker camera 2 (swapped)
+            index_or_path="/dev/video6",  # Innomaker camera 2 (swapped)
             fps=30,
             width=640,   # For 30 Hz with MJPG. If using YUYV, reduce to 320x240
             height=360,  # For 30 Hz with MJPG. If using YUYV, reduce to 320x240
@@ -98,7 +98,7 @@ def ob15_cameras_config() -> dict[str, CameraConfig]:
         # PERFORMANCE: MJPG format is critical for 30 Hz control rate
         # If MJPG fails (camera defaults to YUYV), run: ./setup_camera_formats.sh
         "right_wrist": OpenCVCameraConfig(
-            index_or_path="/dev/video6",  # Innomaker camera 1 (swapped)
+            index_or_path="/dev/video8",  # Innomaker camera 1 (swapped)
             fps=30,
             width=640,   # For 30 Hz with MJPG. If using YUYV, reduce to 320x240
             height=360,  # For 30 Hz with MJPG. If using YUYV, reduce to 320x240
@@ -121,19 +121,21 @@ class OB15Config(RobotConfig):
     #
     # Stable udev names (once bob_1/config/99-ob15.rules is installed): /dev/ob15_bus1 and
     # /dev/ob15_bus2 (or /dev/ob15_<limb> after a per-limb split).
-    left_arm_port: str = "/dev/ttyACM1"  # left arm motors, IDs 1-6
-    right_arm_port: str = "/dev/ttyACM0"  # right arm motors, IDs 1-6
-    base_port: str = "/dev/ttyACM1"  # base wheels, IDs 7-9 (shares left_arm_port by default)
-    head_port: str = "/dev/ttyACM0"  # head pan/tilt, IDs 7-8 (shares right_arm_port by default)
+    # Bus 1 = left arm + base (base wheels 7-9 live on the left arm's bus).
+    # Bus 2 = right arm + head + lift (head pan/tilt 7-8 and lift motor 9 live on the
+    # right arm's bus).
+    left_arm_port: str = "/dev/ttyACM0"  # left arm motors, IDs 1-6
+    right_arm_port: str = "/dev/ttyACM1"  # right arm motors, IDs 1-6
+    base_port: str = "/dev/ttyACM0"  # base wheels, IDs 7-9 (shares left_arm_port by default)
+    head_port: str = "/dev/ttyACM1"  # head pan/tilt, IDs 7-8 (shares right_arm_port by default)
     # Only used when lift_axis.bus == "lift" (lift given its own dedicated port); otherwise
     # the lift motor attaches to whichever group's bus `lift_axis.bus` names.
     # Default matches bus2 (right_arm+head+lift). Must NOT default to bus1 — ID 9 collides
     # with base_right_wheel there.
-    lift_port: str = "/dev/ttyACM0"
-
+    lift_port: str = "/dev/ttyACM1"
     # Legacy aliases from XLerobotConfig (port1=bus1, port2=bus2). If set, they override the
     # corresponding per-limb ports in __post_init__ so old CLI/Guide.sh flags keep working:
-    #   --robot.port1=/dev/ttyACM1 --robot.port2=/dev/ttyACM0
+    #   --robot.port1=/dev/ttyACM0 --robot.port2=/dev/ttyACM1
     port1: str | None = None
     port2: str | None = None
 

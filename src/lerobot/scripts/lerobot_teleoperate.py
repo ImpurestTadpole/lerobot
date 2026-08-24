@@ -124,6 +124,7 @@ from lerobot.teleoperators import (  # noqa: F401
     rebot_102_leader,
     so_leader,
     unitree_g1,
+    xlerobot_vr,
 )
 from lerobot.utils.cycle_timer import CycleTimer
 from lerobot.utils.import_utils import register_third_party_plugins
@@ -321,7 +322,15 @@ def teleoperate(cfg: TeleoperateConfig):
     robot = make_robot_from_config(cfg.robot)
     teleop_action_processor, robot_action_processor, robot_observation_processor = make_default_processors()
 
-    teleop.connect()
+    # XLerobot VR needs the robot reference to initialize its arm/head controllers
+    # (calibrate() maps VR-space targets to the robot's current joint positions).
+    # Calibration itself is deferred inside XLerobotVRTeleop until the robot is
+    # actually connected, so the connect order below (teleop before robot, to avoid
+    # leaving the robot idle at a firmware watchdog) still works.
+    if isinstance(teleop, xlerobot_vr.XLerobotVRTeleop):
+        teleop.connect(robot=robot)
+    else:
+        teleop.connect()
     robot.connect()
 
     try:

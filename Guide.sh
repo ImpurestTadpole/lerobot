@@ -20,7 +20,7 @@ conda activate lerobot
 #   bash scripts/setup_cuda_env.sh
 # Then open a NEW terminal (or run conda deactivate, then conda activate lerobot) so the hook runs.
 # Verify: conda activate lerobot && lerobot-info  → should show CUDA True and GPU model.
-# See also: docs/source/torch_accelerators.mdx (CUDA troubleshooting).
+    # See also: docs/source/torch_accelerators.mdx (CUDA troubleshooting).
 
 # Set USB permissions (run every time after reboot or USB reconnect)
 sudo chmod 666 /dev/ttyACM0 /dev/ttyACM1
@@ -107,16 +107,20 @@ git remote -v                 # Verify remote URL
 # TELEOPERATION
 # =============================================================================
 # ON JETSON:
+# Visualization is the VR headset itself, via teleop.send_camera_frames() — independent of
+# --display_data (that flag is only for the desktop/remote Rerun viewer and is left off here
+# so the control loop isn't slowed down reading cameras/depth every tick for a viewer nobody
+# is watching). stream_cameras_to_vr defaults to true; passed explicitly below for clarity.
 lerobot-teleoperate \
     --robot.type=xlerobot \
     --teleop.type=xlerobot_vr \
-    --display_data=true
+    --teleop.stream_cameras_to_vr=true
 
 # OB15 (XLerobot without head pan/tilt — 15D action space, no head_pan/head_tilt keys):
 lerobot-teleoperate \
     --robot.type=ob15 \
     --teleop.type=xlerobot_vr \
-    --display_data=true
+    --teleop.stream_cameras_to_vr=true
 
 
 # -----------------------------------------------------------------------------
@@ -137,51 +141,6 @@ lerobot-teleoperate \
 #
 # Recording:   Observations: gantry.height_mm, gantry.vel
 #              Actions:      gantry.height_mm and/or gantry.vel (same keys)
-
-# =============================================================================
-# REMOTE VISUALIZATION (ON EXTERNAL PC)
-# =============================================================================
-
-# PREREQUISITE: teleop/record must be running ON THE JETSON with --display_data=true
-# (do not pass --display_ip — that makes the Jetson connect outward instead of serving).
-# On Jetson you should see: "Rerun gRPC server listening on 0.0.0.0:9876"
-# Verify: ss -tlnp | grep 9876
-#
-# PC: install matching rerun-cli (same major as Jetson rerun-sdk, e.g. 0.26.x):
-#   pip install "rerun-sdk==0.26.2"
-# NOT the snap package — it is often an incompatible older version.
-#
-# OPTION 1: Direct connection (recommended - best performance)
-rerun --serve-web --web-viewer-port 9090 --connect "rerun+http://172.20.10.2:9876/proxy"
-
-rerun --serve-web --web-viewer-port 9090 --connect "rerun+http://192.168.86.60:9876/proxy"
-
-rerun --serve-web --web-viewer-port 9090 --connect "rerun+http://10.249.40.136:9876/proxy"
-
-# OPTION 2: Via SSH tunnel
-# Terminal 1:
-ssh -L 9876:localhost:9876 jetson@192.168.0.104
-# Terminal 2:
-rerun --serve-web --web-viewer-port 9090 --connect "rerun+http://localhost:9876/proxy"
-
-# Then open in browser: http://localhost:9090  (not the Jetson IP — the viewer is local on the PC)
-#
-# Troubleshooting:
-# - Blank viewer / "transport error": Jetson teleop not running, wrong IP, or rerun version mismatch.
-# - Nothing on :9876: start lerobot-teleoperate with --display_data=true on the Jetson first.
-# - Firewall: on Jetson: sudo ufw allow 9876/tcp
-
-# NOTE: Install rerun via pip (not snap):
-pip3 install rerun-sdk
-
-# Make Rerun streaming low-latency / live (optional; defaults are already tuned):
-#   export RERUN_FLUSH_TICK_SECS=0.004   # 4ms flush (default). Use 0.002 for minimal latency.
-#   export RERUN_LOG_FREQUENCY=2        # Every other frame (default). Use 1 only on fast wired LAN.
-#   export RERUN_TARGET_WIDTH=320       # 640×360 cameras → 320×180 in Rerun (default). Use 480 on wired LAN.
-#   export RERUN_DOWNSAMPLE_FACTOR=0.2  # Optional: override target width for minimal Wi‑Fi bandwidth.
-# Rerun compression is now always on in code; for record/teleop you can still pass:
-#   --display_compressed_images=true   # Redundant but explicit; avoids raw frames if logic ever changes.
-
 
 # =============================================================================
 # HUGGINGFACE SETUP (ONE-TIME)
@@ -210,7 +169,6 @@ huggingface-cli login
 # OpenCV/V4L2 (RGB-only) to the RealSense SDK with depth capture (XLerobotConfig.use_realsense_depth
 # defaults to True). Requires pyrealsense2 importable in the venv (see camera_realsense.py).
 # Recorded depth lands in the dataset as "observation.images.head_depth" (dtype: depth, 16-bit mm).
-# To see depth in the Rerun viewer during teleop/record: export RERUN_SKIP_DEPTH=false
 # To fall back to plain RGB (e.g. no physical D435i, or pyrealsense2 unavailable), add:
 #     --robot.use_realsense_depth=false
 
@@ -224,7 +182,6 @@ lerobot-record \
     --dataset.single_task="transfer the block" \
     --dataset.num_episodes=5 \
     --dataset.fps=30 \
-    --display_data=true \
     --dataset.push_to_hub=true
     #--resume=true 
 
@@ -236,7 +193,6 @@ lerobot-record \
     --dataset.single_task="cleanup the clothing" \
     --dataset.num_episodes=5 \
     --dataset.fps=30 \
-    --display_data=true \
     --dataset.push_to_hub=true
     #--resume=true 
 
@@ -247,7 +203,6 @@ lerobot-record \
     --dataset.single_task="take coffee from blue place it in the machine, then place it on the yellow." \
     --dataset.num_episodes=15 \
     --dataset.fps=30 \
-    --display_data=true \
     --dataset.push_to_hub=true \
     --resume=true 
 
@@ -259,21 +214,9 @@ lerobot-record \
     --dataset.single_task="pick up the can and place it in the trash bin" \
     --dataset.num_episodes=10 \
     --dataset.fps=30 \
-    --display_data=true \
     --dataset.push_to_hub=false \
     --resume=true
 
-
-# Rerun live-view tuning — set before ANY lerobot-record call.
-# server_memory_limit defaults to 64MB in code (was 55% = ~4.4GB on 8GB Jetson).
-# A large buffer causes the viewer to replay old data when it (re)connects, appearing frozen/laggy.
-# export LEROBOT_RERUN_SERVER_MEMORY_LIMIT=200MB  # if viewers reconnect often and need more history.
-# RERUN_LOG_FREQUENCY=2  → log every other frame (halves viz CPU load)
-# RERUN_TARGET_WIDTH=320 → 320×180 in Rerun from 640×360 cameras (readable, still fast on Jetson)
-# RERUN_JPEG_QUALITY=60  → balance sharpness vs payload
-export RERUN_LOG_FREQUENCY=2
-export RERUN_TARGET_WIDTH=320
-export RERUN_JPEG_QUALITY=60
 
 lerobot-record \
     --robot.type=xlerobot \
@@ -282,7 +225,6 @@ lerobot-record \
     --dataset.single_task="sort the blocks by color" \
     --dataset.num_episodes=20 \
     --dataset.fps=30 \
-    --display_data=true \
     --dataset.push_to_hub=false \
     --resume=true 
 
@@ -293,7 +235,6 @@ lerobot-record \
     --dataset.repo_id=Odog16/block_sorting_single \
     --dataset.single_task="Pick up the red block and place it in the red bowl" \
     --dataset.num_episodes=14 \
-    --display_data=true \
     --dataset.fps=30 \
     --dataset.push_to_hub=false \
     --resume=true 
@@ -305,7 +246,6 @@ lerobot-record \
     --dataset.repo_id=Odog16/block_sorting_single \
     --dataset.single_task="Pick up the blue block and place it in the blue bowl" \
     --dataset.num_episodes=16 \
-    --display_data=true \
     --dataset.fps=30 \
     --dataset.push_to_hub=false \
     --resume=true 
@@ -318,7 +258,6 @@ lerobot-record \
     --dataset.repo_id=Odog16/block_sorting_single \
     --dataset.single_task="Pick up the green block and place it in the green bowl" \
     --dataset.num_episodes=16 \
-    --display_data=true \
     --dataset.fps=30 \
     --dataset.push_to_hub=false \
     --resume=true 
@@ -329,7 +268,6 @@ lerobot-record \
     --dataset.repo_id=Odog16/block_sorting_single \
     --dataset.single_task="Pick up the yellow block and place it in the yellow bowl" \
     --dataset.num_episodes=16 \
-    --display_data=true \
     --dataset.fps=30 \
     --dataset.push_to_hub=false \
     --resume=true 
@@ -343,7 +281,6 @@ lerobot-record \
     --dataset.single_task="pick up the tools from the table and place it in the red bin" \
     --dataset.num_episodes=5 \
     --dataset.fps=30 \
-    --display_data=true \
     --dataset.push_to_hub=false \
     --resume=true
 

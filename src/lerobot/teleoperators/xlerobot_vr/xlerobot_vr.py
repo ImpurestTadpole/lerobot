@@ -895,10 +895,19 @@ class XLerobotVRTeleop(Teleoperator):
             
             # Store robot reference for use in get_action
             self.robot = robot
-            
-            if calibrate and robot is not None:
+
+            if calibrate and robot is not None and robot.is_connected:
                 robot_obs = robot.get_observation()
                 self.calibrate(robot_obs)
+            elif calibrate and robot is not None:
+                # Robot reference given but not connected yet (e.g. teleop.connect() is
+                # called before robot.connect() to avoid leaving the robot idle at a
+                # firmware watchdog). Calibration happens lazily on the first get_action()
+                # call once the robot is actually connected.
+                logger.info(
+                    "[VR] Robot not connected yet — deferring arm-controller calibration "
+                    "to first get_action() call"
+                )
                 
         except Exception as e:
             logger.error(f"[VR] Connection failed: {e}")
@@ -1103,9 +1112,19 @@ class XLerobotVRTeleop(Teleoperator):
     def get_action(self) -> dict[str, Any]:
         """Get VR control action with detailed profiling"""
         total_start = time.perf_counter()
-        
+
         action = {}
-        
+
+        # Lazy calibration: connect() may have been called before the robot was
+        # connected (deferred above), so left_arm/right_arm/head_control are still
+        # None. Calibrate now that the robot is up, otherwise every action is a
+        # no-op and the arm never moves under VR control.
+        if not self._calibrated and self.robot is not None and self.robot.is_connected:
+            try:
+                self.calibrate(self.robot.get_observation())
+            except Exception as e:
+                logger.warning(f"[VR] Deferred calibration failed: {e}")
+
         # Quick check VR monitoring status and robot reference
         if not self.vr_monitor or self.robot is None:
             try:
