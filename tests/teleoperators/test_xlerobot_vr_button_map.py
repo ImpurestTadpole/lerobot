@@ -61,7 +61,13 @@ def test_default_left_x_or_y_triggers_rerecord_and_exit_early():
 
 def test_default_left_menu_stops_session():
     handler = VREventHandler(vr_monitor=None)
+    # _process_left_menu dispatches on RELEASE (a tap), not on the press itself, so it can
+    # distinguish a quick tap from a long-press-for-passthrough (see _LONG_PRESS_S). A press with
+    # no matching release must NOT fire stop_session yet.
     handler._process_left_controller(_meta({"menu": True}))
+    assert handler.events["stop_recording"] is False
+
+    handler._process_left_controller(_meta({"menu": False}))
     assert handler.events["stop_recording"] is True
 
 
@@ -85,8 +91,18 @@ def test_default_right_b_exits_episode_early():
     assert handler.events["exit_early"] is True
 
 
-def test_default_right_a_toggles_intervention():
+def test_default_right_a_exits_episode_early():
+    # RIGHT A and B are both exit_early by default -- a clearly separate pair on the right
+    # controller from LEFT X/Y's rerecord_episode, with no button bound to toggle_intervention
+    # out of the box (DAgger sessions opt in explicitly via --teleop.button_map).
     handler = VREventHandler(vr_monitor=None)
+    handler._process_right_controller(_meta({"a": True}))
+    assert handler.events["exit_early"] is True
+    assert handler._intervention_active is False
+
+
+def test_toggle_intervention_requires_explicit_remap():
+    handler = VREventHandler(vr_monitor=None, button_map={"right.a": "toggle_intervention"})
     assert handler._intervention_active is False
 
     handler._process_right_controller(_meta({"a": True}))
@@ -108,12 +124,14 @@ def test_right_button_debounce_ignores_rapid_repress():
     handler = VREventHandler(vr_monitor=None)
 
     handler._process_right_controller(_meta({"a": True}))
-    assert handler._intervention_active is True
+    assert handler.events["exit_early"] is True
+    handler.events["exit_early"] = False
 
     handler._process_right_controller(_meta({"a": False}))
-    # Re-press immediately, well inside the cooldown window -> ignored.
+    # Re-press immediately, well inside the cooldown window -> dispatch is skipped, so the event
+    # we just cleared stays cleared instead of firing again.
     handler._process_right_controller(_meta({"a": True}))
-    assert handler._intervention_active is True
+    assert handler.events["exit_early"] is False
 
 
 def test_right_missing_button_field_treated_as_unchanged():
@@ -164,3 +182,36 @@ def test_dispatch_semantic_is_idempotent_when_unmapped_button_omitted(semantic):
         "upload_dataset": ("upload_requested", True),
     }[semantic]
     assert handler.events[expected[0]] is expected[1]
+
+
+class _FakeVRMonitor:
+    """Records every send_status() call so tests can assert on the VR headset HUD payload."""
+
+    def __init__(self):
+        self.status_calls: list[dict] = []
+
+    def send_status(self, status: dict) -> None:
+        self.status_calls.append(status)
+
+
+def test_recording_gate_arm_clears_hud_recording_indicator():
+    monitor = _FakeVRMonitor()
+    handler = VREventHandler(vr_monitor=monitor)
+
+    handler.reset_recording_gate()
+
+    assert monitor.status_calls[-1] == {"recording_enabled": False}
+    assert handler.awaiting_recording_start is True
+
+
+def test_recording_gate_open_sets_hud_recording_indicator():
+    monitor = _FakeVRMonitor()
+    handler = VREventHandler(vr_monitor=monitor)
+    handler.reset_recording_gate()
+    monitor.status_calls.clear()
+
+    handler._process_left_x(True)
+
+    assert monitor.status_calls[-1] == {"recording_enabled": True}
+    assert handler.events["recording_gate_open"] is True
+    assert handler.awaiting_recording_start is False
