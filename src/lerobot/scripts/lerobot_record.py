@@ -340,6 +340,11 @@ def record_loop(
         # Checked before `tick()`: this iteration is not a control tick, so it should not
         # be timed as one.
         if events["exit_early"]:
+            # Diagnostic checkpoint (pairs with the "🔎 get_vr_events() returning ..." log in
+            # xlerobot_vr.py): confirms record_loop actually observes exit_early=True and takes
+            # this break. If the get_vr_events() log appears but this one never does, the value is
+            # being lost in `events.update(vr_events)` or the dict identity isn't what's expected.
+            logging.info("🔎 record_loop breaking on exit_early (rerecord_episode=%s)", events.get("rerecord_episode"))
             events["exit_early"] = False
             break
 
