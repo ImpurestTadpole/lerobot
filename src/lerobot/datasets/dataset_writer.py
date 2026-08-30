@@ -394,11 +394,13 @@ class DatasetWriter:
                 self._episodes_since_last_encoding = 0
 
         if episode_data is None:
-            # Only image/depth-stored cameras' staging frames are cleared here — video-
-            # stored cameras' staging frames must survive: the (possibly batched) encoder
-            # still needs them and deletes them itself once each video is written.
-            has_static_cams = len(self._meta.image_keys) + len(self._meta.depth_keys) > 0
-            self.clear_episode_buffer(delete_images=has_static_cams)
+            # Deliberately does not go through clear_episode_buffer(): only image/depth-
+            # stored cameras' staging frames are cleared here — video-stored cameras'
+            # staging frames must survive, since the (possibly batched) encoder still
+            # needs them and deletes them itself once each video is written.
+            if self._meta.image_keys or self._meta.depth_keys:
+                self._delete_camera_frame_dirs(self._meta.image_keys + self._meta.depth_keys)
+            self.episode_buffer = self._create_episode_buffer()
 
     def _batch_save_episode_video(self, start_episode: int, end_episode: int | None = None) -> None:
         """Batch save videos for multiple episodes."""
@@ -601,7 +603,10 @@ class DatasetWriter:
             self._streaming_encoder.cancel_episode()
 
         if delete_images:
-            self._delete_camera_frame_dirs(self._meta.image_keys + self._meta.depth_keys)
+            # Full discard (unlike save_episode's internal reset above): clears every
+            # camera modality's staging, including video, since this episode's frames
+            # are being thrown away entirely, not queued for the encoder.
+            self._delete_camera_frame_dirs(self._meta.camera_keys + self._meta.depth_keys)
 
         self.episode_buffer = self._create_episode_buffer()
 
