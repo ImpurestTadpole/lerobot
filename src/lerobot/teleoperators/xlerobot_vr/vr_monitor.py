@@ -474,9 +474,17 @@ class VRMonitor:
 
 def main():
     """Main function"""
+    # Standalone entry point only -- lerobot-record configures logging itself via
+    # init_logging(). Without a handler, every logger.info/debug call in this module and in
+    # xlevr (SSL cert loaded, "WebSocket server running on wss://...", client connect/disconnect,
+    # button activity, etc.) is silently dropped: Python's logging module only auto-prints
+    # WARNING-and-above (via logging.lastResort) when nothing else is configured. That made a
+    # `python vr_monitor.py` debug run look like the WebSocket server never started even when it
+    # was listening the whole time -- there was simply no log output to show it.
+    logging.basicConfig(level=logging.INFO, format="%(levelname)s %(name)s: %(message)s")
     print("🎮 XLeVR Monitor - XLeVR VR Control Information Monitor")
     print("=" * 60)
-    
+
     # Check XLeVR path
     if not os.path.exists(XLEVR_PATH):
         print(f"❌ XLeVR path does not exist: {XLEVR_PATH}")
