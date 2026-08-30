@@ -32,7 +32,7 @@ from ..config import TeleoperatorConfig
 #   exit_early          - end the current episode early (save & continue)
 #   stop_session        - stop recording / end the rollout session
 #   reset_position       - reset the robot to its rest pose (momentary, held)
-#   toggle_intervention   - DAgger human/policy handover (RIGHT A today)
+#   toggle_intervention   - DAgger human/policy handover (not bound by default, see below)
 #   upload_dataset        - push the recorded dataset to the Hub on demand
 #
 # LEFT MENU is special-cased in VREventHandler regardless of what it's mapped to here: a quick
@@ -44,14 +44,22 @@ from ..config import TeleoperatorConfig
 # "recording gate" (VREventHandler.reset_recording_gate()) and drives the robot without capturing
 # frames until X is pressed, so the operator can reposition things first. That first X press opens
 # the gate (and plays a status ding) instead of dispatching rerecord_episode; once the gate is
-# open, X reverts to its normal button_map semantic for the rest of the episode.
+# open, X reverts to its normal button_map semantic for the rest of the episode. The gate logic
+# guards this itself (no dispatch happens while the gate is armed), so binding X to
+# rerecord_episode here is safe and doesn't double-fire on the press that opens the gate.
+#
+# RIGHT A is intentionally exit_early (not toggle_intervention) by default: for the common
+# lerobot-record workflow, "stop this episode" needs a dedicated, easy-to-reach button distinct
+# from LEFT X/Y. DAgger sessions that want VR-button intervention toggling should override this
+# explicitly via --teleop.button_map='{"right.a": "toggle_intervention", ...}' until DAgger gets
+# its own default button layout (tracked separately).
 DEFAULT_VR_BUTTON_MAP: dict[str, str] = {
     "left.x": "rerecord_episode",  # also opens the recording gate on the first press (see above)
     "left.y": "rerecord_episode",
     "left.menu": "stop_session",  # tap; long-press toggles passthrough instead (see above)
     "left.thumbstick": "reset_position",
+    "right.a": "exit_early",
     "right.b": "exit_early",
-    "right.a": "toggle_intervention",
     "right.thumbstick": "upload_dataset",
 }
 

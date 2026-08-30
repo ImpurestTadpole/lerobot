@@ -1466,8 +1466,10 @@ class XLerobotVRTeleop(Teleoperator):
         ``input_device="teleop"``) and s1_process.py each control loop.
 
         IS_INTERVENTION reflects the toggle state driven by whichever physical button
-        is bound to the ``"toggle_intervention"`` action in ``button_map`` (RIGHT A by
-        default). STOP_SESSION and UPLOAD_REQUESTED surface the ``"stop_session"`` and
+        is bound to the ``"toggle_intervention"`` action in ``button_map`` (not bound by
+        default -- DAgger sessions must set e.g. --teleop.button_map='{"right.a":
+        "toggle_intervention", ...}' explicitly; see DEFAULT_VR_BUTTON_MAP).
+        STOP_SESSION and UPLOAD_REQUESTED surface the ``"stop_session"`` and
         ``"upload_dataset"`` button_map actions, so a DAgger session can be stopped or
         pushed to the Hub entirely from the VR controllers without a keyboard fallback.
         UPLOAD_REQUESTED is one-shot: it is cleared immediately after being read here.
@@ -1516,11 +1518,11 @@ class XLerobotVRTeleop(Teleoperator):
     def reset_intervention(self) -> None:
         """Clear intervention state at the start of each episode.
 
-        NOTE: this also clears the RIGHT A physical-button edge cache, since that
-        is the default "toggle_intervention" binding. If ``button_map`` is
-        customised to drive "toggle_intervention" from a different physical
-        button, that button's own edge cache is reset the same way on its next
-        press/release cycle, so a stale edge here is harmless.
+        NOTE: this also clears the RIGHT A physical-button edge cache, since that's the
+        button DAgger sessions are expected to rebind to "toggle_intervention" (not bound
+        by default, see DEFAULT_VR_BUTTON_MAP). If ``button_map`` drives "toggle_intervention"
+        from a different physical button instead, that button's own edge cache is reset the
+        same way on its next press/release cycle, so a stale edge here is harmless.
         """
         self._intervention_active = False
         if self.vr_event_handler is not None:
@@ -1721,7 +1723,8 @@ class VREventHandler:
         # guard (right-hand buttons); prevents double-fires from noisy packets.
         self._edge_cooldown_s = 0.5
         # Intervention toggle state, driven by whichever button_map key maps to
-        # "toggle_intervention" (RIGHT A by default).
+        # "toggle_intervention" (not bound by default; DAgger sessions rebind e.g.
+        # right.a explicitly, see DEFAULT_VR_BUTTON_MAP).
         self._intervention_active = False
         # Passthrough toggle state, driven by holding LEFT menu (see _process_left_menu).
         self._passthrough_enabled = False
