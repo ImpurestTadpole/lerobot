@@ -1738,6 +1738,12 @@ class VREventHandler:
         """
         self.awaiting_recording_start = True
         self.events["recording_gate_open"] = False
+        # Tell the headset HUD capture is NOT active yet -- without this, "recording_enabled"
+        # stays stuck True (from the previous episode's gate-open) through the whole reposition
+        # window, so the on-screen recording indicator would show red while nothing is actually
+        # being captured.
+        if self.vr_monitor is not None:
+            self.vr_monitor.send_status({"recording_enabled": False})
 
     def update_events(self):
         """Update VR event status"""

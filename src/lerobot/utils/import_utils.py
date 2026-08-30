@@ -77,9 +77,14 @@ def get_safe_default_video_backend():
             importlib.import_module("torchcodec")
             return "torchcodec"
         except (ImportError, OSError, RuntimeError) as e:
+            # torchcodec's own exception message is a multi-paragraph report of every FFmpeg
+            # version it tried (see the full traceback at DEBUG level) -- too long to print at
+            # WARNING on every single run, especially on platforms (e.g. this Jetson's ARM/CUDA
+            # combo) where the fallback is expected and harmless every time.
+            logger.debug(f"torchcodec import failed: {e}")
             logger.warning(
-                f"{e}\n'torchcodec' is installed but cannot be loaded (see the error above). "
-                "Falling back to 'pyav' as a default decoder."
+                "'torchcodec' is installed but cannot be loaded on this platform "
+                "(run with debug logging for the full error). Falling back to 'pyav' as a default decoder."
             )
             return "pyav"
     else:

@@ -478,6 +478,11 @@ def record_loop(
 
             # Push task/episode/elapsed-time info to the VR headset HUD once per second (see
             # XLerobotVRTeleop.send_status / CAMERA_PANEL_SLOTS status text in vr_app.js).
+            # "recording_enabled" is resent here every second (not just at the gate-open edge in
+            # xlerobot_vr.py) so a missed transition self-heals within a second instead of leaving
+            # the HUD's recording indicator stuck on the wrong state -- true exactly while this
+            # call is actually capturing frames (dataset is not None), false during the
+            # gate-wait/reset phases where the robot moves but nothing is recorded.
             if isinstance(teleop, Teleoperator) and hasattr(teleop, "send_status"):
                 ep_idx = events.get("_episode_idx")
                 ep_total = events.get("_episode_total")
@@ -488,6 +493,7 @@ def record_loop(
                         "episode_total": ep_total,
                         "elapsed_s": timestamp,
                         "episode_duration_s": control_time_s,
+                        "recording_enabled": dataset is not None,
                     }
                 )
 
