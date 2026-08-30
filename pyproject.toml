@@ -212,6 +212,9 @@ intelrealsense = [
     "pyrealsense2-macosx>=2.54,<2.57.0 ; sys_platform == 'darwin'",
 ]
 phone = ["hebi-py>=2.8.0,<2.12.0", "teleop>=0.1.0,<0.2.0", "fastapi<1.0", "lerobot[scipy-dep]"]
+# Browser control panel (lerobot-webui) for starting/stopping recording, inference, and DAgger
+# rollouts on a robot (e.g. ob15) from any browser on the same network.
+webui = ["fastapi<1.0", "uvicorn[standard]>=0.30.0,<1.0.0"]
 
 # Policies
 diffusion = ["lerobot[diffusers-dep]"]
@@ -339,6 +342,7 @@ all = [
     "lerobot[aloha]",
     "lerobot[pusht]",
     "lerobot[phone]",
+    "lerobot[webui]",
     "lerobot[libero]; sys_platform == 'linux'",
     "lerobot[metaworld]",
     "lerobot[sarm]",
@@ -368,6 +372,7 @@ lerobot-edit-dataset="lerobot.scripts.lerobot_edit_dataset:main"
 lerobot-setup-can="lerobot.scripts.lerobot_setup_can:main"
 lerobot-annotate="lerobot.scripts.lerobot_annotate:main"
 lerobot-rollout="lerobot.scripts.lerobot_rollout:main"
+lerobot-webui="lerobot.scripts.lerobot_webui:main"
 lerobot-cotrain-align="lerobot.data_processing.co_training_utils:main"
 lerobot-extract-subset="lerobot.data_processing.extract_subset:main"
 lerobot-umi-retarget="lerobot.data_processing.umi_retarget:main"
