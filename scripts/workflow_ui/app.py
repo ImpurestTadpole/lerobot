@@ -894,6 +894,277 @@ def _workflow_status_snapshot(name: str) -> dict:
 
 
 # ---------------------------------------------------------------------------
+# Generalist merge status — the ad-hoc, externally-launched EE-space merge
+# (own tasks + FastUMI + ALOHA + DROID → Odog16/generalist_ee_merged). This
+# job predates the WorkflowRun engine above and is a single long-running
+# `lerobot-cotrain-align` invocation launched directly with nohup, not
+# through this server — so it's tracked by parsing its log + a process-table
+# lookup instead of the run_state.json mechanism used for UI-launched runs.
+# ---------------------------------------------------------------------------
+
+GENERALIST_MERGE_LOG = WORKFLOWS_DIR / "ee_pretrain" / "logs" / "14_generalist_merge.log"
+GENERALIST_MERGE_RESUME_DOC = REPO_ROOT / "docs" / "generalist_merge_resume.md"
+GENERALIST_MERGE_PID_SIGNATURE = "Odog16/generalist_ee_merged"
+
+# (repo_id, group) in the exact order passed to --source-repos.
+GENERALIST_MERGE_SOURCES: list[tuple[str, str]] = [
+    ("Odog16/tool_pickup_ee", "own_tasks"),
+    ("Odog16/trash_pickup_merged_ee", "own_tasks"),
+    ("Odog16/block_sorting_single_ee", "own_tasks"),
+    ("Odog16/block_sorting_clean_ee", "own_tasks"),
+    ("Odog16/making_coffee_v1_ee", "own_tasks"),
+    ("Odog16/ob15_general_dataset_v1_ee", "own_tasks"),
+    ("Odog16/ob15_packing_box_filtered_ee", "own_tasks"),
+    ("Odog16/umi_ee_pretrain_full_clean_desktop", "fastumi_ee"),
+    ("Odog16/umi_ee_pretrain_full_dispose_of_desktop_debris", "fastumi_ee"),
+    ("Odog16/umi_ee_pretrain_full_put_books_into_schoolbag", "fastumi_ee"),
+    ("Odog16/umi_ee_pretrain_full_pack_skincare_products", "fastumi_ee"),
+    ("Odog16/umi_ee_pretrain_full_take_bottle_and_place_on_coaster", "fastumi_ee"),
+    ("Odog16/aloha_sim_insertion_human_ee", "aloha_ee"),
+    ("Odog16/aloha_sim_transfer_cube_human_ee", "aloha_ee"),
+    ("Odog16/aloha_sim_transfer_cube_scripted_ee", "aloha_ee"),
+    ("Odog16/aloha_static_coffee_ee", "aloha_ee"),
+    ("Odog16/aloha_mobile_cabinet_ee", "aloha_ee"),
+    ("Odog16/aloha_mobile_wash_pan_ee", "aloha_ee"),
+    ("Odog16/aloha_static_screw_driver_ee", "aloha_ee"),
+    ("Odog16/aloha_static_candy_ee", "aloha_ee"),
+    ("Odog16/aloha_mobile_wipe_wine_ee", "aloha_ee"),
+    ("Odog16/aloha_static_towel_ee", "aloha_ee"),
+    ("Odog16/aloha_static_vinh_cup_ee", "aloha_ee"),
+    ("Odog16/aloha_static_vinh_cup_left_ee", "aloha_ee"),
+    ("Odog16/aloha_static_ziploc_slide_ee", "aloha_ee"),
+    ("Odog16/aloha_static_coffee_new_ee", "aloha_ee"),
+    ("Odog16/aloha_static_cups_open_ee", "aloha_ee"),
+    ("Odog16/aloha_static_pingpong_test_ee", "aloha_ee"),
+    ("Odog16/aloha_static_pro_pencil_ee", "aloha_ee"),
+    ("Odog16/aloha_sim_insertion_scripted_ee", "aloha_ee"),
+    ("Odog16/droid_ee", "droid_ee"),
+]
+
+# tqdm line: "Align Odog16/foo_ee:  56%|█████▌    | 56/100 [08:02<06:24,  8.75s/ep, ...]"
+# Captures: repo, percent, episode, episode_total, elapsed, remaining, rate value+unit.
+# The "remaining" field is tqdm's own ETA for the current source — reused directly
+# below rather than re-derived, since it's already exactly what we'd compute.
+_ALIGN_PROGRESS_RE = re.compile(
+    r"^Align ([^\s:]+):\s+(\d+)%\|.*?\|\s*(\d+)/(\d+)\s*"
+    r"\[([\d:]+)<([\d:]+),\s*([\d.]+)(s/ep|ep/s|s/it|it/s)",
+    re.MULTILINE,
+)
+
+# Rough historical per-episode alignment cost per source group (seconds),
+# from real timings observed this session — own_tasks/fastumi_ee already
+# match the merge schema (no camera remap/resample) so re-encode fastest;
+# aloha_ee additionally resamples 50fps->30fps and remaps cameras; droid_ee
+# is a rewritten-elsewhere-in-this-project fast parquet-level path. Only
+# used to project an ETA for sources that haven't started yet — the CURRENT
+# source's own ETA below comes from tqdm's live rate, not this table.
+_GROUP_AVG_SECONDS_PER_EPISODE = {
+    "own_tasks": 9.0,
+    "fastumi_ee": 9.0,
+    "aloha_ee": 12.0,
+    "droid_ee": 4.3,
+}
+
+
+def _source_total_episodes(repo: str) -> int | None:
+    """Real episode count for *repo*, read directly from its local
+    meta/info.json — no torch/cv2 import needed, just a small JSON read."""
+    info_path = HF_LEROBOT_CACHE / repo / "meta" / "info.json"
+    if not info_path.is_file():
+        return None
+    try:
+        return int(json.loads(info_path.read_text()).get("total_episodes") or 0)
+    except (OSError, json.JSONDecodeError, ValueError):
+        return None
+
+
+def _source_done_on_disk(repo: str) -> bool:
+    """Whether *repo*'s alignment is genuinely complete, checked directly on
+    disk (survives log truncation/rotation across a stop+relaunch — a plain
+    log-line scan alone can't see progress from before the log was last
+    overwritten). Mirrors the same episode-count comparison
+    `_alignment_artifacts_match` uses in co_training_utils.py, reading only
+    two small JSON files — no torch/cv2 import needed."""
+    tmp_info = (
+        HF_LEROBOT_CACHE / "Odog16" / f"_align_tmp_{repo.replace('/', '__')}" / "meta" / "info.json"
+    )
+    expected = _source_total_episodes(repo)
+    if not expected or not tmp_info.is_file():
+        return False
+    try:
+        cached = int(json.loads(tmp_info.read_text()).get("total_episodes") or -1)
+    except (OSError, json.JSONDecodeError, ValueError):
+        return False
+    return cached == expected
+
+
+def _parse_tqdm_duration(s: str) -> int | None:
+    """"H:MM:SS" or "MM:SS" (tqdm's own bracketed duration format) -> seconds."""
+    try:
+        parts = [int(p) for p in s.split(":")]
+    except ValueError:
+        return None
+    if len(parts) == 2:
+        return parts[0] * 60 + parts[1]
+    if len(parts) == 3:
+        return parts[0] * 3600 + parts[1] * 60 + parts[2]
+    return None
+
+
+def _format_eta(seconds: int) -> str:
+    if seconds <= 0:
+        return "any moment"
+    d, rem = divmod(seconds, 86400)
+    h, rem = divmod(rem, 3600)
+    m, _ = divmod(rem, 60)
+    if d:
+        return f"~{d}d {h}h"
+    if h:
+        return f"~{h}h {m}m"
+    return f"~{m}m"
+
+
+def _merge_pid_alive() -> int | None:
+    """Real PID of the running merge process, found by command-line signature
+    rather than a hand-maintained pid file — survives this UI server being
+    restarted, and a relaunch under a new PID after a stop/reboot."""
+    try:
+        out = subprocess.run(
+            ["pgrep", "-f", GENERALIST_MERGE_PID_SIGNATURE],
+            capture_output=True, text=True, timeout=5,
+        )
+    except (OSError, subprocess.TimeoutExpired):
+        return None
+    pids = [int(p) for p in out.stdout.split() if p.strip().isdigit()]
+    return pids[0] if pids else None
+
+
+def generalist_merge_status() -> dict:
+    """Live status of the multi-day EE-space generalist merge, parsed
+    straight from its log."""
+    log_path = GENERALIST_MERGE_LOG
+    if not log_path.is_file():
+        return {"found": False}
+
+    # Which sources have a completion marker anywhere in the log. grep does
+    # the heavy lifting on a log that grows to many MB over a multi-day run —
+    # Python never reads the whole file, just this short, filtered result.
+    try:
+        grep = subprocess.run(
+            ["grep", "-aE",
+             r"already merge-ready\)|Aligned dataset written to|"
+             r"Reusing already-aligned cache|Reusing completed aligned dataset at|"
+             r"Wrote co-train source manifest",
+             str(log_path)],
+            capture_output=True, text=True, timeout=20,
+        )
+        done_lines = grep.stdout.splitlines()
+    except (OSError, subprocess.TimeoutExpired):
+        done_lines = []
+
+    merge_complete = any("Wrote co-train source manifest" in line for line in done_lines)
+    done_repos: set[str] = set()
+    for repo, _group in GENERALIST_MERGE_SOURCES:
+        marker_tmp = f"_align_tmp_{repo.replace('/', '__')}"
+        marker_native = f"already merge-ready): {repo} "
+        from_log = any(marker_native in line or marker_tmp in line for line in done_lines)
+        if from_log or _source_done_on_disk(repo):
+            done_repos.add(repo)
+
+    # Current in-progress source + episode progress: only the log tail matters.
+    try:
+        with open(log_path, "rb") as f:
+            f.seek(0, 2)
+            size = f.tell()
+            f.seek(max(0, size - 32_000))
+            tail = f.read().decode("utf-8", errors="replace")
+    except OSError:
+        tail = ""
+    tail = tail.replace("\r", "\n")
+    current_repo = current_pct = current_ep = current_ep_total = None
+    current_elapsed_s = current_remaining_s = current_rate_s_per_ep = None
+    for m in _ALIGN_PROGRESS_RE.finditer(tail):
+        current_repo, current_pct, current_ep, current_ep_total = (
+            m.group(1), int(m.group(2)), int(m.group(3)), int(m.group(4)),
+        )
+        current_elapsed_s = _parse_tqdm_duration(m.group(5))
+        current_remaining_s = _parse_tqdm_duration(m.group(6))
+        rate_val, rate_unit = float(m.group(7)), m.group(8)
+        current_rate_s_per_ep = rate_val if rate_unit in ("s/ep", "s/it") else (
+            1.0 / rate_val if rate_val > 0 else None
+        )
+
+    error_line = None
+    for line in tail.splitlines():
+        if any(tok in line for tok in ("Traceback", "CRITICAL", "Killed", "OOM")):
+            error_line = line.strip()
+
+    pid = _merge_pid_alive()
+    sources = []
+    total_all_episodes = 0
+    total_done_episodes = 0
+    pending_eta_s = 0
+    for repo, group in GENERALIST_MERGE_SOURCES:
+        ep_total = _source_total_episodes(repo)
+        if repo in done_repos:
+            status = "done"
+        elif repo == current_repo:
+            status = "current"
+        else:
+            status = "pending"
+        entry = {"repo": repo, "group": group, "status": status, "episode_total": ep_total}
+        if repo == current_repo:
+            entry.update(
+                percent=current_pct, episode=current_ep,
+                eta_s=current_remaining_s, elapsed_s=current_elapsed_s,
+                rate_s_per_ep=(
+                    round(current_rate_s_per_ep, 2) if current_rate_s_per_ep is not None else None
+                ),
+            )
+        if status == "done" and ep_total:
+            total_done_episodes += ep_total
+        if ep_total:
+            total_all_episodes += ep_total
+        # ETA contribution: current source uses tqdm's own live remaining-time;
+        # any source after it (not yet started) uses the group's historical
+        # average rate against its real episode count (rough estimate — see
+        # _GROUP_AVG_SECONDS_PER_EPISODE's docstring).
+        if status == "current" and current_remaining_s is not None:
+            pending_eta_s += current_remaining_s
+        elif status == "pending" and ep_total:
+            pending_eta_s += ep_total * _GROUP_AVG_SECONDS_PER_EPISODE.get(group, 10.0)
+        sources.append(entry)
+
+    total_eta_s = int(pending_eta_s)
+
+    return {
+        "found": True,
+        "log_path": str(log_path.relative_to(REPO_ROOT)),
+        "pid": pid,
+        "alive": pid is not None,
+        "merge_complete": merge_complete,
+        "total_sources": len(GENERALIST_MERGE_SOURCES),
+        "done_count": len(done_repos),
+        "current_repo": current_repo,
+        "error_line": error_line,
+        "sources": sources,
+        "total_all_episodes": total_all_episodes,
+        "total_done_episodes": total_done_episodes,
+        "eta_seconds": total_eta_s,
+        "eta_human": _format_eta(total_eta_s) if not merge_complete else None,
+    }
+
+
+def generalist_merge_resume() -> dict:
+    """Raw text of the resume/status doc — narrative facts (decisions,
+    pending steps) live in one file so this UI and future sessions read the
+    same source of truth instead of duplicating it in this server."""
+    if not GENERALIST_MERGE_RESUME_DOC.is_file():
+        return {"found": False, "text": ""}
+    return {"found": True, "text": GENERALIST_MERGE_RESUME_DOC.read_text(encoding="utf-8")}
+
+
+# ---------------------------------------------------------------------------
 # Presets
 # ---------------------------------------------------------------------------
 
@@ -1410,6 +1681,12 @@ class Handler(BaseHTTPRequestHandler):
                 self._json(compare_datasets(q["ref"], q["cand"]))
             elif parsed.path == "/api/dataset-schema":
                 self._json(dataset_schema(q["repo"]))
+            elif parsed.path == "/api/generalist-merge/status":
+                self._json(generalist_merge_status())
+            elif parsed.path == "/api/generalist-merge/resume":
+                self._json(generalist_merge_resume())
+            elif parsed.path == "/api/processes":
+                self._json(running_processes_status())
             else:
                 self._error("Not found", 404)
         except (KeyError, ValueError, FileNotFoundError) as err:
@@ -1471,6 +1748,13 @@ class Handler(BaseHTTPRequestHandler):
                     return
                 run.stop()
                 self._json({"ok": True})
+            elif parsed.path == "/api/processes/stop":
+                pid = int(body["pid"])
+                result = stop_running_process(pid)
+                if not result["ok"]:
+                    self._error(result["error"], 400)
+                    return
+                self._json(result)
             else:
                 self._error("Not found", 404)
         except (KeyError, ValueError, FileNotFoundError, json.JSONDecodeError) as err:
@@ -1489,6 +1773,181 @@ class Handler(BaseHTTPRequestHandler):
             _runs[name] = run
         threading.Thread(target=run.run, daemon=True, name=f"run-{name}").start()
         self._json({"ok": True})
+
+
+# ---------------------------------------------------------------------------
+# Running-processes panel — any lerobot-* job on this machine, not just the
+# generalist merge above (training runs, other conversions/merges started by
+# hand or via a previous workflow run). Answers "what's actually going on on
+# this machine right now" from any device, without needing SSH access.
+# ---------------------------------------------------------------------------
+
+# (label, exact argv-token to match) — checked against each token of a
+# process's real argv (from /proc/<pid>/cmdline, never truncated), not a
+# substring search over a joined command string: a `--foo=/path/workflow_ui`
+# argument to some unrelated command must not false-positive-match the
+# "workflow-ui" entry the way a loose substring/regex search over the whole
+# command line could.
+_PROCESS_TOKENS: list[tuple[str, str]] = [
+    ("train", "lerobot-train"),
+    ("merge", "lerobot-cotrain-align"),
+    ("umi-retarget", "lerobot-umi-retarget"),
+    ("record", "lerobot-record"),
+    ("eval", "lerobot-eval"),
+    ("extract-subset", "lerobot-extract-subset"),
+    ("sarm-annotate", "compute_rabc_weights"),
+    ("workflow-ui", "workflow_ui/app.py"),
+]
+_PROCESS_BINARY_NAMES = {tok for _label, tok in _PROCESS_TOKENS}
+
+# Flags worth pulling out per job label, so the panel shows a short human
+# summary instead of a multi-hundred-argument raw command line.
+_SUMMARY_FLAGS: dict[str, list[str]] = {
+    "train": ["--dataset.repo_id", "--policy.type", "--output_dir", "--steps"],
+    "merge": ["--target-repo-id"],
+    "umi-retarget": ["--target-repo-id"],
+    "record": ["--dataset.repo_id"],
+    "eval": ["--policy.path", "--env.type"],
+    "extract-subset": ["--target-repo-id"],
+    "sarm-annotate": ["--dataset-repo-id"],
+}
+
+_CLK_TCK = os.sysconf("SC_CLK_TCK")
+
+
+def _proc_cmdline(pid: int) -> list[str] | None:
+    try:
+        raw = (Path("/proc") / str(pid) / "cmdline").read_bytes()
+    except OSError:
+        return None
+    if not raw:
+        return None  # empty cmdline = kernel thread
+    return raw.decode("utf-8", errors="replace").rstrip("\x00").split("\x00")
+
+
+def _proc_elapsed_seconds(pid: int) -> int | None:
+    """Seconds since *pid* started, via /proc/<pid>/stat's starttime field
+    (in clock ticks since boot) against /proc/uptime — avoids relying on
+    `ps`'s etimes column, which needs its own subprocess call per query."""
+    try:
+        stat = (Path("/proc") / str(pid) / "stat").read_text()
+        after_comm = stat.rsplit(")", 1)[1].split()  # comm can contain "(" ")" " "
+        starttime_ticks = int(after_comm[19])  # field 22 overall, index 19 after comm
+        uptime_s = float(Path("/proc/uptime").read_text().split()[0])
+    except (OSError, IndexError, ValueError):
+        return None
+    return int(uptime_s - starttime_ticks / _CLK_TCK)
+
+
+def _format_elapsed(seconds: int) -> str:
+    d, rem = divmod(seconds, 86400)
+    h, rem = divmod(rem, 3600)
+    m, _ = divmod(rem, 60)
+    parts = []
+    if d:
+        parts.append(f"{d}d")
+    if h or d:
+        parts.append(f"{h}h")
+    parts.append(f"{m}m")
+    return "".join(parts)
+
+
+def _extract_flag(argv: list[str], flag: str) -> str | None:
+    for i, tok in enumerate(argv):
+        if tok == flag and i + 1 < len(argv):
+            return argv[i + 1]
+        if tok.startswith(flag + "="):
+            return tok.split("=", 1)[1]
+    return None
+
+
+def running_processes_status() -> dict:
+    """Every distinct lerobot-* job currently running, deduplicated so a
+    job's `conda run` wrapper shell and its video-encoder worker forks (which
+    share the job's exact argv tail — see align_single_dataset's
+    ProcessPoolExecutor) don't show up as separate entries alongside the
+    real invocation."""
+    groups: dict[tuple[str, ...], list[tuple[int, list[str], bool]]] = {}
+    try:
+        pids = [int(p.name) for p in Path("/proc").iterdir() if p.name.isdigit()]
+    except OSError:
+        pids = []
+
+    for pid in pids:
+        argv = _proc_cmdline(pid)
+        if not argv:
+            continue
+        # Index of the first token that's one of our known binaries/scripts —
+        # matched by exact equality or a path ending in it (argv[0] is often
+        # a full interpreter path like ".../bin/lerobot-cotrain-align").
+        match_idx = None
+        for i, tok in enumerate(argv):
+            if tok in _PROCESS_BINARY_NAMES or any(tok.endswith("/" + b) for b in _PROCESS_BINARY_NAMES):
+                match_idx = i
+                break
+        if match_idx is None:
+            continue
+        binary = next(
+            b for b in _PROCESS_BINARY_NAMES
+            if argv[match_idx] == b or argv[match_idx].endswith("/" + b)
+        )
+        is_wrapper = "conda" in argv[0] and "run" in argv[:match_idx]
+        key = (binary, *argv[match_idx + 1:])  # tail args identify the logical job
+        groups.setdefault(key, []).append((pid, argv, is_wrapper))
+
+    processes = []
+    for (binary, *_tail), entries in groups.items():
+        label = next(lbl for lbl, tok in _PROCESS_TOKENS if tok == binary)
+        # Prefer the real interpreter invocation over the thin `conda run`
+        # wrapper shell as the entry whose pid/elapsed we report.
+        entries.sort(key=lambda e: e[2])  # non-wrapper (False) sorts first
+        primary_pid, primary_argv, _ = entries[0]
+        elapsed_s = _proc_elapsed_seconds(primary_pid) or 0
+        summary_parts = [
+            f"{flag.lstrip('-')}={val}"
+            for flag in _SUMMARY_FLAGS.get(label, [])
+            if (val := _extract_flag(primary_argv, flag))
+        ]
+        entry = {
+            "label": label,
+            "pid": primary_pid,
+            "worker_count": len(entries) - 1,
+            "elapsed": _format_elapsed(elapsed_s),
+            "elapsed_s": elapsed_s,
+            "summary": ", ".join(summary_parts) or " ".join(primary_argv)[:160],
+        }
+        # Only a known, fixed log path is exposed — never derived from argv,
+        # so a process can't smuggle an arbitrary path into the log viewer.
+        if label == "merge" and GENERALIST_MERGE_LOG.is_file():
+            entry["log_path"] = str(GENERALIST_MERGE_LOG.relative_to(REPO_ROOT))
+        processes.append(entry)
+    processes.sort(key=lambda p: -p["elapsed_s"])
+    return {"processes": processes}
+
+
+def stop_running_process(pid: int) -> dict:
+    """Send SIGTERM to *pid*'s whole process group, but only after
+    re-confirming (right now, not from a stale list) that it's still one of
+    our recognized lerobot-* jobs — this server has no auth and is reachable
+    on the LAN, so this must never become a generic "kill any PID" endpoint.
+    """
+    argv = _proc_cmdline(pid)
+    if not argv:
+        return {"ok": False, "error": f"pid {pid} not found (already exited?)"}
+    is_known = any(
+        tok in _PROCESS_BINARY_NAMES or any(tok.endswith("/" + b) for b in _PROCESS_BINARY_NAMES)
+        for tok in argv
+    )
+    if not is_known:
+        return {"ok": False, "error": "refusing to stop a process that isn't a recognized lerobot job"}
+    try:
+        pgid = os.getpgid(pid)
+        os.killpg(pgid, signal.SIGTERM)
+    except ProcessLookupError:
+        return {"ok": False, "error": "process already exited"}
+    except PermissionError:
+        return {"ok": False, "error": "permission denied (owned by another user?)"}
+    return {"ok": True}
 
 
 def _detect_lan_ip() -> str | None:

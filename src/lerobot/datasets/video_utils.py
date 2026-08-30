@@ -386,7 +386,18 @@ def decode_video_frames_torchcodec(
     # convert timestamps to frame indices
     frame_indices = [round(ts * average_fps) for ts in timestamps]
     # retrieve frames based on indices
-    frames_batch = decoder.get_frames_at(indices=frame_indices)
+    try:
+        frames_batch = decoder.get_frames_at(indices=frame_indices)
+    except IndexError as err:
+        # Rounding a query timestamp can land exactly on (or past) the last decodable
+        # frame when metadata's average_fps disagrees slightly with the actual frame
+        # count (same metadata-vs-MP4-length mismatch FrameTimestampError covers below).
+        # Surface it as FrameTimestampError so callers that already skip those frames
+        # (e.g. dataset alignment/merge tools) handle this case too instead of crashing.
+        raise FrameTimestampError(
+            f"Requested frame index(es) out of range decoding {video_path}: {err}"
+            f"\nqueried timestamps: {timestamps}"
+        ) from err
 
     for frame, pts in zip(frames_batch.data, frames_batch.pts_seconds, strict=True):
         loaded_frames.append(frame)

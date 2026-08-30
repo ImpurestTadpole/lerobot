@@ -96,9 +96,13 @@ print(
 )
 
 import argparse
+import contextlib
 import copy
+import errno
+import fcntl
 import json
 import logging
+import os
 import shutil
 from pathlib import Path
 from typing import Any
@@ -286,6 +290,45 @@ def _load_reference_stats(
 
 
 _ALIGN_OPTIONS_FILENAME = "cotrain_align_options.json"
+_ALIGN_PROGRESS_FILENAME = "align_progress.json"
+
+
+def _write_align_progress(
+    aligned_root: Path, next_source_episode: int, n_written: int, n_skipped: int, done: bool
+) -> None:
+    """Record how far `align_single_dataset` has gotten through the SOURCE
+    episode loop, so a crashed/killed run can resume instead of restarting
+    (potentially many hours of re-decoding video) — and so completeness can
+    be judged correctly even when some source episodes were skipped (see
+    the `align_single_dataset` per-episode try/except): the merged
+    dataset's own `total_episodes` no longer equals the source's episode
+    count whenever any skip occurred, so that raw comparison alone can't
+    tell "genuinely finished" from "crashed partway through" anymore.
+    """
+    path = aligned_root / "meta" / _ALIGN_PROGRESS_FILENAME
+    path.parent.mkdir(parents=True, exist_ok=True)
+    with open(path, "w", encoding="utf-8") as f:
+        json.dump(
+            {
+                "next_source_episode": next_source_episode,
+                "n_written": n_written,
+                "n_skipped": n_skipped,
+                "done": done,
+            },
+            f,
+            indent=2,
+        )
+
+
+def _read_align_progress(aligned_root: Path) -> dict | None:
+    path = aligned_root / "meta" / _ALIGN_PROGRESS_FILENAME
+    if not path.is_file():
+        return None
+    try:
+        with open(path, encoding="utf-8") as f:
+            return json.load(f)
+    except (json.JSONDecodeError, OSError):
+        return None
 
 
 def _write_align_options(aligned_root: Path, pad_fill_mode: str) -> None:
@@ -444,16 +487,24 @@ def _alignment_artifacts_match(
 ) -> bool:
     """True if *info_json* matches the schema we would write with *target_features*.
 
-    *expected_total_episodes*, when given, must equal the cached
-    ``total_episodes`` — schema alone (fps/names/camera shapes) can match a
-    dataset that was only *partially* written (e.g. the process was killed
-    mid-alignment): ``info.json``/``tasks.parquet`` are updated after every
-    single episode (see ``LeRobotDatasetMetadata.save_episode``), so a
-    50-of-95,658-episode partial run looks schema-valid without this check,
-    and would otherwise be silently accepted as "already aligned," truncating
-    that source in the merge with no error. Pass the source's real
-    ``total_episodes`` to catch this; omit only for callers that don't have
-    it (legacy behaviour).
+    *expected_total_episodes*, when given, is used to judge whether a prior
+    alignment pass actually *finished* — schema alone (fps/names/camera
+    shapes) can match a dataset that was only *partially* written (e.g. the
+    process was killed mid-alignment): ``info.json``/``tasks.parquet`` are
+    updated after every single episode (see
+    ``LeRobotDatasetMetadata.save_episode``), so a 50-of-95,658-episode
+    partial run looks schema-valid without this check, and would otherwise
+    be silently accepted as "already aligned," truncating that source in
+    the merge with no error.
+
+    If a ``meta/align_progress.json`` marker exists (written by
+    ``align_single_dataset``'s per-episode loop), its own ``done`` flag is
+    trusted instead of a raw episode-count comparison — required because
+    that loop can *skip* undecodable source episodes (corrupt/boundary-bug
+    video), so a genuinely-finished alignment's written ``total_episodes``
+    can legitimately be less than the source's. Datasets with no progress
+    marker (e.g. finished before this mechanism existed) fall back to the
+    original raw-count check.
     """
     if not info_json.is_file():
         return False
@@ -466,10 +517,16 @@ def _alignment_artifacts_match(
         cached = json.load(f)
     if int(cached.get("fps", -1)) != int(effective_fps):
         return False
-    if expected_total_episodes is not None and int(cached.get("total_episodes", -1)) != int(
-        expected_total_episodes
-    ):
-        return False
+    if expected_total_episodes is not None:
+        # _read_align_progress takes the dataset ROOT (it appends "meta" itself,
+        # matching _write_align_progress's call convention) — info_json.parent
+        # is already .../meta, so undo that one level here.
+        progress = _read_align_progress(info_json.parent.parent)
+        if progress is not None:
+            if not progress.get("done"):
+                return False
+        elif int(cached.get("total_episodes", -1)) != int(expected_total_episodes):
+            return False
     cf = cached.get("features") or {}
     for key in ("observation.state", "action"):
         want = target_features.get(key) or {}
@@ -724,6 +781,67 @@ def _canonical_visual_feature_dict(
 
 
 # ---------------------------------------------------------------------------
+# Concurrency safety
+# ---------------------------------------------------------------------------
+
+@contextlib.contextmanager
+def _exclusive_align_lock(output_root: Path):
+    """Exclusive, crash-safe lock on *output_root* for the duration of an
+    alignment pass against it.
+
+    Exists because two independent invocations of this tool were found
+    running concurrently against the same output_root in production (real
+    incident, 2026-08-16 — see memory ee-space-generalist-plan.md): the
+    second invocation's own stale/incomplete-cache detection correctly
+    decided to wipe what looked like an interrupted prior run, but that
+    "prior run" was actually a DIFFERENT, still-live process actively
+    writing new episodes into the same directory. `shutil.rmtree()` raced
+    against that live writer and deleted the entire data/ and videos/
+    directories out from under it — not a corner case, real data loss. The
+    resume/skip-on-error work elsewhere in this file only makes recovery
+    safe from a single process crashing; it does nothing to stop two
+    processes from destroying each other's work if run at the same time,
+    which is what actually happened.
+
+    Uses flock() specifically (not a PID/marker file) because it is
+    released automatically by the OS the instant the holding process exits
+    for ANY reason — including SIGKILL, OOM-kill, or a segfault — with zero
+    risk of a stale lock permanently blocking future runs, which a plain
+    "lock file exists" check would have.
+    """
+    lock_path = output_root.parent / f".{output_root.name}.lock"
+    lock_path.parent.mkdir(parents=True, exist_ok=True)
+    fd = os.open(str(lock_path), os.O_CREAT | os.O_RDWR)
+    try:
+        try:
+            fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        except OSError as e:
+            if e.errno in (errno.EACCES, errno.EAGAIN):
+                holder = ""
+                with contextlib.suppress(OSError):
+                    holder = lock_path.read_text().strip()
+                raise RuntimeError(
+                    f"{output_root} is already being aligned by another process"
+                    f"{f' (pid {holder})' if holder else ''} — refusing to run "
+                    "concurrently against the same output directory. This exact "
+                    "situation destroyed real data once already (see "
+                    "ee-space-generalist-plan.md's 2026-08-16 incident). If that "
+                    "process is actually gone (crashed without releasing the "
+                    f"lock is not possible with flock, but a stale {lock_path} "
+                    "PID hint can still be misleading after a reboot), confirm "
+                    "with `ps -p <pid>` before doing anything about it."
+                ) from e
+            raise
+        os.ftruncate(fd, 0)
+        os.write(fd, str(os.getpid()).encode())
+        yield
+    finally:
+        with contextlib.suppress(OSError):
+            fcntl.flock(fd, fcntl.LOCK_UN)
+        os.close(fd)
+
+
+# ---------------------------------------------------------------------------
 # Per-dataset alignment
 # ---------------------------------------------------------------------------
 
@@ -894,8 +1012,18 @@ def align_single_dataset(
         resize_info,
     )
 
+    num_episodes = src_meta.total_episodes
+
     # LeRobotDataset.create() uses mkdir(..., exist_ok=False) on the dataset root.
     # A crashed run often leaves a partial directory → FileExistsError on retry.
+    # Three outcomes: (1) genuinely finished already → reuse as-is; (2) partial
+    # but schema-compatible with a usable progress marker → resume from where
+    # it stopped (LeRobotDataset.resume()), instead of re-decoding potentially
+    # many hours of already-processed video; (3) anything else → wipe and start
+    # over, same as before this resume support existed.
+    resume_from = 0
+    prior_n_written = 0
+    prior_n_skipped = 0
     if output_root.exists():
         info_json = output_root / "meta" / "info.json"
         if force_rebuild:
@@ -906,16 +1034,54 @@ def align_single_dataset(
             target_features,
             effective_fps,
             pad_fill_mode,
-            expected_total_episodes=src_meta.total_episodes,
+            expected_total_episodes=num_episodes,
         ):
             logger.info(
                 "Reusing completed aligned dataset at %s (metadata matches options, "
-                "all %d episodes confirmed present).",
+                "alignment previously finished).",
                 output_root,
-                src_meta.total_episodes,
             )
             return output_root
-        elif info_json.is_file():
+        elif info_json.is_file() and _alignment_artifacts_match(
+            info_json, target_features, effective_fps, pad_fill_mode,
+            expected_total_episodes=None,  # schema-only: ignore completeness for the resume check
+        ):
+            progress = _read_align_progress(output_root)
+            if progress is None:
+                # Legacy partial dataset from before per-episode skip/resume support
+                # existed: no progress marker, but real episodes are on disk. That
+                # older code path had no skip-on-error logic — it either wrote an
+                # episode successfully or crashed the whole process — so written
+                # source episodes were always processed 1:1, in order, with zero
+                # skips. Bootstrap a synthetic resume point from that guarantee
+                # instead of discarding this (potentially many hours of) progress.
+                with open(info_json, encoding="utf-8") as f:
+                    legacy_written = int(json.load(f).get("total_episodes", 0))
+                if legacy_written > 0:
+                    progress = {"next_source_episode": legacy_written, "n_written": legacy_written, "n_skipped": 0}
+                    logger.info(
+                        "%s has no progress marker (predates skip/resume support) but "
+                        "%d real episodes are on disk — bootstrapping resume point there.",
+                        output_root, legacy_written,
+                    )
+            next_ep = (progress or {}).get("next_source_episode", 0)
+            if progress is not None and 0 < next_ep <= num_episodes:
+                logger.info(
+                    "Resuming interrupted alignment at %s: %d/%d source episodes already "
+                    "processed (%d written, %d skipped) — continuing from episode %d.",
+                    output_root, next_ep, num_episodes,
+                    progress.get("n_written", 0), progress.get("n_skipped", 0), next_ep,
+                )
+                resume_from = next_ep
+                prior_n_written = progress.get("n_written", 0)
+                prior_n_skipped = progress.get("n_skipped", 0)
+            else:
+                logger.warning(
+                    "Removing incomplete aligned dataset with no usable resume point: %s",
+                    output_root,
+                )
+                shutil.rmtree(output_root)
+        else:
             logger.warning(
                 "Removing stale or incomplete aligned dataset (options changed, e.g. "
                 "--match-features-from or resolution, OR a prior run was interrupted "
@@ -923,25 +1089,81 @@ def align_single_dataset(
                 output_root,
             )
             shutil.rmtree(output_root)
-        else:
-            logger.warning(
-                "Removing incomplete aligned dataset directory from a prior run: %s",
-                output_root,
-            )
-            shutil.rmtree(output_root)
 
     # Do not mkdir(output_root) here: LeRobotDatasetMetadata.create() requires
-    # root to not exist yet (mkdir(..., exist_ok=False)).
+    # root to not exist yet (mkdir(..., exist_ok=False)); resume() mkdirs itself.
 
-    aligned_ds = LeRobotDataset.create(
-        repo_id=target_repo_id,
-        fps=effective_fps,
-        robot_type=robot_type,
-        features=target_features,
-        root=output_root,
-        use_videos=len(target_cam_keys) > 0,
-        image_writer_threads=4,
-    )
+    aligned_ds = None
+    if resume_from > 0:
+        try:
+            aligned_ds = LeRobotDataset.resume(
+                repo_id=target_repo_id,
+                root=output_root,
+                image_writer_threads=4,
+            )
+        except Exception as e:  # noqa: BLE001 - resume() can genuinely fail: Parquet only
+            # writes a valid footer at close()/finalize() time, so a HARD kill (segfault,
+            # OOM-killer, kill -9 — anything that skips Python cleanup entirely) mid-run
+            # leaves meta/episodes/*.parquet corrupt and unreadable, no matter how small
+            # metadata_buffer_size is set below. Resume is still valuable for gentler
+            # interruptions (this process's own clean SIGTERM handling, an interrupted-
+            # but-still-Python-level exit), so it's worth trying — but it must never be
+            # allowed to crash the whole relaunch when it can't be honored; that would be
+            # worse than the pre-resume behaviour of just wiping and starting over.
+            logger.warning(
+                "Resuming %s failed (%s: %s) — likely corrupt metadata from a hard kill "
+                "that skipped normal cleanup. Falling back to a full rebuild instead of "
+                "crashing.",
+                output_root, type(e).__name__, e,
+            )
+            shutil.rmtree(output_root, ignore_errors=True)
+            resume_from = 0
+            prior_n_written = 0
+            prior_n_skipped = 0
+
+    if aligned_ds is None:
+        aligned_ds = LeRobotDataset.create(
+            repo_id=target_repo_id,
+            fps=effective_fps,
+            robot_type=robot_type,
+            features=target_features,
+            root=output_root,
+            use_videos=len(target_cam_keys) > 0,
+            image_writer_threads=4,
+        )
+        # Write pad_fill_mode NOW, not only after a successful finish (the
+        # original behaviour) — a run that crashes mid-alignment (the exact
+        # scenario resume support exists for) would otherwise leave no
+        # marker at all, making _cached_pad_fill_mode() fall back to its
+        # "zero" default. If the real pad_fill_mode isn't "zero" (e.g.
+        # "ref-mean"), that mismatch fails _alignment_artifacts_match's
+        # very first check on the next run, before the resume/legacy-
+        # bootstrap logic above ever gets a chance to run — silently
+        # forcing a full rewipe-and-restart instead of resuming. Only
+        # written on a fresh create(); a resume()'d run's marker was
+        # already written correctly by its own original create().
+        _write_align_options(output_root, pad_fill_mode)
+
+    # Force every episode's metadata to flush to meta/episodes/*.parquet
+    # immediately, instead of batching up to the default 10 episodes in
+    # process memory (LeRobotDatasetMetadata's own default). An alignment
+    # pass can run for many hours or days; a hard crash must never lose
+    # already-written episodes' own metadata just because the batch hadn't
+    # flushed yet — that gap is what silently broke resume() the first time
+    # this was tested against a genuine mid-loop kill (not just a clean
+    # early stop): info.json's total_episodes count is updated and written
+    # on every single save_episode() call, but without this, the
+    # meta/episodes/*.parquet records those counts describe could still be
+    # sitting unflushed in memory, so LeRobotDataset.resume() would either
+    # fail to load metadata at all or, worse, silently disagree with
+    # info.json about which episodes actually have durable metadata. The
+    # underlying writer (_flush_metadata_buffer) already appends
+    # incrementally to one open ParquetWriter, so flushing every episode
+    # instead of every 10 costs a small amount of extra I/O, negligible
+    # next to the video encoding already paid per episode. Applies whether
+    # this run just called .create() or .resume()d, so the guarantee holds
+    # for the whole lifetime of a multi-day run, not just its first segment.
+    aligned_ds.meta._metadata_buffer_size = 1
 
     # Keys auto-populated by DatasetWriter; must NOT be in add_frame() dict.
     _auto_keys = {
@@ -951,143 +1173,169 @@ def align_single_dataset(
     # The set of feature keys we actually want to write (from target schema).
     target_feature_keys = set(target_features.keys())
 
-    num_episodes = src_meta.total_episodes
     _ds_label = source_repo if len(source_repo) <= 52 else f"…{source_repo[-49:]}"
     ep_pbar = tqdm(
-        range(num_episodes),
+        range(resume_from, num_episodes),
         desc=f"Align {_ds_label}",
         unit="ep",
         dynamic_ncols=True,
         leave=True,
+        initial=resume_from,
+        total=num_episodes,
     )
+    n_written = prior_n_written
+    n_skipped = prior_n_skipped
     for ep_idx in ep_pbar:
-        ep_pbar.set_postfix_str(f"episode={ep_idx}/{num_episodes - 1}", refresh=False)
-        # Load this episode as a filtered view of the source dataset.
-        ep_ds = LeRobotDataset(source_repo, episodes=[ep_idx])
-        ep_info = src_meta.episodes[ep_idx]
+        ep_pbar.set_postfix_str(
+            f"episode={ep_idx}/{num_episodes - 1} written={n_written} skipped={n_skipped}",
+            refresh=False,
+        )
+        try:
+            # Load this episode as a filtered view of the source dataset.
+            ep_ds = LeRobotDataset(source_repo, episodes=[ep_idx])
+            ep_info = src_meta.episodes[ep_idx]
 
-        # Resolve task description string for this episode.
-        task_idx = ep_info.get("task_index", 0)
-        if isinstance(task_idx, (list, np.ndarray)):
-            task_idx = int(task_idx[0])
-        task_description = src_meta.tasks.index[int(task_idx)]
-        if not isinstance(task_description, str):
-            task_description = str(task_description)
+            # Resolve task description string for this episode.
+            task_idx = ep_info.get("task_index", 0)
+            if isinstance(task_idx, (list, np.ndarray)):
+                task_idx = int(task_idx[0])
+            task_description = src_meta.tasks.index[int(task_idx)]
+            if not isinstance(task_description, str):
+                task_description = str(task_description)
 
-        resample_indices = _compute_resample_indices(src_fps, effective_fps, len(ep_ds))
+            resample_indices = _compute_resample_indices(src_fps, effective_fps, len(ep_ds))
 
-        frame_count = 0
-        skipped_bad_ts = 0
-        for frame_pos in tqdm(
-            resample_indices,
-            desc=f"  frames ep {ep_idx}",
-            leave=False,
-            unit="fr",
-            dynamic_ncols=True,
-        ):
-            try:
-                raw_frame = ep_ds[frame_pos]
-            except FrameTimestampError as err:
-                # Hub datasets sometimes have one extra parquet row or a last timestamp
-                # that rounds past the last decodable MP4 frame (metadata vs file mismatch).
-                skipped_bad_ts += 1
-                if skipped_bad_ts == 1:
-                    logger.warning(
-                        "Episode %d: skipping frame(s) with out-of-range video timestamps "
-                        "in %s (source metadata vs MP4 length). First index=%d. %s",
-                        ep_idx,
-                        source_repo,
-                        frame_pos,
-                        err,
-                    )
-                continue
+            frame_count = 0
+            skipped_bad_ts = 0
+            for frame_pos in tqdm(
+                resample_indices,
+                desc=f"  frames ep {ep_idx}",
+                leave=False,
+                unit="fr",
+                dynamic_ncols=True,
+            ):
+                try:
+                    raw_frame = ep_ds[frame_pos]
+                except FrameTimestampError as err:
+                    # Hub datasets sometimes have one extra parquet row or a last timestamp
+                    # that rounds past the last decodable MP4 frame (metadata vs file mismatch).
+                    skipped_bad_ts += 1
+                    if skipped_bad_ts == 1:
+                        logger.warning(
+                            "Episode %d: skipping frame(s) with out-of-range video timestamps "
+                            "in %s (source metadata vs MP4 length). First index=%d. %s",
+                            ep_idx,
+                            source_repo,
+                            frame_pos,
+                            err,
+                        )
+                    continue
 
-            # Remap camera keys first.
-            remapped = _remap_camera_keys(raw_frame, camera_remap)
+                # Remap camera keys first.
+                remapped = _remap_camera_keys(raw_frame, camera_remap)
 
-            # State / action: project by joint names when a reference schema is
-            # given (drops extras like gantry.vel); else pad or truncate.
-            state = remapped.get("observation.state")
-            if state is not None:
-                arr = state.numpy() if isinstance(state, torch.Tensor) else np.asarray(state)
-                src_st = src_meta.features.get("observation.state") or {}
-                src_st_names = src_st.get("names")
-                if state_names is not None:
-                    aligned_st = _remap_vector_by_names(
-                        arr, src_st_names, state_names, fill_values=state_fill
-                    )
-                else:
-                    aligned_st = _pad_vector(arr.astype(np.float32), target_state_dim)
-                remapped["observation.state"] = torch.from_numpy(aligned_st)
+                # State / action: project by joint names when a reference schema is
+                # given (drops extras like gantry.vel); else pad or truncate.
+                state = remapped.get("observation.state")
+                if state is not None:
+                    arr = state.numpy() if isinstance(state, torch.Tensor) else np.asarray(state)
+                    src_st = src_meta.features.get("observation.state") or {}
+                    src_st_names = src_st.get("names")
+                    if state_names is not None:
+                        aligned_st = _remap_vector_by_names(
+                            arr, src_st_names, state_names, fill_values=state_fill
+                        )
+                    else:
+                        aligned_st = _pad_vector(arr.astype(np.float32), target_state_dim)
+                    remapped["observation.state"] = torch.from_numpy(aligned_st)
 
-            action = remapped.get("action")
-            if action is not None:
-                arr = action.numpy() if isinstance(action, torch.Tensor) else np.asarray(action)
-                src_ac = src_meta.features.get("action") or {}
-                src_ac_names = src_ac.get("names")
-                if action_names is not None:
-                    aligned_ac = _remap_vector_by_names(
-                        arr, src_ac_names, action_names, fill_values=action_fill
-                    )
-                else:
-                    aligned_ac = _pad_vector(arr.astype(np.float32), target_action_dim)
-                if action_state_copy:
-                    st = remapped.get("observation.state")
-                    if st is not None:
-                        st_arr = st.numpy() if isinstance(st, torch.Tensor) else np.asarray(st)
-                        for i_ac, i_st in action_state_copy:
-                            aligned_ac[i_ac] = st_arr[i_st]
-                remapped["action"] = torch.from_numpy(aligned_ac)
+                action = remapped.get("action")
+                if action is not None:
+                    arr = action.numpy() if isinstance(action, torch.Tensor) else np.asarray(action)
+                    src_ac = src_meta.features.get("action") or {}
+                    src_ac_names = src_ac.get("names")
+                    if action_names is not None:
+                        aligned_ac = _remap_vector_by_names(
+                            arr, src_ac_names, action_names, fill_values=action_fill
+                        )
+                    else:
+                        aligned_ac = _pad_vector(arr.astype(np.float32), target_action_dim)
+                    if action_state_copy:
+                        st = remapped.get("observation.state")
+                        if st is not None:
+                            st_arr = st.numpy() if isinstance(st, torch.Tensor) else np.asarray(st)
+                            for i_ac, i_st in action_state_copy:
+                                aligned_ac[i_ac] = st_arr[i_st]
+                    remapped["action"] = torch.from_numpy(aligned_ac)
 
-            # Keep only keys that belong to the target feature schema;
-            # strip auto-populated keys and any leftover source-specific keys.
-            frame: dict[str, Any] = {
-                k: v for k, v in remapped.items()
-                if k in target_feature_keys and k not in _auto_keys
-            }
-            for img_key in list(frame.keys()):
-                feat = target_features.get(img_key, {})
-                dt = feat.get("dtype")
-                if dt in ("image", "video"):
-                    frame[img_key] = _ensure_image_hwc_numpy(
-                        frame[img_key], feat, target_hw=target_image_size
-                    )
-                elif dt == "depth":
-                    frame[img_key] = _ensure_depth_chw_numpy(
-                        frame[img_key], target_hw=target_image_size
-                    )
-            for miss_key in missing_cam_keys:
-                feat = target_features[miss_key]
-                h, w = int(feat["shape"][0]), int(feat["shape"][1])
-                if feat.get("dtype") == "depth":
-                    frame[miss_key] = np.zeros((1, h, w), dtype=np.uint16)
-                else:
-                    frame[miss_key] = np.zeros((h, w, 3), dtype=np.uint8)
-            frame["task"] = task_description
+                # Keep only keys that belong to the target feature schema;
+                # strip auto-populated keys and any leftover source-specific keys.
+                frame: dict[str, Any] = {
+                    k: v for k, v in remapped.items()
+                    if k in target_feature_keys and k not in _auto_keys
+                }
+                for img_key in list(frame.keys()):
+                    feat = target_features.get(img_key, {})
+                    dt = feat.get("dtype")
+                    if dt in ("image", "video"):
+                        frame[img_key] = _ensure_image_hwc_numpy(
+                            frame[img_key], feat, target_hw=target_image_size
+                        )
+                    elif dt == "depth":
+                        frame[img_key] = _ensure_depth_chw_numpy(
+                            frame[img_key], target_hw=target_image_size
+                        )
+                for miss_key in missing_cam_keys:
+                    feat = target_features[miss_key]
+                    h, w = int(feat["shape"][0]), int(feat["shape"][1])
+                    if feat.get("dtype") == "depth":
+                        frame[miss_key] = np.zeros((1, h, w), dtype=np.uint16)
+                    else:
+                        frame[miss_key] = np.zeros((h, w, 3), dtype=np.uint8)
+                frame["task"] = task_description
 
-            aligned_ds.add_frame(frame)
-            frame_count += 1
+                aligned_ds.add_frame(frame)
+                frame_count += 1
 
-        if skipped_bad_ts > 1:
-            tqdm.write(
-                f"  episode {ep_idx} ({source_repo}): skipped {skipped_bad_ts}/"
-                f"{len(resample_indices)} resampled frames (bad timestamps vs MP4)"
+            if skipped_bad_ts > 1:
+                tqdm.write(
+                    f"  episode {ep_idx} ({source_repo}): skipped {skipped_bad_ts}/"
+                    f"{len(resample_indices)} resampled frames (bad timestamps vs MP4)"
+                )
+
+            if frame_count > 0:
+                aligned_ds.save_episode()
+                n_written += 1
+            else:
+                aligned_ds.clear_episode_buffer()
+
+        except Exception as e:  # noqa: BLE001 - isolate one bad source episode (corrupt/
+            # undecodable video — e.g. a source episode whose real data is split across two
+            # physical video files but its boundary metadata only points at one, so decoding
+            # runs past the end of that file) so it doesn't kill an alignment pass that can
+            # run for many hours. Matches the per-episode isolation already established in
+            # scripts/convert_joint_to_ee.py.
+            logger.warning(
+                "Episode %d (%s): skipping due to error: %s: %s",
+                ep_idx, source_repo, type(e).__name__, e,
             )
-
-        if frame_count > 0:
-            aligned_ds.save_episode()
-        else:
             aligned_ds.clear_episode_buffer()
+            n_skipped += 1
 
         ep_pbar.set_postfix_str(
-            f"episode={ep_idx}/{num_episodes - 1} saved_frames={frame_count}",
+            f"episode={ep_idx}/{num_episodes - 1} written={n_written} skipped={n_skipped}",
             refresh=True,
         )
+        _write_align_progress(output_root, ep_idx + 1, n_written, n_skipped, done=False)
 
     ep_pbar.close()
     aligned_ds.finalize()
     _write_align_options(output_root, pad_fill_mode)
-    logger.info("Aligned dataset written to: %s", output_root)
+    _write_align_progress(output_root, num_episodes, n_written, n_skipped, done=True)
+    logger.info(
+        "Aligned dataset written to: %s (%d episodes written, %d skipped due to errors)",
+        output_root, n_written, n_skipped,
+    )
     return output_root
 
 
@@ -1267,6 +1515,16 @@ _DEFAULT_CAMERA_REMAP: dict[str, str] = {
     # zero-filled for).
     "wrist_left": "left_wrist",
     "exterior_1_left": "head",
+    # xLeRobot community sources (2026-08-16/17 batch) — two naming
+    # conventions observed across contributors: "left_arm_wrist"/
+    # "right_arm_wrist" (zonglin11/Keith-Luo/Grigorij) and "left"/"right"
+    # (siyulw2025/yihao-brain-bot; their "top" already covered above).
+    # "head" needs no entry — it already matches the canonical name via
+    # the identity fallback (camera_remap.get(key, key)).
+    "left_arm_wrist": "left_wrist",
+    "right_arm_wrist": "right_wrist",
+    "left": "left_wrist",
+    "right": "right_wrist",
 }
 
 
@@ -1517,49 +1775,61 @@ def align_datasets_for_cotraining(
             })
             continue
 
-        if force_rebuild and aligned_root.exists():
-            logger.warning("Force rebuild: removing align cache %s", aligned_root)
-            shutil.rmtree(aligned_root)
-
-        cache_matches = info_json.is_file() and _alignment_artifacts_match(
-            info_json,
-            target_features,
-            merge_fps,
-            pad_fill_mode,
-            expected_total_episodes=src_meta.total_episodes,
-        )
-        if not force_rebuild and cache_matches:
-            logger.info(
-                "Reusing already-aligned cache: %s (all %d episodes confirmed present)",
-                aligned_root,
-                src_meta.total_episodes,
-            )
-        else:
-            if aligned_root.exists():
-                logger.warning(
-                    "Rebuilding align cache %s (stale vs current options, or a prior run "
-                    "was interrupted mid-alignment).",
-                    aligned_root,
-                )
+        with _exclusive_align_lock(aligned_root):
+            if force_rebuild and aligned_root.exists():
+                logger.warning("Force rebuild: removing align cache %s", aligned_root)
                 shutil.rmtree(aligned_root)
-            align_single_dataset(
-                source_repo=src_repo,
-                target_repo_id=aligned_repo_id,
-                target_fps=target_fps,
-                target_state_dim=target_state_dim,
-                target_action_dim=target_action_dim,
-                camera_remap=camera_remap,
-                output_root=aligned_root,
-                robot_type=robot_type,
-                target_image_size=unified_hw,
-                match_features_from=match_features_from,
-                match_features_root=mfeat_root,
-                force_rebuild=False,
-                canonical_visual=canonical_visual,
-                forced_effective_fps=merge_fps if canonical_visual is not None else None,
-                pad_fill_mode=pad_fill_mode,
-                camera_fill_mode=camera_fill_mode,
+
+            cache_matches = info_json.is_file() and _alignment_artifacts_match(
+                info_json,
+                target_features,
+                merge_fps,
+                pad_fill_mode,
+                expected_total_episodes=src_meta.total_episodes,
             )
+            if not force_rebuild and cache_matches:
+                logger.info(
+                    "Reusing already-aligned cache: %s (all %d episodes confirmed present)",
+                    aligned_root,
+                    src_meta.total_episodes,
+                )
+            else:
+                # Do NOT shutil.rmtree(aligned_root) here even when it exists — that was a
+                # real bug (found 2026-08-29, after it destroyed 72,007/95,658 real episodes
+                # of DROID alignment progress on a disk-full crash): align_single_dataset()
+                # below has its own, more precise reuse/resume/wipe logic (matching schema +
+                # a valid align_progress.json resume point → LeRobotDataset.resume(); no
+                # usable resume point or genuinely incompatible options → wipes itself). This
+                # caller deleting the directory FIRST made that entire resume path
+                # unreachable in production — align_single_dataset only ever saw an empty
+                # directory, so it could never distinguish "resumable" from "start fresh".
+                # The resume logic had only ever been exercised via direct unit-style calls
+                # to align_single_dataset(), never through this real orchestrator path, which
+                # is why the gap went unnoticed until it cost real progress.
+                if aligned_root.exists():
+                    logger.info(
+                        "%s not fully confirmed complete — handing off to align_single_dataset "
+                        "to decide reuse/resume/wipe from its own inspection of %s.",
+                        src_repo, aligned_root,
+                    )
+                align_single_dataset(
+                    source_repo=src_repo,
+                    target_repo_id=aligned_repo_id,
+                    target_fps=target_fps,
+                    target_state_dim=target_state_dim,
+                    target_action_dim=target_action_dim,
+                    camera_remap=camera_remap,
+                    output_root=aligned_root,
+                    robot_type=robot_type,
+                    target_image_size=unified_hw,
+                    match_features_from=match_features_from,
+                    match_features_root=mfeat_root,
+                    force_rebuild=False,
+                    canonical_visual=canonical_visual,
+                    forced_effective_fps=merge_fps if canonical_visual is not None else None,
+                    pad_fill_mode=pad_fill_mode,
+                    camera_fill_mode=camera_fill_mode,
+                )
 
         aligned_roots.append(aligned_root)
         aligned_repo_ids.append(aligned_repo_id)
@@ -1722,16 +1992,19 @@ def main() -> None:
     parser.add_argument("--target-state-dim", type=int, default=18)
     parser.add_argument("--target-action-dim", type=int, default=18)
     parser.add_argument(
-        "--camera-remap", type=str,
-        default=(
-            "top:head,cam_high:head,cam_low:head,image:head,obs_image:head,"
-            "cam_left_wrist:left_wrist,left_wrist:left_wrist,"
-            "wrist_image:left_wrist,"
-            "cam_right_wrist:right_wrist,right_wrist:right_wrist,"
-            "rgb_images.front:head,rgb_images.left:left_wrist,"
-            "rgb_images.right:right_wrist"
+        "--camera-remap", type=str, default=None,
+        help=(
+            "Comma-separated 'src_cam:dst_cam' mappings. Defaults to "
+            "_DEFAULT_CAMERA_REMAP (the single source of truth, kept in "
+            "sync with every source added to this project) when omitted — "
+            "this CLI flag used to carry its own independently-maintained "
+            "default string here, which silently drifted out of sync with "
+            "_DEFAULT_CAMERA_REMAP (missing DROID's and the 2026-08 xLeRobot "
+            "community batch's entries) since the CLI always supplied a "
+            "non-None value, bypassing align_datasets_for_cotraining's own "
+            "None-triggered fallback to _DEFAULT_CAMERA_REMAP entirely. "
+            "Fixed by having exactly one default, not two.",
         ),
-        help="Comma-separated 'src_cam:dst_cam' mappings.",
     )
     parser.add_argument(
         "--output-root", type=Path, default=None,
@@ -1875,7 +2148,7 @@ def main() -> None:
             )
         target_image_size = (int(parts[0]), int(parts[1]))
 
-    camera_remap = _parse_camera_remap(args.camera_remap)
+    camera_remap = _parse_camera_remap(args.camera_remap) if args.camera_remap is not None else None
     output_root = args.output_root
     if output_root is not None:
         output_root = output_root.expanduser()

@@ -59,11 +59,16 @@
                       background: var(--accent); border: 1.5px solid var(--ink);
                       display: inline-block; }
   nav.tabs { display: flex; gap: 0; margin-right: 1rem; border: 1.5px solid var(--ink);
-             border-radius: 9px; overflow: hidden; background: var(--panel2); }
+             border-radius: 9px; background: var(--panel2); max-width: 100%;
+             overflow-x: auto; -webkit-overflow-scrolling: touch; scrollbar-width: none; }
+  nav.tabs::-webkit-scrollbar { display: none; }
   nav.tabs button { border: none; background: none; color: var(--ink); border-radius: 0;
                     padding: .35rem .9rem; font-size: .72rem; font-weight: 700;
-                    text-transform: uppercase; letter-spacing: .08em; box-shadow: none; }
+                    text-transform: uppercase; letter-spacing: .08em; box-shadow: none;
+                    flex-shrink: 0; white-space: nowrap; }
   nav.tabs button + button { border-left: 1.5px solid var(--ink); }
+  nav.tabs button:first-child { border-top-left-radius: 7px; border-bottom-left-radius: 7px; }
+  nav.tabs button:last-child { border-top-right-radius: 7px; border-bottom-right-radius: 7px; }
   nav.tabs button.active { background: var(--ink); color: var(--bg); }
   .tabdot { display: inline-block; width: 7px; height: 7px; border-radius: 50%;
             margin-left: .35rem; background: var(--muted); vertical-align: middle; }
@@ -76,6 +81,16 @@
   main { flex: 1; display: flex; min-height: 0; }
   .view { flex: 1; display: none; min-height: 0; }
   .view.active { display: flex; }
+  /* Workflow view stacks a persistent "what's running" strip above the
+     sidebar+editor row — render() wipes #editor's innerHTML on every
+     workflow load/switch, so this box must live outside #editor entirely
+     or it would get destroyed along with it. */
+  #view-workflow.active { flex-direction: column; }
+  #workflow-body { flex: 1; display: flex; min-height: 0; }
+  #whats-running { padding: .6rem 1rem 0; }
+  #whats-running .section { margin-bottom: .6rem; }
+  #whats-running-detail { font-size: .78rem; color: var(--muted); margin-top: .3rem; }
+  #whats-running-detail b { color: var(--ink); }
   /* ---------- controls: chunky keys ---------- */
   button { background: var(--panel2); color: var(--ink); border: 1.5px solid var(--ink);
            border-radius: 9px; padding: .38rem .85rem; cursor: pointer; font-size: .78rem;
@@ -279,6 +294,75 @@
                      transition: border-color .12s, background .12s; }
   #recipe-dropzone p { margin: 0; font-size: .85rem; color: var(--muted); }
   #recipe-dropzone code { font-size: .8rem; }
+  /* ---------- generalist merge view ---------- */
+  #view-merge { overflow-y: auto; padding: 1rem 1.25rem; }
+  #view-merge.active { display: block; }
+  #merge-summary { display: flex; gap: .8rem; flex-wrap: wrap; align-items: center; }
+  #merge-progress-bar { flex: 1; min-width: 200px; height: 10px; border-radius: 99px;
+                        background: var(--panel2); border: 1.5px solid var(--ink);
+                        overflow: hidden; margin-top: .3rem; }
+  #merge-progress-fill { height: 100%; background: var(--accent); transition: width .3s; }
+  .merge-sources { max-width: 60rem; margin: 0 auto; display: grid;
+                   grid-template-columns: repeat(auto-fill, minmax(230px,1fr)); gap: .4rem; }
+  .merge-src { border: 1.5px solid var(--line); border-radius: 8px; padding: .4rem .6rem;
+               font-family: ui-monospace, monospace; font-size: .72rem; display: flex;
+               flex-direction: column; gap: .15rem; background: var(--panel2); }
+  .merge-src.done { border-color: var(--ok); }
+  .merge-src.current { border-color: var(--run); box-shadow: 0 0 0 2px rgba(255,74,0,.25); }
+  .merge-src .msrc-repo { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+  .merge-src .msrc-status { font-size: .65rem; text-transform: uppercase; letter-spacing: .05em; }
+  .merge-src.done .msrc-status { color: var(--ok); }
+  .merge-src.current .msrc-status { color: var(--run); }
+  .merge-src.pending .msrc-status { color: var(--muted); }
+  .merge-group-label { grid-column: 1/-1; font-size: .68rem; text-transform: uppercase;
+                       letter-spacing: .1em; color: var(--muted); margin-top: .5rem; }
+  #merge-resume pre { white-space: pre-wrap; font-size: .78rem; line-height: 1.5;
+                      max-height: 32rem; overflow-y: auto; font-family: ui-monospace, monospace; }
+  .merge-current-detail { display: flex; flex-wrap: wrap; gap: .3rem 1.2rem; font-size: .74rem;
+                          color: var(--muted); margin-top: .3rem; }
+  .merge-current-detail b { color: var(--ink); font-weight: 700; }
+  .merge-eta { font-size: .78rem; margin-top: .15rem; }
+  .merge-eta b { color: var(--accent); }
+  /* ---------- narrow-viewport (phone) adjustments ---------- */
+  @media (max-width: 560px) {
+    header { padding: .5rem .6rem; gap: .4rem; }
+    header h1 { font-size: .7rem; letter-spacing: .08em; }
+    nav.tabs button { padding: .32rem .6rem; font-size: .66rem; }
+    #wf-title { display: none; }
+    #view-merge, #view-compare, #view-recipes, #view-guide { padding: .6rem .6rem; }
+    #merge-summary > div { min-width: 0 !important; flex-basis: 100%; }
+    #merge-progress-bar { min-width: 0; }
+    .merge-sources { grid-template-columns: 1fr; }
+    .proc-summary { min-width: 0; }
+    .section { padding: .7rem .8rem; }
+  }
+  .proc-row { display: flex; align-items: center; gap: .6rem; padding: .35rem .4rem;
+              border-bottom: 1px solid var(--line); font-size: .78rem; flex-wrap: wrap;
+              position: relative; cursor: pointer; border-radius: 6px; }
+  .proc-row:last-child { border-bottom: none; }
+  .proc-row:hover { background: var(--hover-bg); }
+  .proc-menu { position: absolute; top: calc(100% + 4px); left: .4rem; z-index: 60;
+               width: 210px; background: var(--panel2); border: 1.5px solid var(--ink);
+               border-radius: 10px; padding: .4rem; box-shadow: 0 4px 0 rgba(22,21,15,.35);
+               cursor: default; display: flex; flex-direction: column; gap: .3rem; }
+  .proc-menu button { width: 100%; text-align: left; font-size: .7rem; padding: .35rem .5rem; }
+  .proc-menu .proc-menu-title { font-size: .68rem; color: var(--muted);
+                                 padding: 0 .1rem .2rem; border-bottom: 1px solid var(--line);
+                                 margin-bottom: .1rem; font-family: ui-monospace, monospace;
+                                 white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+  .proc-label { font-weight: 700; text-transform: uppercase; letter-spacing: .05em;
+                font-size: .65rem; padding: .1rem .5rem; border-radius: 99px;
+                background: var(--c-train); color: #fff; flex: none; }
+  .proc-label[data-label="merge"] { background: var(--c-merge); }
+  .proc-label[data-label="umi-retarget"] { background: var(--c-data); }
+  .proc-label[data-label="record"] { background: var(--c-deploy); }
+  .proc-label[data-label="eval"] { background: var(--c-finetune); }
+  .proc-label[data-label="extract-subset"] { background: var(--c-extract); }
+  .proc-label[data-label="sarm-annotate"] { background: var(--c-sarm); }
+  .proc-label[data-label="workflow-ui"] { background: var(--c-custom); }
+  .proc-summary { flex: 1; min-width: 200px; font-family: ui-monospace, monospace;
+                  overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+  .proc-meta { color: var(--muted); font-size: .72rem; flex: none; }
   #recipe-dropzone:hover, #recipe-dropzone.dragover { border-color: var(--accent);
                      background: var(--hover-bg); }
   #recipe-paste { width: 100%; font-family: ui-monospace, monospace; }
@@ -329,10 +413,11 @@
 <header>
   <h1>xlerobot cotrain</h1>
   <nav class="tabs">
-    <button data-view="workflow" class="active">Workflow</button>
-    <button data-view="compare">Compare datasets</button>
     <button data-view="guide">Guide</button>
+    <button data-view="compare">Compare datasets</button>
     <button data-view="recipes">Recipes</button>
+    <button data-view="workflow" class="active">Workflow</button>
+    <button data-view="merge">Merge <span id="merge-tab-dot" class="tabdot hidden"></span></button>
     <button data-view="log">Log <span id="log-tab-dot" class="tabdot hidden"></span></button>
   </nav>
   <span id="wf-title" style="color:var(--muted)">no workflow selected</span>
@@ -349,6 +434,14 @@
 <main>
   <!-- ============================ WORKFLOW ============================ -->
   <div class="view active" id="view-workflow">
+    <div id="whats-running">
+      <div class="section">
+        <h2>What's running <span id="whats-running-dot" class="tabdot hidden"></span></h2>
+        <div id="whats-running-list"><p class="hint">Loading…</p></div>
+        <div id="whats-running-detail"></div>
+      </div>
+    </div>
+    <div id="workflow-body">
     <div id="sidebar">
       <button id="btn-new">+ New workflow</button>
       <button id="btn-preset" data-preset="home_tasks">+ Home-tasks preset</button>
@@ -374,6 +467,7 @@
       Watch progress on the <b>Log</b> tab — it lights up while a stage is running, and the
       sidebar list dots whichever saved workflow is currently active.</p>
     </div></div>
+    </div>
   </div>
 
   <!-- ============================ LOG (toggleable page) ============================ -->
@@ -449,6 +543,27 @@
       </div>
 
       <div id="recipe-schema-reference"></div>
+    </div>
+  </div>
+
+  <!-- ============================ GENERALIST MERGE ============================ -->
+  <div class="view" id="view-merge">
+    <div style="width:100%">
+      <div class="section" style="max-width:60rem;margin:0 auto 1rem">
+        <h2>Running processes on this machine</h2>
+        <div id="proc-list"><p class="hint">Loading…</p></div>
+      </div>
+      <div class="section" style="max-width:60rem;margin:0 auto 1rem">
+        <h2>EE-space generalist merge <span id="merge-status-chip" class="chip"></span></h2>
+        <div id="merge-summary">
+          <p class="hint">Loading…</p>
+        </div>
+      </div>
+      <div class="merge-sources" id="merge-sources"></div>
+      <div class="section" id="merge-resume" style="max-width:60rem;margin:1rem auto 0">
+        <h2>Resume notes (docs/generalist_merge_resume.md)</h2>
+        <pre id="merge-resume-text">Loading…</pre>
+      </div>
     </div>
   </div>
 </main>
@@ -1297,6 +1412,190 @@ $("#log-select").onchange = () => {
 };
 setInterval(pollStatus, 2000);
 setInterval(updateSidebarRunning, 2000);
+
+/* ------------------------------ running processes ------------------------------ */
+function toggleProcMenu(row, p) {
+  const existing = row.querySelector(".pop");
+  closePops();
+  if (existing) return;                                // second click closes
+  const menu = el("div", {class: "pop proc-menu", onclick: (e) => e.stopPropagation()},
+    el("div", {class: "proc-menu-title"}, `${p.label} · pid ${p.pid}`),
+  );
+  if (p.log_path) {
+    const viewLogBtn = el("button", {}, "View log");
+    viewLogBtn.onclick = () => {
+      closePops();
+      document.querySelector('nav.tabs button[data-view="log"]').click();
+      logPath = p.log_path; logOffset = 0;
+      $("#logview").textContent = "";
+      const sel = $("#log-select");
+      sel.innerHTML = "";
+      sel.dataset.sig = "";  // force pollStatus to rebuild this dropdown next time a workflow is loaded
+      sel.appendChild(el("option", {value: p.log_path, text: p.log_path}));
+      sel.value = p.log_path;
+      pollLog();
+    };
+    menu.appendChild(viewLogBtn);
+  }
+  const stopBtn = el("button", {class: "danger"}, "Stop process");
+  stopBtn.onclick = async () => {
+    closePops();
+    const workers = p.worker_count > 0 ? ` and its ${p.worker_count} worker process${p.worker_count === 1 ? "" : "es"}` : "";
+    const warning = p.label === "workflow-ui"
+      ? `This IS the server rendering this page — stopping it will disconnect you immediately. Continue?`
+      : `Stop ${p.label} (pid ${p.pid})${workers}? This sends SIGTERM — any unsaved progress in that job is lost.`;
+    if (!confirm(warning)) return;
+    try {
+      await api("/api/processes/stop", {pid: p.pid});
+      toast(`Stopped ${p.label} (pid ${p.pid})`);
+      pollProcesses();
+      if (typeof pollMergeStatus === "function") pollMergeStatus();
+    } catch (e) { toast(e.message, true); }
+  };
+  menu.appendChild(stopBtn);
+  row.appendChild(menu);
+  const r = menu.getBoundingClientRect();
+  if (r.right > innerWidth - 8) { menu.style.left = "auto"; menu.style.right = "0"; }
+}
+function buildProcRow(p) {
+  const workers = p.worker_count > 0 ? ` (+${p.worker_count} worker process${p.worker_count === 1 ? "" : "es"})` : "";
+  const row = el("div", {class: "proc-row"},
+    el("span", {class: "proc-label", "data-label": p.label}, p.label),
+    el("span", {class: "proc-summary", title: p.summary}, p.summary),
+    el("span", {class: "proc-meta"}, `pid ${p.pid} · up ${p.elapsed}${workers}`),
+  );
+  row.onclick = (ev) => { ev.stopPropagation(); toggleProcMenu(row, p); };
+  return row;
+}
+async function renderProcessesInto(boxId, processes) {
+  const box = $(boxId);
+  if (document.querySelector(`${boxId} .proc-menu`)) return;  // menu open — don't yank it away
+  box.innerHTML = "";
+  if (!processes.length) {
+    box.appendChild(el("p", {class: "hint"}, "Nothing lerobot-related is running right now."));
+    return;
+  }
+  for (const p of processes) box.appendChild(buildProcRow(p));
+}
+async function pollProcesses() {
+  try {
+    const {processes} = await api("/api/processes");
+    renderProcessesInto("#proc-list", processes);
+  } catch (e) { /* transient */ }
+}
+pollProcesses();
+setInterval(pollProcesses, 4000);
+
+/* ------------------------------ "what's running" (main/Workflow page) ------------------------------ */
+async function pollWhatsRunning() {
+  try {
+    const {processes} = await api("/api/processes");
+    renderProcessesInto("#whats-running-list", processes);
+    const dot = $("#whats-running-dot");
+    dot.className = processes.length ? "tabdot running" : "tabdot hidden";
+
+    const detail = $("#whats-running-detail");
+    const mergeProc = processes.find(p => p.label === "merge");
+    if (mergeProc) {
+      const st = await api("/api/generalist-merge/status");
+      const cur = st.found && st.sources ? st.sources.find(s => s.status === "current") : null;
+      if (cur && cur.percent != null) {
+        detail.innerHTML = "";
+        detail.appendChild(el("span", {}, "Currently computing: EE-space merge — aligning ",
+          el("b", {}, cur.repo), ` (${cur.percent}%, episode ${cur.episode}/${cur.episode_total})`,
+          st.eta_human ? ` — ~${st.eta_human.replace("~", "")} left overall` : ""));
+      } else {
+        detail.textContent = "";
+      }
+    } else {
+      detail.textContent = "";
+    }
+  } catch (e) { /* transient */ }
+}
+pollWhatsRunning();
+setInterval(pollWhatsRunning, 4000);
+
+/* ------------------------------ generalist merge status ------------------------------ */
+function formatSeconds(s) {
+  if (s == null) return null;
+  if (s <= 0) return "any moment";
+  const d = Math.floor(s / 86400), h = Math.floor((s % 86400) / 3600), m = Math.floor((s % 3600) / 60);
+  if (d) return `~${d}d ${h}h`;
+  if (h) return `~${h}h ${m}m`;
+  return `~${m}m`;
+}
+async function pollMergeStatus() {
+  try {
+    const st = await api("/api/generalist-merge/status");
+    const dot = $("#merge-tab-dot");
+    if (!st.found) {
+      dot.className = "tabdot hidden";
+      $("#merge-summary").innerHTML = '<p class="hint">No merge log found yet.</p>';
+      return;
+    }
+    const label = st.merge_complete ? "done" : (st.alive ? "running" : "stopped");
+    const dotClass = label === "done" ? "done" : label === "running" ? "running" : "failed";
+    const chip = $("#merge-status-chip");
+    chip.textContent = label; chip.className = "chip " + dotClass;
+    dot.className = "tabdot " + dotClass;
+
+    const pct = Math.round(100 * st.done_count / st.total_sources);
+    const cur = st.sources.find(s => s.status === "current");
+    const summary = $("#merge-summary"); summary.innerHTML = "";
+
+    const headline = el("div", {style: "flex:1;min-width:260px"},
+      el("div", {}, `${st.done_count}/${st.total_sources} sources done`
+        + (st.total_all_episodes ? ` · ${st.total_done_episodes.toLocaleString()}/${st.total_all_episodes.toLocaleString()} episodes` : "")),
+      el("div", {id: "merge-progress-bar"}, el("div", {id: "merge-progress-fill", style: `width:${pct}%`})),
+    );
+    if (!st.merge_complete && st.eta_human) {
+      headline.appendChild(el("p", {class: "merge-eta"}, "Estimated time remaining: ",
+        el("b", {}, st.eta_human), " (rough estimate — see per-source detail below)"));
+    }
+    summary.appendChild(headline);
+
+    if (cur && cur.percent != null) {
+      const detail = el("div", {class: "merge-current-detail"},
+        el("span", {}, "Currently aligning ", el("b", {}, cur.repo)),
+        el("span", {}, "episode ", el("b", {}, `${cur.episode}/${cur.episode_total}`), ` (${cur.percent}%)`),
+      );
+      if (cur.rate_s_per_ep != null) detail.appendChild(el("span", {}, el("b", {}, `${cur.rate_s_per_ep}s`), "/episode"));
+      if (cur.elapsed_s != null) detail.appendChild(el("span", {}, "running ", el("b", {}, formatSeconds(cur.elapsed_s) || "0m")));
+      if (cur.eta_s != null) detail.appendChild(el("span", {}, "done in ", el("b", {}, formatSeconds(cur.eta_s))));
+      summary.appendChild(detail);
+    }
+    let statusLine = `PID ${st.pid ?? "—"} · ${st.alive ? "alive" : "not running"}`;
+    if (st.error_line) statusLine += " · " + st.error_line;
+    summary.appendChild(el("p", {class: "hint", style: "flex-basis:100%"}, statusLine));
+
+    const box = $("#merge-sources"); box.innerHTML = "";
+    let lastGroup = null;
+    for (const s of st.sources) {
+      if (s.group !== lastGroup) {
+        box.appendChild(el("div", {class: "merge-group-label"}, s.group));
+        lastGroup = s.group;
+      }
+      const epTotal = s.episode_total != null ? s.episode_total.toLocaleString() : "?";
+      const statusText = (s.status === "current" && s.percent != null)
+        ? `${s.percent}% (${s.episode}/${epTotal} ep)`
+        : (s.episode_total != null ? `${s.status} · ${epTotal} ep` : s.status);
+      box.appendChild(el("div", {class: "merge-src " + s.status},
+        el("div", {class: "msrc-repo"}, s.repo),
+        el("div", {class: "msrc-status"}, statusText),
+      ));
+    }
+  } catch (e) { /* transient */ }
+}
+async function loadMergeResume() {
+  try {
+    const d = await api("/api/generalist-merge/resume");
+    $("#merge-resume-text").textContent = d.found ? d.text : "(docs/generalist_merge_resume.md not found)";
+  } catch (e) { /* transient */ }
+}
+pollMergeStatus();
+loadMergeResume();
+setInterval(pollMergeStatus, 3000);
+setInterval(loadMergeResume, 30000);
 
 /* ------------------------------ toolbar ------------------------------ */
 $("#btn-save").onclick = () => saveWorkflow().catch(e => toast(e.message, true));
