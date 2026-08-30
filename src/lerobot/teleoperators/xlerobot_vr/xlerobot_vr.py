@@ -1568,12 +1568,22 @@ class XLerobotVRTeleop(Teleoperator):
 
             # Get current event status (copy)
             events = self.vr_event_handler.get_events()
-            
+
+            # Diagnostic checkpoint: confirms the flag actually leaves this function True, so a
+            # missing log line here despite a "pressed -> ..." dispatch log means the bug is
+            # between _dispatch_semantic and this return (e.g. a second VREventHandler instance,
+            # or the copy/reset ordering below), not in record_loop's consumption of it.
+            if events.get("exit_early") or events.get("rerecord_episode"):
+                logger.info(
+                    "🔎 get_vr_events() returning exit_early=%s rerecord_episode=%s",
+                    events.get("exit_early"), events.get("rerecord_episode"),
+                )
+
             # Automatically reset exit_early to prevent infinite loops
             # But keep rerecord_episode until it's processed in the recording loop
             if events.get("exit_early", False):
                 self.vr_event_handler.events["exit_early"] = False
-            
+
             return events
         else:
             # Return default event status
@@ -1884,10 +1894,13 @@ class VREventHandler:
         """Process left controller input (session/DAgger buttons per ``button_map``)."""
         buttons = _safe_buttons(metadata)
 
-        # Log raw left button states whenever they change, for mapping debug
+        # Log raw left button states whenever they change, for mapping debug. INFO (not debug)
+        # so this is visible with default logging while diagnosing dispatch-vs-record_loop gaps
+        # (a raw dict that never shows True here despite a physical press means the mismatch is
+        # upstream, in the VR bridge's button schema, not in this file).
         prev_buttons_snapshot = self.prev_states.get('buttons_snapshot', {})
         if buttons != prev_buttons_snapshot:
-            logger.debug(f"🎮 LEFT raw buttons: {buttons}")
+            logger.info(f"🎮 LEFT raw buttons: {buttons}")
 
         # IMPORTANT: Do NOT map thumbstick *movement* to session events.
         # The left thumbstick X axis is used for base rotation, so only the
@@ -1911,7 +1924,7 @@ class VREventHandler:
 
         prev_right_snapshot = self.prev_states.get('right_buttons_snapshot', {})
         if buttons != prev_right_snapshot:
-            logger.debug(f"🎮 RIGHT raw buttons: {buttons}")
+            logger.info(f"🎮 RIGHT raw buttons: {buttons}")
 
         # Some packets can omit button fields entirely (e.g. {}); guard_missing
         # treats those as "unchanged" rather than "released" to avoid false
