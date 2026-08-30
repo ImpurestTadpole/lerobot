@@ -32,7 +32,7 @@ from ..config import TeleoperatorConfig
 #   exit_early          - end the current episode early (save & continue)
 #   stop_session        - stop recording / end the rollout session
 #   reset_position       - reset the robot to its rest pose (momentary, held)
-#   toggle_intervention   - DAgger human/policy handover (RIGHT A today)
+#   toggle_intervention   - DAgger human/policy handover (RIGHT B today)
 #   upload_dataset        - push the recorded dataset to the Hub on demand
 #
 # LEFT MENU is special-cased in VREventHandler regardless of what it's mapped to here: a quick
@@ -43,15 +43,24 @@ from ..config import TeleoperatorConfig
 # LEFT X is also special-cased: at the start of each episode attempt, lerobot_record.py arms a
 # "recording gate" (VREventHandler.reset_recording_gate()) and drives the robot without capturing
 # frames until X is pressed, so the operator can reposition things first. That first X press opens
-# the gate (and plays a status ding) instead of dispatching rerecord_episode; once the gate is
-# open, X reverts to its normal button_map semantic for the rest of the episode.
+# the gate (and plays a status ding) instead of dispatching whatever it's mapped to here; once the
+# gate is open, X reverts to its normal button_map semantic for the rest of the episode — which is
+# deliberately left unmapped by default (see below) rather than sharing rerecord_episode with Y.
 DEFAULT_VR_BUTTON_MAP: dict[str, str] = {
-    "left.x": "rerecord_episode",  # also opens the recording gate on the first press (see above)
+    # Deliberately NOT bound to rerecord_episode: X is also the button that opens the recording
+    # gate (see above), so operators instinctively press it again once recording is under way. If
+    # X also meant "discard episode" post-gate, every one of those presses would silently wipe the
+    # episode-in-progress -- it would look like "recording never starts" even though it did. Y is
+    # the sole rerecord button so a genuine discard is a deliberate, distinct action.
+    # "left.x": "rerecord_episode",
     "left.y": "rerecord_episode",
     "left.menu": "stop_session",  # tap; long-press toggles passthrough instead (see above)
     "left.thumbstick": "reset_position",
-    "right.b": "exit_early",
-    "right.a": "toggle_intervention",
+    # RIGHT A ends and saves the current episode (matches the operator workflow: LEFT X starts
+    # recording, RIGHT A finishes it). Was previously mapped to toggle_intervention, which is now
+    # on RIGHT B instead.
+    "right.a": "exit_early",
+    "right.b": "toggle_intervention",
     "right.thumbstick": "upload_dataset",
 }
 

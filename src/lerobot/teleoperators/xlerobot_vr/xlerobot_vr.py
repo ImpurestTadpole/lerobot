@@ -98,12 +98,20 @@ def _safe_trigger(metadata: dict) -> float:
     return max(0.0, min(1.0, v))
 
 
+# Named WebXR buttons the event handler actually dispatches on. Diagnostic extras
+# (e.g. `_rawPressed` arrays the headset page used to attach) must not leak in —
+# a non-empty list is truthy and would look like a permanently-held button.
+_KNOWN_VR_BUTTONS = frozenset({"x", "y", "a", "b", "squeeze", "thumbstick", "menu"})
+
+
 def _safe_buttons(metadata: dict) -> dict:
-    """Return buttons dict, or empty dict if invalid."""
+    """Return a dict of known boolean button names, or empty if invalid."""
     if not isinstance(metadata, dict):
         return {}
     b = metadata.get("buttons")
-    return b if isinstance(b, dict) else {}
+    if not isinstance(b, dict):
+        return {}
+    return {k: bool(v) for k, v in b.items() if k in _KNOWN_VR_BUTTONS}
 
 
 def _safe_head_angles(metadata: dict) -> tuple[float, float]:
@@ -787,16 +795,24 @@ class XLerobotVRTeleop(Teleoperator):
         # Lift velocity smoothing state (smoothed_y, smoothed_vel) for get_vr_lift_action
         self._lift_state = {}
 
-        # Camera-to-headset streaming state (see send_camera_frames)
+        # Camera-to-headset streaming state (see send_camera_frames). The actual JPEG
+        # encode+send work runs on a dedicated background thread (_camera_stream_worker_loop)
+        # so it never blocks the control loop — send_camera_frames() itself just hands off the
+        # latest obs and returns immediately. See _start_camera_stream_thread.
         self._last_camera_stream_time = 0.0
         self._camera_frame_inflight: dict[str, bool] = {}
+        self._camera_stream_thread: threading.Thread | None = None
+        self._camera_stream_stop_event: threading.Event | None = None
+        self._camera_stream_new_obs_event = threading.Event()
+        self._camera_stream_lock = threading.Lock()
+        self._camera_stream_latest_obs: dict[str, Any] | None = None
 
         # Depth-view toggle state (see _update_depth_toggle / send_camera_frames)
         self._depth_view_enabled = False
         self._prev_right_thumbstick_click = False
 
         # Intervention state — toggled by the button_map's "toggle_intervention" action
-        # (RIGHT A by default), read by s1_process / DAgger via get_teleop_events()
+        # (RIGHT B by default), read by s1_process / DAgger via get_teleop_events()
         self._intervention_active = False
 
         self.logs = {}
@@ -896,6 +912,9 @@ class XLerobotVRTeleop(Teleoperator):
             # Store robot reference for use in get_action
             self.robot = robot
 
+            if self.config.stream_cameras_to_vr:
+                self._start_camera_stream_thread()
+
             if calibrate and robot is not None and robot.is_connected:
                 robot_obs = robot.get_observation()
                 self.calibrate(robot_obs)
@@ -988,21 +1007,83 @@ class XLerobotVRTeleop(Teleoperator):
         else:
             self._camera_frame_inflight.pop(key, None)
 
+    def _start_camera_stream_thread(self) -> None:
+        """Starts the background worker that encodes/sends VR camera frames.
+
+        No-op if already running. See ``_camera_stream_worker_loop`` for why this work is kept
+        off the control-loop thread.
+        """
+        if self._camera_stream_thread is not None and self._camera_stream_thread.is_alive():
+            return
+        self._camera_stream_stop_event = threading.Event()
+        self._camera_stream_thread = threading.Thread(
+            target=self._camera_stream_worker_loop, name="vr_camera_stream", daemon=True
+        )
+        self._camera_stream_thread.start()
+
+    def _stop_camera_stream_thread(self) -> None:
+        """Signals the camera-stream worker to stop and waits for it to exit."""
+        if self._camera_stream_stop_event is not None:
+            self._camera_stream_stop_event.set()
+        self._camera_stream_new_obs_event.set()  # wake the worker if it's blocked in wait()
+        if self._camera_stream_thread is not None and self._camera_stream_thread.is_alive():
+            self._camera_stream_thread.join(timeout=2.0)
+        self._camera_stream_thread = None
+        self._camera_stream_stop_event = None
+
+    def _camera_stream_worker_loop(self) -> None:
+        """Background thread: encodes+sends the latest obs handed off by send_camera_frames().
+
+        JPEG-encoding (and the resize/colormap/color-convert that precede it) is pure CPU work
+        that used to run synchronously inside record_loop's hot path once per control tick,
+        directly gating the achievable control rate. This loop instead pulls whatever the most
+        recent observation is whenever it's free, so a slow encode only delays the VR preview
+        (which was already rate-limited and frame-dropping, see below) and never the robot's
+        control loop.
+        """
+        stop_event = self._camera_stream_stop_event
+        assert stop_event is not None
+        while not stop_event.is_set():
+            got_new = self._camera_stream_new_obs_event.wait(timeout=0.5)
+            if not got_new:
+                continue
+            self._camera_stream_new_obs_event.clear()
+            if stop_event.is_set():
+                break
+            with self._camera_stream_lock:
+                obs = self._camera_stream_latest_obs
+            if obs is None:
+                continue
+            try:
+                self._encode_and_send_camera_frames(obs)
+            except Exception:
+                logger.exception("[VR] camera stream worker failed to encode/send frames")
+
     def send_camera_frames(self, obs: dict[str, Any]) -> None:
         """
-        JPEG-encode the robot's camera frames from `obs` and push them to the VR headset for
-        live display while teleoperating. Opt-in via config.stream_cameras_to_vr; a no-op
-        otherwise. Rate-limited to config.camera_stream_fps and drops a camera's frame instead
-        of queuing it if that camera's previous frame hasn't finished sending yet, so this never
-        blocks the control loop.
+        Hands off the robot's camera frames from `obs` to the background camera-stream worker
+        (see ``_camera_stream_worker_loop``) for JPEG-encoding and sending to the VR headset.
+        Opt-in via config.stream_cameras_to_vr; a no-op otherwise. Never blocks: this just stores
+        a reference and signals the worker, so it's safe to call every control tick regardless of
+        camera_stream_fps or encode cost.
+        """
+        if not self.config.stream_cameras_to_vr or self.vr_monitor is None:
+            return
+        with self._camera_stream_lock:
+            self._camera_stream_latest_obs = obs
+        self._camera_stream_new_obs_event.set()
+
+    def _encode_and_send_camera_frames(self, obs: dict[str, Any]) -> None:
+        """Rate-limited JPEG-encode + send of one obs snapshot. Runs on the camera-stream worker
+        thread (see ``_camera_stream_worker_loop``), never on the control-loop thread.
+
+        Rate-limited to config.camera_stream_fps and drops a camera's frame instead of queuing
+        it if that camera's previous frame hasn't finished sending yet.
 
         Depth frames (keys ending "_depth") are only encoded/sent when the operator has toggled
         the depth view on (RIGHT thumbstick click, see _update_depth_toggle) — encoding depth
         every tick regardless would add CPU cost for a view most sessions never look at.
         """
-        if not self.config.stream_cameras_to_vr or self.vr_monitor is None:
-            return
-
         now = time.perf_counter()
         min_interval = 1.0 / max(self.config.camera_stream_fps, 1e-6)
         if now - self._last_camera_stream_time < min_interval:
@@ -1066,7 +1147,12 @@ class XLerobotVRTeleop(Teleoperator):
         """
         if not self.config.stream_cameras_to_vr or self.vr_monitor is None:
             return
-        self.vr_monitor.send_status({"episode_event": event})
+        # Include recording_active so a partial ping still updates the HUD indicator
+        # (the client merges status fields; without this the REC/READY state would
+        # lag until the next 0.2s periodic task/episode push).
+        self.vr_monitor.send_status(
+            {"episode_event": event, "recording_active": event == "start"}
+        )
 
     def _get_noop_lift_action(self, robot) -> dict[str, Any]:
         """When lift axis is enabled, return zero velocity so lift does not keep moving."""
@@ -1358,14 +1444,16 @@ class XLerobotVRTeleop(Teleoperator):
             )
         
         try:
+            self._stop_camera_stream_thread()
+
             if self.vr_monitor:
                 # VR Monitor usually runs in a thread, stop the thread
                 pass
-            
+
             self._connected = False
             self._calibrated = False
             print("[VR] Disconnected")
-            
+
         except Exception as e:
             print(f"[VR] Error during disconnect: {e}")
 
@@ -1391,7 +1479,7 @@ class XLerobotVRTeleop(Teleoperator):
         ``input_device="teleop"``) and s1_process.py each control loop.
 
         IS_INTERVENTION reflects the toggle state driven by whichever physical button
-        is bound to the ``"toggle_intervention"`` action in ``button_map`` (RIGHT A by
+        is bound to the ``"toggle_intervention"`` action in ``button_map`` (RIGHT B by
         default). STOP_SESSION and UPLOAD_REQUESTED surface the ``"stop_session"`` and
         ``"upload_dataset"`` button_map actions, so a DAgger session can be stopped or
         pushed to the Hub entirely from the VR controllers without a keyboard fallback.
@@ -1441,7 +1529,7 @@ class XLerobotVRTeleop(Teleoperator):
     def reset_intervention(self) -> None:
         """Clear intervention state at the start of each episode.
 
-        NOTE: this also clears the RIGHT A physical-button edge cache, since that
+        NOTE: this also clears the RIGHT B physical-button edge cache, since that
         is the default "toggle_intervention" binding. If ``button_map`` is
         customised to drive "toggle_intervention" from a different physical
         button, that button's own edge cache is reset the same way on its next
@@ -1450,9 +1538,9 @@ class XLerobotVRTeleop(Teleoperator):
         self._intervention_active = False
         if self.vr_event_handler is not None:
             self.vr_event_handler._intervention_active = False
-            # Also clear the A-button prev state so first press in new episode is a clean edge
-            self.vr_event_handler.prev_states['right_button_a'] = False
-            self.vr_event_handler.prev_states['right_a_last_press_ts'] = 0.0
+            # Also clear the B-button prev state so first press in new episode is a clean edge
+            self.vr_event_handler.prev_states['right_button_b'] = False
+            self.vr_event_handler.prev_states['right_b_last_press_ts'] = 0.0
         logger.debug("[VR] Intervention state reset for new episode")
 
     def enable_torque(self) -> None:
@@ -1646,13 +1734,13 @@ class VREventHandler:
         # guard (right-hand buttons); prevents double-fires from noisy packets.
         self._edge_cooldown_s = 0.5
         # Intervention toggle state, driven by whichever button_map key maps to
-        # "toggle_intervention" (RIGHT A by default).
+        # "toggle_intervention" (RIGHT B by default).
         self._intervention_active = False
         # Passthrough toggle state, driven by holding LEFT menu (see _process_left_menu).
         self._passthrough_enabled = False
 
     def reset_recording_gate(self) -> None:
-        """Arm the recording gate: the next LEFT X press opens it instead of re-recording.
+        """Arm the recording gate: the next LEFT X press opens it instead of its normal button_map action.
 
         Called by lerobot_record.py at the start of each episode attempt, before any frames are
         captured, so the operator can freely reposition the robot and only start the actual
@@ -1660,6 +1748,11 @@ class VREventHandler:
         """
         self.awaiting_recording_start = True
         self.events["recording_gate_open"] = False
+        # READY (not REC) for the reposition window — without this the previous
+        # episode's recording_active=True would stick on the HUD until the next
+        # periodic status push.
+        if self.vr_monitor is not None:
+            self.vr_monitor.send_status({"recording_active": False})
 
     def update_events(self):
         """Update VR event status"""
@@ -1766,7 +1859,7 @@ class VREventHandler:
 
         self.prev_states[prev_key] = pressed
 
-    def _process_left_menu(self, pressed: bool) -> None:
+    def _process_left_menu(self, pressed: bool, raw_buttons: dict | None = None) -> None:
         """Edge/hold-detect the LEFT menu button.
 
         A tap dispatches its button_map semantic (stop_session by default) on release, same
@@ -1775,9 +1868,17 @@ class VREventHandler:
         hold doesn't also stop the session. Handled separately from ``_process_button``
         because it needs release-time dispatch and hold-duration tracking that the generic
         edge-only path doesn't do.
+
+        ``raw_buttons``: a VR packet that omits the 'menu' key entirely is a transient drop, not
+        a real release — without this guard it reads as "released" while actually still held,
+        which could fire the release-time semantic (stop_session by default) from a single
+        dropped frame mid-hold. Same protection as the other buttons — see _process_left_x.
         """
-        now = time.monotonic()
         prev_pressed = bool(self.prev_states.get('button_menu', False))
+        if raw_buttons is not None and 'menu' not in raw_buttons:
+            pressed = prev_pressed
+
+        now = time.monotonic()
         long_press_fired = bool(self.prev_states.get('menu_long_press_fired', False))
 
         if pressed and not prev_pressed:
@@ -1793,17 +1894,28 @@ class VREventHandler:
 
         self.prev_states['button_menu'] = pressed
 
-    def _process_left_x(self, pressed: bool) -> None:
+    def _process_left_x(self, pressed: bool, raw_buttons: dict | None = None) -> None:
         """Edge-detect LEFT X, special-cased while ``awaiting_recording_start`` is set.
 
         While the recording gate is armed (see ``reset_recording_gate``), a rising edge opens
         the gate (self-clearing pulse on "recording_gate_open") instead of dispatching X's
-        normal button_map semantic (rerecord_episode by default) — pressing X is how the
-        operator says "start recording now" for that episode. Once the gate has opened for this
-        episode, X reverts to its normal behavior for the rest of the episode.
+        normal button_map semantic (unmapped by default -- see DEFAULT_VR_BUTTON_MAP for why) --
+        pressing X is how the operator says "start recording now" for that episode. Once the
+        gate has opened for this episode, X reverts to its normal (default: no-op) behavior for
+        the rest of the episode.
+
+        ``raw_buttons`` guards against a VR packet that omits the 'x' key entirely (a transient
+        WebXR gamepad glitch, not a real release): without it, that single dropped packet reads
+        as "button released", so a real tap landing right after can have its rising edge eaten.
+        Same protection the right-hand buttons already have via ``_process_button``'s
+        ``guard_missing`` — this branch bypasses ``_process_button`` (it needs release-time
+        recording-gate semantics ``_process_button`` doesn't provide), so it needs its own copy.
         """
+        prev_pressed = bool(self.prev_states.get('button_x', False))
+        if raw_buttons is not None and 'x' not in raw_buttons:
+            pressed = prev_pressed
+
         if self.awaiting_recording_start:
-            prev_pressed = bool(self.prev_states.get('button_x', False))
             if pressed and not prev_pressed:
                 self.awaiting_recording_start = False
                 self.events["recording_gate_open"] = True
@@ -1812,8 +1924,13 @@ class VREventHandler:
                     self.vr_monitor.send_status({"recording_enabled": True})
             self.prev_states['button_x'] = pressed
         else:
-            self.events["recording_gate_open"] = False
-            self._process_button("left", "x", pressed, "button_x")
+            # Do NOT clear recording_gate_open here. It is a sticky pulse consumed by
+            # lerobot_record.py's wait loop; later packets in the same 0.5s record_loop
+            # burst would otherwise overwrite it back to False via events.update() and
+            # the wait would never observe the press.
+            # `pressed` already absorbed the missing-key guard above, so no need to pass
+            # guard_missing/raw_buttons through here too.
+            self._process_button("left", "x", pressed, "button_x", ts_key="left_x_last_press_ts")
 
     def _process_left_controller(self, metadata):
         """Process left controller input (session/DAgger buttons per ``button_map``)."""
@@ -1830,11 +1947,28 @@ class VREventHandler:
         # IMPORTANT: Do NOT map thumbstick *movement* to session events.
         # The left thumbstick X axis is used for base rotation, so only the
         # click (button) is bound here, not the analog axis.
-        self._process_left_x(bool(buttons.get('x', False)))
-        self._process_button("left", "y", bool(buttons.get('y', False)), "button_y")
-        self._process_left_menu(bool(buttons.get('menu', False)))
+        # Same guard_missing + debounce hardening as the right-hand buttons below: a VR packet
+        # that omits a button key is a transient drop, not a real release, and left-hand taps
+        # were previously unprotected against it (see _process_left_x docstring).
+        self._process_left_x(bool(buttons.get('x', False)), raw_buttons=buttons)
         self._process_button(
-            "left", "thumbstick", bool(buttons.get('thumbstick', False)), "button_thumbstick"
+            "left",
+            "y",
+            bool(buttons.get('y', False)),
+            "button_y",
+            ts_key="left_y_last_press_ts",
+            guard_missing=True,
+            raw_buttons=buttons,
+        )
+        self._process_left_menu(bool(buttons.get('menu', False)), raw_buttons=buttons)
+        self._process_button(
+            "left",
+            "thumbstick",
+            bool(buttons.get('thumbstick', False)),
+            "button_thumbstick",
+            ts_key="left_thumbstick_last_press_ts",
+            guard_missing=True,
+            raw_buttons=buttons,
         )
 
         # Detect trigger key events
@@ -1952,7 +2086,8 @@ class VREventHandler:
             (tap instead for its normal button_map action above)
           - LEFT X button: at the start of each episode, robot is driven but NOT recorded
             until X is pressed once (plays a ding) — reposition freely first, then press X
-            to start capturing frames. After that, X reverts to its button_map action above.
+            to start capturing frames. After that, X does nothing by default (not bound in
+            button_map) so pressing it again mid-episode can't accidentally discard progress.
         ===================================================================
         """
         logger.info(guide)

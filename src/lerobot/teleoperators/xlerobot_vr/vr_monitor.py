@@ -156,6 +156,13 @@ class SimpleAPIHandler(http.server.BaseHTTPRequestHandler):
                 
                 self.send_response(200)
                 self.send_header('Content-Type', content_type)
+                # The VR headset browser (and some intermediate proxies) will otherwise cache
+                # web-ui/*.js and index.html indefinitely with no way to force-refresh from
+                # inside the headset — a code change here can silently keep running stale JS
+                # across sessions. This is a live hardware-control page, never serve stale code.
+                self.send_header('Cache-Control', 'no-cache, no-store, must-revalidate')
+                self.send_header('Pragma', 'no-cache')
+                self.send_header('Expires', '0')
                 self.end_headers()
                 self.wfile.write(content)
             else:
@@ -431,6 +438,19 @@ class VRMonitor:
         if not hasattr(self.vr_server, "broadcast_status"):
             return None
         return asyncio.run_coroutine_threadsafe(self.vr_server.broadcast_status(status), self.loop)
+
+    def has_connected_client(self) -> bool:
+        """True once at least one VR headset browser has completed the WSS handshake.
+
+        Used to tell "the headset browser never connected at all" (most commonly: the operator
+        only accepted the self-signed cert on the HTTPS static-file port, not on this separate
+        WSS control port -- browsers trust a self-signed cert per origin+port, not per origin)
+        apart from "connected but not pressing anything", which look identical from the
+        lerobot side (no VR events ever arrive) but need very different operator action.
+        """
+        if self.vr_server is None:
+            return False
+        return bool(getattr(self.vr_server, "clients", None))
 
     def get_left_goal_nowait(self):
         """Return the latest left arm goal if available, else None."""
