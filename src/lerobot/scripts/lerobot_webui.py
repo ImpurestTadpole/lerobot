@@ -254,60 +254,68 @@ INDEX_HTML = """<!doctype html>
 <meta name="viewport" content="width=device-width, initial-scale=1">
 <title>ob15 control panel</title>
 <style>
+  /* Sized generously throughout: this page is commonly opened in the Quest browser (a
+     standalone tab, not the WebXR/XLeVR scene) and driven with a controller ray-pointer
+     rather than a mouse, so targets need to be bigger and text more legible at arm's
+     length than a typical desktop control panel. */
   :root { color-scheme: dark; }
   * { box-sizing: border-box; }
   body {
     margin: 0; font-family: -apple-system, system-ui, sans-serif;
-    background: #14161a; color: #e6e6e6;
+    background: #14161a; color: #e6e6e6; font-size: 18px;
   }
   header {
-    padding: 1rem 1.25rem; border-bottom: 1px solid #2a2d33;
-    display: flex; align-items: center; justify-content: space-between;
+    padding: 1.1rem 1.5rem; border-bottom: 1px solid #2a2d33;
+    display: flex; align-items: center; justify-content: space-between; flex-wrap: wrap; gap: 0.5rem;
   }
-  header h1 { font-size: 1.05rem; margin: 0; font-weight: 600; }
+  header h1 { font-size: 1.3rem; margin: 0; font-weight: 600; }
   #statusPill {
-    padding: 0.25rem 0.7rem; border-radius: 999px; font-size: 0.8rem; font-weight: 600;
+    padding: 0.4rem 0.9rem; border-radius: 999px; font-size: 0.95rem; font-weight: 600;
     background: #333; color: #aaa;
   }
   #statusPill.running { background: #1f4f2c; color: #7fe0a0; }
-  main { max-width: 900px; margin: 0 auto; padding: 1.25rem; }
-  .tabs { display: flex; gap: 0.4rem; margin-bottom: 1rem; }
+  main { max-width: 900px; margin: 0 auto; padding: 1.5rem; }
+  .tabs { display: flex; gap: 0.6rem; margin-bottom: 1.2rem; flex-wrap: wrap; }
   .tab {
-    padding: 0.5rem 1rem; border-radius: 8px; cursor: pointer; background: #1d2025;
-    border: 1px solid #2a2d33; font-size: 0.9rem;
+    padding: 0.85rem 1.3rem; border-radius: 10px; cursor: pointer; background: #1d2025;
+    border: 1px solid #2a2d33; font-size: 1.05rem; min-height: 3.2rem; display: flex; align-items: center;
   }
   .tab.active { background: #2c5cc9; border-color: #2c5cc9; color: white; }
-  .panel { display: none; background: #1a1c20; border: 1px solid #2a2d33; border-radius: 10px; padding: 1rem 1.25rem; }
+  .panel { display: none; background: #1a1c20; border: 1px solid #2a2d33; border-radius: 12px; padding: 1.3rem 1.5rem; }
   .panel.active { display: block; }
-  label { display: block; font-size: 0.8rem; color: #9aa0a8; margin: 0.75rem 0 0.25rem; }
+  label { display: block; font-size: 0.95rem; color: #adb3ba; margin: 1rem 0 0.35rem; }
   input[type=text], input[type=number] {
-    width: 100%; padding: 0.5rem 0.6rem; border-radius: 6px; border: 1px solid #2a2d33;
-    background: #101216; color: #e6e6e6; font-size: 0.9rem;
+    width: 100%; padding: 0.85rem 0.9rem; border-radius: 8px; border: 1px solid #3a3e46;
+    background: #101216; color: #e6e6e6; font-size: 1.05rem; min-height: 3.1rem;
   }
-  .row { display: flex; gap: 0.75rem; }
-  .row > div { flex: 1; }
-  .checkbox { display: flex; align-items: center; gap: 0.4rem; margin-top: 0.75rem; }
-  .checkbox input { width: auto; }
-  .checkbox label { margin: 0; }
+  .row { display: flex; gap: 0.9rem; flex-wrap: wrap; }
+  .row > div { flex: 1; min-width: 140px; }
+  .checkbox {
+    display: flex; align-items: center; gap: 0.65rem; margin-top: 1.1rem;
+    padding: 0.5rem 0.2rem; cursor: pointer; min-height: 3rem;
+  }
+  .checkbox input { width: 1.5rem; height: 1.5rem; accent-color: #2c5cc9; flex-shrink: 0; }
+  .checkbox label { margin: 0; font-size: 1.05rem; color: #e6e6e6; cursor: pointer; }
   button.primary {
-    margin-top: 1.1rem; width: 100%; padding: 0.65rem; border: none; border-radius: 8px;
-    background: #2c5cc9; color: white; font-size: 0.95rem; font-weight: 600; cursor: pointer;
+    margin-top: 1.4rem; width: 100%; padding: 1rem; border: none; border-radius: 10px;
+    min-height: 3.6rem;
+    background: #2c5cc9; color: white; font-size: 1.15rem; font-weight: 600; cursor: pointer;
   }
   button.primary:disabled { background: #33363b; color: #777; cursor: not-allowed; }
-  .controls { display: flex; gap: 0.6rem; margin: 1rem 0; }
+  .controls { display: flex; gap: 0.75rem; margin: 1.3rem 0; }
   .controls button {
-    flex: 1; padding: 0.55rem; border-radius: 8px; border: 1px solid #2a2d33; cursor: pointer;
-    font-weight: 600; font-size: 0.85rem;
+    flex: 1; padding: 0.9rem; border-radius: 10px; border: 1px solid #2a2d33; cursor: pointer;
+    font-weight: 600; font-size: 1.02rem; min-height: 3.4rem;
   }
   #stopBtn { background: #5c2020; color: #ffb3b3; }
   #killBtn { background: #1d2025; color: #ff8a8a; }
   #stopBtn:disabled, #killBtn:disabled { opacity: 0.4; cursor: not-allowed; }
   #log {
     margin-top: 1rem; background: #0b0c0e; border: 1px solid #2a2d33; border-radius: 8px;
-    padding: 0.75rem; height: 260px; overflow-y: auto; font-family: ui-monospace, monospace;
-    font-size: 0.78rem; white-space: pre-wrap; color: #b8c4d0;
+    padding: 0.9rem; height: 260px; overflow-y: auto; font-family: ui-monospace, monospace;
+    font-size: 0.9rem; white-space: pre-wrap; color: #b8c4d0;
   }
-  .err { color: #ff8a8a; font-size: 0.85rem; margin-top: 0.6rem; min-height: 1.1em; }
+  .err { color: #ff8a8a; font-size: 0.95rem; margin-top: 0.6rem; min-height: 1.1em; }
 </style>
 </head>
 <body>
@@ -316,6 +324,12 @@ INDEX_HTML = """<!doctype html>
   <span id="statusPill">idle</span>
 </header>
 <main>
+  <p style="color:#8a9099; font-size:0.95rem; margin:0 0 1.2rem;">
+    Start a session here, then put on the headset to teleoperate — VR controller buttons
+    (rerecord episode, exit early, stop, toggle intervention) control the session once it's
+    running. This page works standalone in the Quest Browser app; it's separate from the
+    XLeVR teleop scene.
+  </p>
   <div class="tabs">
     <div class="tab active" data-tab="record">Record dataset</div>
     <div class="tab" data-tab="inference">Inference</div>
