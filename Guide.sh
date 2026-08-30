@@ -4,8 +4,6 @@
 # LeRobot requires Python >=3.12. Use a single conda environment (no venv).
 
 
-username="jetson"
-pwd = jetson01  # change to your username
 # ONE-TIME: Create conda env with Python 3.12 and install lerobot
 # conda create -n lerobot python=3.12 -y
 # conda activate lerobot
@@ -103,6 +101,13 @@ git status                    # See what files have changed
 git log --oneline            # See commit history
 git remote -v                 # Verify remote URL
 
+# First-time push authentication (Personal Access Token, not your GitHub password):
+#   - Create one at https://github.com/settings/tokens, scope "repo" (full control)
+#   - When prompted: Username = GitHub username, Password = paste the token
+#   - Credentials are saved for future pushes
+# If you get authentication errors, ensure remote is HTTPS:
+#   git remote set-url origin https://github.com/ImpurestTadpole/lerobot.git
+
 # =============================================================================
 # TELEOPERATION
 # =============================================================================
@@ -155,11 +160,14 @@ huggingface-cli login
 # RECORDING
 # =============================================================================
 # VR CONTROLLER CONTROLS (default button_map — see xlerobot_vr/configuration_xlerobot_vr.py):
-# LEFT X or Y button      → Re-record current episode
-# RIGHT B button           → Save episode & move to next (finish early)
+# LEFT X button            → FIRST press each episode: opens the recording gate (starts
+#                            capturing frames). Not bound to anything afterward — safe to
+#                            reposition/press again without discarding the episode.
+# LEFT Y button            → Re-record (discard) current episode
+# RIGHT A button           → Save episode & move to next (finish early)
 # LEFT Menu button         → Stop recording
 # LEFT Thumbstick click    → Reset robot position
-# RIGHT A button           → Toggle DAgger intervention (human <-> policy)
+# RIGHT B button           → Toggle DAgger intervention (human <-> policy)
 # RIGHT Thumbstick click   → Request dataset upload (DAgger corrections-only)
 # Remap any of these without touching motion controls via:
 #   --teleop.button_map='{"right.b": "stop_session", ...}'
@@ -183,7 +191,7 @@ lerobot-record \
     --dataset.num_episodes=5 \
     --dataset.fps=30 \
     --dataset.push_to_hub=true
-    #--resume=true 
+    #--resume=true
 
 #clothing cleanup
 lerobot-record \
@@ -194,7 +202,7 @@ lerobot-record \
     --dataset.num_episodes=5 \
     --dataset.fps=30 \
     --dataset.push_to_hub=true
-    #--resume=true 
+    #--resume=true
 
 lerobot-record \
     --robot.type=xlerobot \
@@ -204,7 +212,7 @@ lerobot-record \
     --dataset.num_episodes=15 \
     --dataset.fps=30 \
     --dataset.push_to_hub=true \
-    --resume=true 
+    --resume=true
 
 
 lerobot-record \
@@ -226,7 +234,7 @@ lerobot-record \
     --dataset.num_episodes=20 \
     --dataset.fps=30 \
     --dataset.push_to_hub=false \
-    --resume=true 
+    --resume=true
 
 # Session 1: Red block (62 episodes) X4 sessions
 lerobot-record \
@@ -237,7 +245,7 @@ lerobot-record \
     --dataset.num_episodes=14 \
     --dataset.fps=30 \
     --dataset.push_to_hub=false \
-    --resume=true 
+    --resume=true
 
 # Session 2: Blue block (62 episodes) X4 sessions
 lerobot-record \
@@ -248,7 +256,7 @@ lerobot-record \
     --dataset.num_episodes=16 \
     --dataset.fps=30 \
     --dataset.push_to_hub=false \
-    --resume=true 
+    --resume=true
 
 
 # Session 3: Green block (62 episodes) X4 sessions
@@ -260,7 +268,7 @@ lerobot-record \
     --dataset.num_episodes=16 \
     --dataset.fps=30 \
     --dataset.push_to_hub=false \
-    --resume=true 
+    --resume=true
 # Session 4: Yellow block (62 episodes) X4 sessions
 lerobot-record \
     --robot.type=xlerobot \
@@ -270,7 +278,7 @@ lerobot-record \
     --dataset.num_episodes=16 \
     --dataset.fps=30 \
     --dataset.push_to_hub=false \
-    --resume=true 
+    --resume=true
 
 
 # RECORDING LOCAL ONLY (push manually later):
@@ -291,15 +299,16 @@ lerobot-record \
 lerobot-record \
     --robot.type=ob15 \
     --teleop.type=xlerobot_vr \
-    --dataset.repo_id=${HF_USER}/pickup_task \
-    --dataset.root=$HOME/.cache/huggingface/lerobot/${HF_USER}/pickup_task \
-    --dataset.single_task="pick up the object and place it in the bin" \
+    --dataset.repo_id=Odog16/keys_into_bowl_ob15 \
+    --dataset.root=/home/jetson/.cache/huggingface/lerobot/Odog16/keys_into_bowl_ob15 \
+    --dataset.single_task="pick up the keys and place it in the blue bowl" \
     --dataset.num_episodes=20 \
     --dataset.episode_time_s=180 \
     --dataset.reset_time_s=10 \
     --dataset.fps=30 \
-    --dataset.push_to_hub=false \
+    --dataset.push_to_hub=true \
     --resume=true
+
 
 # Manually push to hub after recording:
 # HF_DATASETS_CACHE=/tmp bypasses any corrupt Arrow cache from a previous interrupted load
@@ -331,11 +340,12 @@ rm -rf ~/.cache/huggingface/lerobot/Odog16/tool_pickup
 #
 # VR CONTROLLER EVENTS (default button_map; see RECORDING section above for the
 # full table, and --teleop.button_map to remap):
-# - LEFT X/Y button: Re-record current episode
-# - RIGHT B button: Save episode & move to next
+# - LEFT X button: opens the recording gate (first press of each episode only)
+# - LEFT Y button: Re-record current episode
+# - RIGHT A button: Save episode & move to next
 # - LEFT Menu button: Stop recording completely
 # - LEFT Thumbstick click: Reset robot to zero position
-# - RIGHT A button / RIGHT Thumbstick click: DAgger intervention toggle / upload
+# - RIGHT B button / RIGHT Thumbstick click: DAgger intervention toggle / upload
 #   (only relevant for `lerobot-rollout --strategy.type=dagger --strategy.input_device=teleop`)
 
 # =============================================================================
@@ -1571,7 +1581,7 @@ python -m lerobot.async_inference.robot_client \
 
 
 # OPTION 2: Direct evaluation (may hit CUDA OOM on Jetson)
-# 
+#
 # MODEL SIZE LIMITS FOR JETSON ORIN NANO (8GB):
 # - Total system RAM: 8GB (shared with GPU)
 # - Available GPU memory: ~4-5GB (after OS overhead)
@@ -1579,15 +1589,15 @@ python -m lerobot.async_inference.robot_client \
 #   * Small models (<500MB): Should work fine
 #   * Medium models (500MB-1GB): May work with optimizations (mixed precision, smaller batch)
 #   * Large models (>1GB): Likely to hit OOM (like your 1.2GB SmolVLA model)
-# 
+#
 # TROUBLESHOOTING CUDA OOM:
 # If you get "NvMapMemAllocInternalTagged: error 12" or "CUDACachingAllocator" errors,
 # the model (1.2GB) is too large for Jetson GPU memory. Use Option 1 (async) instead.
-# 
+#
 # For larger Jetson models:
 # - Jetson Orin AGX (32GB/64GB): Can handle models up to ~10-20GB
 # - Jetson Orin NX (16GB): Can handle models up to ~5-8GB
-# 
+#
 # DOCKER PERMISSIONS:
 # If you get "permission denied" or "unknown server OS" errors, add user to docker group:
 #   sudo usermod -aG docker $USER
@@ -1969,30 +1979,4 @@ python -m lerobot.policies.hvla.launch \
 # S1 and S2 checkpoints live on PC2 only; Jetson host needs no policy weights.
 # ./scripts/sync_hvla_deploy.sh copies S2→PC2, S1→Jetson, robot JSON→Jetson — for OPTION D you
 # need S1+S2 on PC2 only; use the script for S2+JSON or rsync S1 to PC2 paths yourself.
-
-# =============================================================================
-# GIT WORKFLOW
-# =============================================================================
-cd /home/jetson/lerobot
-
-# 1. Stage your changes
-git add .
-
-# 2. Commit your changes
-git commit -m "Your commit message"
-
-# 3. Pull latest changes from remote (merge if needed)
-git pull origin main
-
-# 4. Push your changes to remote
-# NOTE: First time pushing requires authentication:
-#   - Create Personal Access Token: https://github.com/settings/tokens
-#   - Select scope: "repo" (full control)
-#   - When prompted:
-#     * Username: your GitHub username
-#     * Password: paste your Personal Access Token (NOT your GitHub password)
-#   - Credentials will be saved for future pushes
-git push origin main
-
-# If you get authentication errors, ensure remote is HTTPS:
-#   git remote set-url origin https://github.com/ImpurestTadpole/lerobot.git
+# See GIT WORKFLOW near the top of this file for git commands.

@@ -138,14 +138,19 @@ class OB15Config(RobotConfig):
     # giving it a distinct port here -- no code changes needed on either end of the split.
     #
     # Stable udev names (once bob_1/config/99-ob15.rules is installed): /dev/ob15_bus1 and
-    # /dev/ob15_bus2 (or /dev/ob15_<limb> after a per-limb split).
+    # /dev/ob15_bus2 (or /dev/ob15_<limb> after a per-limb split
+    # ).
     # Bus 1 = left arm + base (base wheels 7-9 live on the left arm's bus).
     # Bus 2 = right arm + head + lift (head pan/tilt 7-8 and lift motor 9 live on the
     # right arm's bus).
     left_arm_port: str = "/dev/ttyACM0"  # left arm motors, IDs 1-6
     right_arm_port: str = "/dev/ttyACM1"  # right arm motors, IDs 1-6
-    base_port: str = "/dev/ttyACM0"  # base wheels, IDs 7-9 (shares left_arm_port by default)
-    head_port: str = "/dev/ttyACM1"  # head pan/tilt, IDs 7-8 (shares right_arm_port by default)
+    # None means "follow left_arm_port/right_arm_port" (resolved in __post_init__), so
+    # overriding --robot.left_arm_port also moves the base's port unless base_port is set
+    # explicitly. A class-level default of `left_arm_port` here would only capture that
+    # field's literal default at class-definition time, not track per-instance overrides.
+    base_port: str | None = None  # base wheels, IDs 7-9 (shares left_arm_port by default)
+    head_port: str | None = None  # head pan/tilt, IDs 7-8 (shares right_arm_port by default)
     # Only used when lift_axis.bus == "lift" (lift given its own dedicated port); otherwise
     # the lift motor attaches to whichever group's bus `lift_axis.bus` names.
     # Default matches bus2 (right_arm+head+lift). Must NOT default to bus1 — ID 9 collides
@@ -195,6 +200,13 @@ class OB15Config(RobotConfig):
 
     def __post_init__(self):
         super().__post_init__()
+        # Resolve the "follow left_arm_port/right_arm_port" defaults before applying the
+        # legacy port1/port2 aliases below, so an explicit port1/port2 still wins.
+        if self.base_port is None:
+            self.base_port = self.left_arm_port
+        if self.head_port is None:
+            self.head_port = self.right_arm_port
+
         # Expand legacy bus aliases onto the per-limb ports they used to mean.
         if self.port1 is not None:
             self.left_arm_port = self.port1

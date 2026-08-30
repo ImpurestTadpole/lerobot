@@ -304,6 +304,16 @@ def record_loop(
     loop_times = []
     last_hz_print = time.perf_counter()
     hz_print_interval = 1.0  # Print Hz rate every 1 second
+
+    # VR HUD status push: its own (short) cadence, independent of hz_print_interval above.
+    # The pre-recording "reposition" gate-wait phase (see `record()`) calls this function
+    # repeatedly with control_time_s=0.5 — each call is shorter than hz_print_interval, so
+    # gating the VR push on that 1s interval meant it never fired during that phase and the
+    # headset HUD showed nothing at all while waiting for LEFT X. 0.2s keeps the HUD visibly
+    # live without meaningfully adding to control-loop overhead (small JSON, same
+    # run_coroutine_threadsafe path already used every frame for camera streaming).
+    last_status_send = 0.0
+    status_send_interval = 0.2
     prev_loop_start = time.perf_counter()  # Track previous loop start time
     frame_idx = 0  # For throttling visualization
 
@@ -476,8 +486,10 @@ def record_loop(
                 loop_times.clear()  # Reset for next interval
             last_hz_print = current_time
 
-            # Push task/episode/elapsed-time info to the VR headset HUD once per second (see
-            # XLerobotVRTeleop.send_status / CAMERA_PANEL_SLOTS status text in vr_app.js).
+        # Push task/episode/elapsed-time info to the VR headset HUD (see status_send_interval
+        # above for why this runs on its own cadence rather than piggybacking on hz_print_interval).
+        if current_time - last_status_send >= status_send_interval:
+            last_status_send = current_time
             if isinstance(teleop, Teleoperator) and hasattr(teleop, "send_status"):
                 ep_idx = events.get("_episode_idx")
                 ep_total = events.get("_episode_total")
@@ -486,6 +498,7 @@ def record_loop(
                         "task": single_task,
                         "episode_idx": ep_idx,
                         "episode_total": ep_total,
+                        "recording_active": bool(events.get("_recording_active")),
                         "elapsed_s": timestamp,
                         "episode_duration_s": control_time_s,
                     }
@@ -664,9 +677,14 @@ def record(
                     f"🎬 Starting Episode {dataset.num_episodes + 1} "
                     f"(Progress: {recorded_episodes + 1}/{cfg.dataset.num_episodes} episodes)"
                 )
-                # Used only for logging inside record_loop.
+                # Episode counter for the VR HUD (see record_loop's status push): shown for the
+                # whole episode, including the reposition/gate-wait phase below, so the headset
+                # always displays "EP x/y" — `_recording_active` (set separately, just before the
+                # real record_loop call) is what actually gates the HUD's REC indicator and the
+                # start/stop chimes, so reposition time isn't shown or chimed as if it were capture.
                 events["_episode_idx"] = recorded_episodes + 1
                 events["_episode_total"] = cfg.dataset.num_episodes
+                events["_recording_active"] = False
 
                 # VR-only: don't start capturing frames until the operator explicitly says so.
                 # This gives time to reposition the robot/scene after the reset phase without
@@ -691,6 +709,8 @@ def record(
                             depth_read_interval=cfg.dataset.depth_read_interval,
                         )
                     events["recording_gate_open"] = False
+                    if getattr(teleop, "vr_event_handler", None):
+                        teleop.vr_event_handler.events["recording_gate_open"] = False
                     if events["stop_recording"]:
                         break
                     # Same defensive clear as above: a stray rerecord/exit_early press during the
@@ -701,6 +721,9 @@ def record(
                     if getattr(teleop, "vr_event_handler", None):
                         teleop.vr_event_handler.events["rerecord_episode"] = False
                         teleop.vr_event_handler.events["exit_early"] = False
+
+                # Frames are actually about to be captured now — flip the HUD's REC indicator on.
+                events["_recording_active"] = True
 
                 if isinstance(teleop, Teleoperator) and hasattr(teleop, "send_episode_event"):
                     teleop.send_episode_event("start")
@@ -725,6 +748,7 @@ def record(
                     teleop.send_episode_event("stop")
                 events.pop("_episode_idx", None)
                 events.pop("_episode_total", None)
+                events.pop("_recording_active", None)
 
                 if events["rerecord_episode"]:
                     log_say("Re-record episode", cfg.play_sounds)

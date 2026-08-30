@@ -43,20 +43,23 @@ def test_default_config_button_map_matches_default_map():
     assert cfg.button_map == DEFAULT_VR_BUTTON_MAP
 
 
-def test_default_left_x_or_y_triggers_rerecord_and_exit_early():
+def test_default_left_y_triggers_rerecord_and_exit_early():
     handler = VREventHandler(vr_monitor=None)
 
-    handler._process_left_controller(_meta({"x": True}))
-    assert handler.events["rerecord_episode"] is True
-    assert handler.events["exit_early"] is True
-
-    handler._process_left_controller(_meta({"x": False}))
-
-    handler.events["rerecord_episode"] = False
-    handler.events["exit_early"] = False
     handler._process_left_controller(_meta({"y": True}))
     assert handler.events["rerecord_episode"] is True
     assert handler.events["exit_early"] is True
+
+
+def test_default_left_x_is_unmapped_outside_the_recording_gate():
+    """X is deliberately left unbound in DEFAULT_VR_BUTTON_MAP (unlike Y) because it's also the
+    button that opens the recording gate -- if it also meant "discard episode" post-gate, an
+    operator instinctively re-pressing it mid-episode would silently wipe their progress."""
+    handler = VREventHandler(vr_monitor=None)
+
+    handler._process_left_controller(_meta({"x": True}))
+    assert handler.events["rerecord_episode"] is False
+    assert handler.events["exit_early"] is False
 
 
 def test_default_left_menu_stops_session():
@@ -79,22 +82,22 @@ def test_default_left_thumbstick_reset_position_is_self_clearing():
     assert handler.events["reset_position"] is False
 
 
-def test_default_right_b_exits_episode_early():
+def test_default_right_a_exits_episode_early():
     handler = VREventHandler(vr_monitor=None)
-    handler._process_right_controller(_meta({"b": True}))
+    handler._process_right_controller(_meta({"a": True}))
     assert handler.events["exit_early"] is True
 
 
-def test_default_right_a_toggles_intervention():
+def test_default_right_b_toggles_intervention():
     handler = VREventHandler(vr_monitor=None)
     assert handler._intervention_active is False
 
-    handler._process_right_controller(_meta({"a": True}))
+    handler._process_right_controller(_meta({"b": True}))
     assert handler._intervention_active is True
 
-    handler._process_right_controller(_meta({"a": False}))
+    handler._process_right_controller(_meta({"b": False}))
     time.sleep(0.6)  # clear the debounce window
-    handler._process_right_controller(_meta({"a": True}))
+    handler._process_right_controller(_meta({"b": True}))
     assert handler._intervention_active is False
 
 
@@ -107,39 +110,39 @@ def test_default_right_thumbstick_requests_upload():
 def test_right_button_debounce_ignores_rapid_repress():
     handler = VREventHandler(vr_monitor=None)
 
-    handler._process_right_controller(_meta({"a": True}))
+    handler._process_right_controller(_meta({"b": True}))
     assert handler._intervention_active is True
 
-    handler._process_right_controller(_meta({"a": False}))
+    handler._process_right_controller(_meta({"b": False}))
     # Re-press immediately, well inside the cooldown window -> ignored.
-    handler._process_right_controller(_meta({"a": True}))
+    handler._process_right_controller(_meta({"b": True}))
     assert handler._intervention_active is True
 
 
 def test_right_missing_button_field_treated_as_unchanged():
     handler = VREventHandler(vr_monitor=None)
 
-    handler._process_right_controller(_meta({"b": True}))
+    handler._process_right_controller(_meta({"a": True}))
     assert handler.events["exit_early"] is True
     handler.events["exit_early"] = False
 
-    # Packet omits 'b' entirely (e.g. dropped field) -> must not read as a
+    # Packet omits 'a' entirely (e.g. dropped field) -> must not read as a
     # release-then-repress on the next real packet.
     handler._process_right_controller(_meta({}))
-    handler._process_right_controller(_meta({"b": True}))
+    handler._process_right_controller(_meta({"a": True}))
     assert handler.events["exit_early"] is False
 
 
 def test_button_map_can_be_remapped():
-    remapped = {"right.b": "toggle_intervention", "right.a": "exit_early"}
+    remapped = {"right.a": "toggle_intervention", "right.b": "exit_early"}
     handler = VREventHandler(vr_monitor=None, button_map=remapped)
 
-    handler._process_right_controller(_meta({"b": True}))
+    handler._process_right_controller(_meta({"a": True}))
     assert handler._intervention_active is True
     assert handler.events["exit_early"] is False
 
-    handler._process_right_controller(_meta({"b": False}))
-    handler._process_right_controller(_meta({"a": True}))
+    handler._process_right_controller(_meta({"a": False}))
+    handler._process_right_controller(_meta({"b": True}))
     assert handler.events["exit_early"] is True
 
 

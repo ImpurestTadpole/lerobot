@@ -15,6 +15,7 @@ import ssl
 import socket
 from pathlib import Path
 from typing import Optional
+from urllib.parse import urlsplit
 
 def _resolve_xlevr_path() -> str:
     """Locate the XLeVR checkout (serves web-ui + certs, provides the xlevr package).
@@ -125,21 +126,30 @@ class SimpleAPIHandler(http.server.BaseHTTPRequestHandler):
     
     def do_GET(self):
         """Handle GET requests."""
-        if self.path == '/' or self.path == '/index.html':
+        # self.path is the raw request-target and includes the query string (e.g.
+        # "/vr_app.js?v=2026-08-30-...", the cache-busting param index.html appends to the
+        # script tag) -- every extension check below used to match against that whole string,
+        # so `.endswith('.js')` was False whenever a version query string was present and every
+        # such request 404'd. That 404 silently killed the entire page: vr_app.js/index.html
+        # never actually executed, so nothing after it (the Start Controller Tracking button,
+        # the WebSocket connection, button/arm handling) ever ran either -- indistinguishable
+        # from "the button doesn't work" with no error visible to the operator.
+        path = urlsplit(self.path).path
+        if path == '/' or path == '/index.html':
             # Serve main page from web-ui directory
             self.serve_file('web-ui/index.html', 'text/html')
-        elif self.path.endswith('.css'):
+        elif path.endswith('.css'):
             # Serve CSS files from web-ui directory
-            self.serve_file(f'web-ui{self.path}', 'text/css')
-        elif self.path.endswith('.js'):
+            self.serve_file(f'web-ui{path}', 'text/css')
+        elif path.endswith('.js'):
             # Serve JS files from web-ui directory
-            self.serve_file(f'web-ui{self.path}', 'application/javascript')
-        elif self.path.endswith('.ico'):
-            self.serve_file(self.path[1:], 'image/x-icon')
-        elif self.path.endswith(('.jpg', '.jpeg', '.png', '.gif')):
+            self.serve_file(f'web-ui{path}', 'application/javascript')
+        elif path.endswith('.ico'):
+            self.serve_file(path[1:], 'image/x-icon')
+        elif path.endswith(('.jpg', '.jpeg', '.png', '.gif')):
             # Serve image files from web-ui directory
-            content_type = 'image/jpeg' if self.path.endswith(('.jpg', '.jpeg')) else 'image/png' if self.path.endswith('.png') else 'image/gif'
-            self.serve_file(f'web-ui{self.path}', content_type)
+            content_type = 'image/jpeg' if path.endswith(('.jpg', '.jpeg')) else 'image/png' if path.endswith('.png') else 'image/gif'
+            self.serve_file(f'web-ui{path}', content_type)
         else:
             self.send_error(404, "Not found")
     
@@ -156,6 +166,13 @@ class SimpleAPIHandler(http.server.BaseHTTPRequestHandler):
                 
                 self.send_response(200)
                 self.send_header('Content-Type', content_type)
+                # The VR headset browser (and some intermediate proxies) will otherwise cache
+                # web-ui/*.js and index.html indefinitely with no way to force-refresh from
+                # inside the headset — a code change here can silently keep running stale JS
+                # across sessions. This is a live hardware-control page, never serve stale code.
+                self.send_header('Cache-Control', 'no-cache, no-store, must-revalidate')
+                self.send_header('Pragma', 'no-cache')
+                self.send_header('Expires', '0')
                 self.end_headers()
                 self.wfile.write(content)
             else:
@@ -454,9 +471,17 @@ class VRMonitor:
 
 def main():
     """Main function"""
+    # Standalone entry point only -- lerobot-record configures logging itself via
+    # init_logging(). Without a handler, every logger.info/debug call in this module and in
+    # xlevr (SSL cert loaded, "WebSocket server running on wss://...", client connect/disconnect,
+    # button activity, etc.) is silently dropped: Python's logging module only auto-prints
+    # WARNING-and-above (via logging.lastResort) when nothing else is configured. That made a
+    # `python vr_monitor.py` debug run look like the WebSocket server never started even when it
+    # was listening the whole time -- there was simply no log output to show it.
+    logging.basicConfig(level=logging.INFO, format="%(levelname)s %(name)s: %(message)s")
     print("🎮 XLeVR Monitor - XLeVR VR Control Information Monitor")
     print("=" * 60)
-    
+
     # Check XLeVR path
     if not os.path.exists(XLEVR_PATH):
         print(f"❌ XLeVR path does not exist: {XLEVR_PATH}")

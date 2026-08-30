@@ -201,6 +201,17 @@ class CycleTimer:
     #: logged it for 556 groups out of 576.
     SPAN_TOLERANCE = 0.01
 
+    #: Minimum seconds between consecutive slow-loop warnings. Near-target jitter
+    #: closes a slightly-over-budget group on most ticks, so without a cooldown the
+    #: warning fires every tick and drowns out the rest of the run's logs.
+    WARN_COOLDOWN_S = 5.0
+
+    #: Fraction over the cycle budget a group must run before it's worth a WARNING
+    #: instead of a quiet DEBUG note. A loop running at 29 Hz against a 30 Hz target is
+    #: normal scheduler jitter, not a problem — this keeps that case out of default logs
+    #: while still surfacing a genuinely struggling loop (e.g. dropping to 20 Hz).
+    SLOW_LOOP_TOLERANCE = 0.10
+
     def __init__(
         self,
         fps: float,
@@ -240,6 +251,10 @@ class CycleTimer:
         # Boundary effects take hold at the next ``tick()`` — see :meth:`tick`.
         self._pending_close: str | None = None
         self._drop_next_gap = False
+        # Slow-loop warning is rate-limited (see WARN_COOLDOWN_S below) — near-target
+        # jitter closes a slightly-over-budget group on most ticks, and warning every
+        # tick drowns out the rest of the run's logs without adding information.
+        self._last_warn_t: float | None = None
 
     def restart(self) -> None:
         """Re-arm the start-up exemption after control state was reset mid-run.
@@ -399,16 +414,24 @@ class CycleTimer:
                 if group_work > self.cycle_interval:
                     stats.groups_over += 1
                     warned = True
-                    consequence = (
-                        "Dataset frames might be dropped and robot control might be unstable."
-                        if self.records_data
-                        else "Robot control might be unstable."
-                    )
-                    logger.warning(
+                    message = (
                         f"Control loop is running slower ({1 / group_work:.1f} Hz) than the target FPS "
-                        f"({self.fps:g} Hz). {consequence} Common causes are: 1) Camera FPS not keeping up "
-                        "2) Policy inference (action or text) taking too long 3) CPU starvation"
+                        f"({self.fps:g} Hz)."
                     )
+                    if group_work > self.cycle_interval * (1.0 + self.SLOW_LOOP_TOLERANCE):
+                        if self._last_warn_t is None or now - self._last_warn_t >= self.WARN_COOLDOWN_S:
+                            self._last_warn_t = now
+                            consequence = (
+                                "Dataset frames might be dropped and robot control might be unstable."
+                                if self.records_data
+                                else "Robot control might be unstable."
+                            )
+                            logger.warning(
+                                f"{message} {consequence} Common causes are: 1) Camera FPS not keeping up "
+                                "2) Policy inference (action or text) taking too long 3) CPU starvation"
+                            )
+                    else:
+                        logger.debug(message)
         # A late tick that did not blow the cycle budget costs only interpolation
         # smoothness, so it is a DEBUG note — and at multiplier 1 there is no
         # smoothness to lose, the warning above is the whole story.  Group-closing
