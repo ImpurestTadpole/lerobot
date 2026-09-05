@@ -24,6 +24,7 @@ python -m lerobot.async_inference.policy_server \
 ```
 """
 
+import gc
 import logging
 import pickle  # nosec
 import threading
@@ -161,6 +162,16 @@ class PolicyServer(services_pb2_grpc.AsyncInferenceServicer):
         self.rename_map = policy_specs.rename_map
 
         policy_class = get_policy_class(self.policy_type)
+
+        if self.policy is not None:
+            # Free the previous client's policy before loading a new one, otherwise its
+            # GPU memory lingers (only released once garbage-collected) and can starve
+            # the new load on memory-constrained GPUs.
+            del self.policy
+            self.policy = None
+            gc.collect()
+            if torch.cuda.is_available():
+                torch.cuda.empty_cache()
 
         start = time.perf_counter()
 
