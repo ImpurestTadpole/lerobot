@@ -226,11 +226,20 @@ class PolicyServer(services_pb2_grpc.AsyncInferenceServicer):
                     # RTC already enabled or not applicable
                     self.policy = policy_class.from_pretrained(policy_specs.pretrained_name_or_path)
             except Exception as e:
+                error_msg = str(e)
                 self.logger.warning(
                     "Failed to pre-load policy config for RTC setup (%s). "
                     "Falling back to direct policy load with post-load RTC injection.",
-                    e,
+                    error_msg,
                 )
+                # `e`'s traceback keeps every frame of the failed from_pretrained() call alive,
+                # including any partially-constructed model already moved to the GPU. Drop it
+                # explicitly and reclaim that memory before retrying, otherwise the fallback
+                # load below competes with the leaked memory from the attempt that just failed.
+                del e
+                gc.collect()
+                if torch.cuda.is_available():
+                    torch.cuda.empty_cache()
                 fallback_config = None
                 if self.config.policy_dtype is not None:
                     try:
