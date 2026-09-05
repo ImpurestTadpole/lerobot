@@ -191,6 +191,12 @@ class PolicyServer(services_pb2_grpc.AsyncInferenceServicer):
                 # Load config first using the policy's concrete config class
                 config = policy_class.config_class.from_pretrained(policy_specs.pretrained_name_or_path)
 
+                if self.config.policy_dtype is not None and hasattr(config, "dtype"):
+                    self.logger.info(
+                        "Overriding policy dtype: %s -> %s", config.dtype, self.config.policy_dtype
+                    )
+                    config.dtype = self.config.policy_dtype
+
                 # Enable RTC if not already enabled
                 if hasattr(config, "rtc_config") and (
                     config.rtc_config is None or not getattr(config.rtc_config, "enabled", False)
@@ -214,7 +220,19 @@ class PolicyServer(services_pb2_grpc.AsyncInferenceServicer):
                     "Falling back to direct policy load with post-load RTC injection.",
                     e,
                 )
-                self.policy = policy_class.from_pretrained(policy_specs.pretrained_name_or_path)
+                fallback_config = None
+                if self.config.policy_dtype is not None:
+                    try:
+                        fallback_config = policy_class.config_class.from_pretrained(
+                            policy_specs.pretrained_name_or_path
+                        )
+                        if hasattr(fallback_config, "dtype"):
+                            fallback_config.dtype = self.config.policy_dtype
+                    except Exception:
+                        fallback_config = None
+                self.policy = policy_class.from_pretrained(
+                    policy_specs.pretrained_name_or_path, config=fallback_config
+                )
                 # Config pre-load failed (e.g. extra 'type' field in config.json), but
                 # the policy itself loaded fine.  Inject RTC now so it still runs.
                 if hasattr(self.policy, "init_rtc_processor") and hasattr(self.policy.config, "rtc_config"):

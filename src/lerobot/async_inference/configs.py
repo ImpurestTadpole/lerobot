@@ -64,6 +64,14 @@ class PolicyServerConfig:
         default=DEFAULT_OBS_QUEUE_TIMEOUT, metadata={"help": "Timeout for observation queue in seconds"}
     )
 
+    # Optional override for the checkpoint's saved dtype (e.g. "bfloat16"), to fit large
+    # policies (Pi0/Pi0.5's PaliGemma backbone) on GPUs with limited VRAM. Leave unset to use
+    # whatever dtype the checkpoint's config.json specifies.
+    policy_dtype: str | None = field(
+        default=None,
+        metadata={"help": "Override the policy checkpoint's dtype (e.g. 'bfloat16') to reduce VRAM usage"},
+    )
+
     def __post_init__(self):
         """Validate configuration after initialization."""
         if self.port < 1 or self.port > 65535:
@@ -96,6 +104,7 @@ class PolicyServerConfig:
             "fps": self.fps,
             "environment_dt": self.environment_dt,
             "inference_latency": self.inference_latency,
+            "policy_dtype": self.policy_dtype,
         }
 
 
