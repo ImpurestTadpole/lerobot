@@ -798,6 +798,7 @@ def record(
                         display_data=cfg.display_data,
                         display_mode=cfg.display_mode,
                         depth_read_interval=cfg.dataset.depth_read_interval,
+                        display_compressed_images=display_compressed_images,
                     )
     finally:
         # Ctrl-C is how most recording sessions end, and this teardown runs hardware disconnects,
