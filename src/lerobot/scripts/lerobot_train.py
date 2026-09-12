@@ -810,7 +810,12 @@ def train(cfg: TrainPipelineConfig, accelerator: "Accelerator | None" = None):
         if getattr(active_cfg, "push_to_hub", False):
             unwrapped_model = accelerator.unwrap_model(policy)
             # PEFT only applies when training a policy — reward models use the plain path.
-            if not cfg.is_reward_model_training and cfg.policy.use_peft:
+            if cfg.is_reward_model_training:
+                # PreTrainedRewardModel.push_model_to_hub() only takes cfg — it reads
+                # weights directly off self via save_pretrained(), unlike the policy
+                # path below which needs an explicit state_dict/dataset_meta.
+                unwrapped_model.push_model_to_hub(cfg)
+            elif cfg.policy.use_peft:
                 unwrapped_model.push_model_to_hub(cfg, peft_model=unwrapped_model, dataset_meta=dataset.meta)
             else:
                 unwrapped_model.push_model_to_hub(cfg, state_dict=model_state_dict, dataset_meta=dataset.meta)

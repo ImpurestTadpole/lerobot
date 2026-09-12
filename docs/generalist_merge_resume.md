@@ -21,13 +21,22 @@ resumed from ~72,017 — instead it rebuilt from episode 0, revealing a
 FOURTH, separate, pre-existing bug: the real orchestrator always deletes
 the align cache before giving the (already-built, already-tested) resume
 logic a chance to see it, making resume unreachable in production the
-whole time. Fixed; not yet verified end-to-end (flagged honestly, not
-glossed over). This bug, not the disk-full crash itself, is what actually
-destroyed the 75% of real progress. See "5th DROID restart" section below.
+whole time. Fixed. This bug, not the disk-full crash itself, is what
+actually destroyed the 75% of real progress. See "5th DROID restart"
+section below. **Update 2026-08-30: the resume fix is now verified
+end-to-end** through the real production entrypoint (not just code
+review) — a simulated crash/resume test confirmed it resumes from the
+correct episode, doesn't touch already-written files, and is meaningfully
+faster than a rebuild.
 
 Meanwhile, 32 NEW source datasets (7 flex-pi + 25 xLeRobot community) were
-converted in parallel for a later relaunch — see "New sources" section
-below.
+converted in parallel for a later relaunch, and **all 34 now have their
+align caches fully prewarmed and ready** (flex-pi's earlier v2.1-format
+blocker was solved 2026-08-30) — see "New sources" section below. Nothing
+is outstanding on the new-source side anymore; the only remaining wait is
+DROID's 5th pass finishing (~360 episodes/hour observed, ETA on the order
+of a week+ from 2026-08-30 — see memory for the exact math at time of
+estimate).
 
 ## 4th DROID restart (2026-08-17): silent camera zero-fill bug
 
@@ -143,14 +152,24 @@ after the current DROID pass finishes):
   depth-vs-no-depth scoping decision itself). Full account, including the
   exact reasoning for each, in memory `ee-space-generalist-plan.md` under
   "New sources: flex-pi + xLeRobot community".
-- **Still to do** once both conversion batches finish: prewarm their
-  `_align_tmp_*` align caches (via `align_datasets_for_cotraining` under a
-  scratch `--target-repo-id`, so the throwaway final-aggregation step
-  doesn't touch the real `generalist_ee_merged` output), then include them
-  in the full source list on the next relaunch after DROID's current pass
-  completes. `config/generalist_source_weights.yaml` will need a new
-  source group (and probably a volume cap, mirroring DROID's 30%) for
-  these ~34 new small sources.
+- **Update 2026-08-30 — both fully done, nothing left to do here.** flex-pi
+  hit a real blocker (its output was genuine v2.1 format, which this
+  codebase's dataset classes can't load at all — see the incident write-up
+  in memory), solved by building a lightweight RGB-only "view" (depth
+  features stripped from `info.json`, `data/`+`videos/` symlinked, not
+  copied) and running the **official**, unmodified
+  `lerobot/scripts/convert_dataset_v21_to_v30.py` on it — sidesteps that
+  tool's own depth-dtype gap entirely by just not exposing it to any depth
+  features. Produced `Odog16/flexpi_<name>_ee_rgbonly` ×10, all verified
+  loadable. Then prewarmed `_align_tmp_*` caches for all 34 new sources
+  (10 flex-pi + 24 xLeRobot — 2 of the original 26 candidates had no
+  working Hub version and were excluded) via the same scratch-target-repo-id
+  technique, safely parallel to DROID's live alignment. **All 34 caches are
+  built and ready** — the next full relaunch will fast-path-reuse every one
+  of them. Still outstanding, unrelated to readiness: `config/
+  generalist_source_weights.yaml` needs a new source group (and probably a
+  volume cap, mirroring DROID's 30%) for these ~34 new small sources before
+  training.
 
 ## 2026-08-16 crash: what happened, what changed
 
