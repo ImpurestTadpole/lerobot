@@ -17,17 +17,34 @@
 import logging
 import time
 
-from lerobot.motors import Motor, MotorCalibration, MotorNormMode
-from lerobot.motors.feetech import (
-    FeetechMotorsBus,
-    OperatingMode,
-)
+from lerobot.motors import Motor, MotorCalibration, MotorNormMode, SerialMotorsBus
 from lerobot.utils.decorators import check_if_already_connected, check_if_not_connected
 
 from ..teleoperator import Teleoperator
 from .config_so_leader import SOLeaderTeleopConfig
 
 logger = logging.getLogger(__name__)
+
+_HOMING_POSITION_DIAGRAM = r"""
+       ╭─────┬────────────────────┬──────╮ ◉╲═════╗   ← moveable claw
+       │     │      forearm       │  ▤▤  │╤══╲════╝
+       ╰┬───┬┴────────────────────┴──────┴┴═══════╝
+        │   │                                  ███
+        │   │                                  ███  ← handle
+        │   │                                  ███
+        │   │   upper arm
+        │   │
+        │   │
+        │   │
+   ╭────┴───┴────╮
+   │   base ◉    │
+   ╰──┬───────┬──╯
+  ╭───┴───────┴───╮
+  │▓▓▓ C-clamp ▓▓▓│
+  ╰───────────────╯
+ ═══════════════════════════════════════════════════
+                table edge
+"""
 
 
 class SOLeader(Teleoperator):
@@ -40,7 +57,7 @@ class SOLeader(Teleoperator):
         super().__init__(config)
         self.config = config
         norm_mode_body = MotorNormMode.DEGREES if config.use_degrees else MotorNormMode.RANGE_M100_100
-        self.bus = FeetechMotorsBus(
+        self.bus = SerialMotorsBus(
             port=self.config.port,
             motors={
                 "shoulder_pan": Motor(1, "sts3215", norm_mode_body),
@@ -94,10 +111,11 @@ class SOLeader(Teleoperator):
 
         logger.info(f"\nRunning calibration of {self}")
         self.bus.disable_torque()
-        for motor in self.bus.motors:
-            self.bus.write("Operating_Mode", motor, OperatingMode.POSITION.value)
+        self.bus.set_operating_mode("position")
 
-        input(f"Move {self} to the middle of its range of motion and press ENTER....")
+        print(_HOMING_POSITION_DIAGRAM)
+        print("Video walkthrough: https://huggingface.co/docs/lerobot/main/en/so101#calibration-video")
+        input(f"Move {self} to the middle of its range of motion (shown above) and press ENTER....")
         homing_offsets = self.bus.set_half_turn_homings()
 
         full_turn_motor = "wrist_roll"
@@ -110,14 +128,14 @@ class SOLeader(Teleoperator):
         range_mins[full_turn_motor] = 0
         range_maxes[full_turn_motor] = 4095
 
-        self.calibration = {}
+        self.calibration: dict[str, MotorCalibration] = {}
         for motor, m in self.bus.motors.items():
             self.calibration[motor] = MotorCalibration(
                 id=m.id,
                 drive_mode=0,
-                homing_offset=homing_offsets[motor],
-                range_min=range_mins[motor],
-                range_max=range_maxes[motor],
+                homing_offset=int(homing_offsets[motor]),
+                range_min=int(range_mins[motor]),
+                range_max=int(range_maxes[motor]),
             )
 
         self.bus.write_calibration(self.calibration)
@@ -127,8 +145,7 @@ class SOLeader(Teleoperator):
     def configure(self) -> None:
         self.bus.disable_torque()
         self.bus.configure_motors()
-        for motor in self.bus.motors:
-            self.bus.write("Operating_Mode", motor, OperatingMode.POSITION.value)
+        self.bus.set_operating_mode("position")
 
     def enable_torque(self) -> None:
         self.bus.enable_torque()

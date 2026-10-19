@@ -602,7 +602,7 @@ def raw_response_to_subtask_annotation(
 
 
 def compute_temporal_proportions(
-    annotations: dict[int, Any], fps: int = 30, subtask_order: list[str] | None = None
+    annotations: dict[int, SubtaskAnnotation], fps: int = 30, subtask_order: list[str] | None = None
 ) -> dict[str, float]:
     """
     Compute dataset-level temporal proportions (priors) for each subtask.
@@ -1202,7 +1202,7 @@ def visualize_annotations(
     num_episodes: int = 5,
     annotation_type: str = "sparse",
     episode_indices: list[int] | None = None,
-):
+) -> None:
     """
     Visualize subtask annotations for a set of episodes.
 
@@ -1267,7 +1267,7 @@ def visualize_annotations(
                     output_path = output_dir / f"episode_{ep_idx:04d}_{ann_type}.png"
                     visualize_episode(
                         ep_idx,
-                        annotations.get(ep_idx),
+                        annotations[ep_idx],
                         video_path,
                         video_start,
                         video_end,
@@ -1281,7 +1281,7 @@ def visualize_annotations(
                 output_path = output_dir / f"episode_{ep_idx:04d}_{annotation_type}.png"
                 visualize_episode(
                     ep_idx,
-                    annotations.get(ep_idx),
+                    annotations[ep_idx],
                     video_path,
                     video_start,
                     video_end,
@@ -1508,7 +1508,7 @@ def worker_process_episodes(
     greedy: bool,
     temperature: float,
     extract_fps: int = 1,
-) -> tuple[dict, dict | None]:
+) -> tuple[dict[int, SubtaskAnnotation], dict[int, SubtaskAnnotation] | None]:
     """Worker for parallel processing across GPUs."""
     device = f"cuda:{gpu_id}"
     dataset = LeRobotDataset(repo_id, download_videos=False)
@@ -1535,7 +1535,8 @@ def worker_process_episodes(
         else None
     )
 
-    sparse_annotations, dense_annotations = {}, {} if dense_subtask_list else None
+    sparse_annotations: dict[int, SubtaskAnnotation] = {}
+    dense_annotations: dict[int, SubtaskAnnotation] = {}
 
     for ep_idx in episode_indices:
         _, sparse_ann, err = process_single_episode(
@@ -1551,7 +1552,7 @@ def worker_process_episodes(
             if dense_ann:
                 dense_annotations[ep_idx] = dense_ann
 
-    return sparse_annotations, dense_annotations
+    return sparse_annotations, (dense_annotations if dense_subtask_list else None)
 
 
 def main():
