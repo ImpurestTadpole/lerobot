@@ -61,7 +61,7 @@ If `nvidia-smi` works but `torch.cuda.is_available()` returns `False`, the CUDA 
 To select the desired accelerator, use the `--policy.device` flag when running `lerobot-train` or `lerobot-eval`. For example, to use MPS on Apple Silicon, run:
 
 ```bash
-lerobot-train
+lerobot-train \
     --policy.device=mps ...
 ```
 
