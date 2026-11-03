@@ -218,6 +218,74 @@ def load_episodes(local_dir: Path) -> datasets.Dataset:
     return episodes
 
 
+def repair_trailing_metadata_shard(local_dir: Path) -> int | None:
+    """Remove a corrupt trailing ``meta/episodes/*.parquet`` shard left by a hard kill
+    (process killed before that file's writer was ever ``close()``d, so it has no valid
+    Parquet footer and is unreadable in full, even though everything written to it via
+    ``write_table()`` is physically present on disk), then reconcile ``info.json`` so the
+    rest of the metadata stays internally consistent with what's actually recoverable.
+
+    This only ever removes a shard that fails to *open* at all — a shard that opens
+    successfully is trusted as-is and never touched, even if it's not the newest. Safe to
+    call on a dataset with no corruption at all (returns ``None``, no-op).
+
+    Args:
+        local_dir: Dataset root directory.
+
+    Returns:
+        The recovered ``total_episodes`` count if a corrupt shard was found and removed,
+        or ``None`` if every existing shard already opened cleanly (nothing to repair).
+
+    Raises:
+        RuntimeError: Every shard was corrupt, so nothing at all is recoverable — the
+            caller should treat this the same as any other unrecoverable resume failure
+            (e.g. fall back to a full rebuild).
+    """
+    episodes_dir = local_dir / EPISODES_DIR
+    paths = sorted(episodes_dir.glob("*/*.parquet"))
+    if not paths:
+        return None
+
+    corrupt_paths = []
+    for p in paths:
+        try:
+            pq.ParquetFile(p)  # cheap: only reads the footer, doesn't materialize rows
+        except Exception:
+            corrupt_paths.append(p)
+
+    if not corrupt_paths:
+        return None
+
+    valid_paths = [p for p in paths if p not in corrupt_paths]
+    for p in corrupt_paths:
+        # Rename rather than delete: keeps the bytes around for forensic inspection, and
+        # ".parquet.corrupt" no longer matches the "*.parquet" glob any loader uses, so it
+        # can never be picked up again by accident.
+        p.rename(p.with_name(p.name + ".corrupt"))
+
+    if not valid_paths:
+        raise RuntimeError(
+            f"All meta/episodes/*.parquet shards under {episodes_dir} were corrupt "
+            "(no valid footer) — nothing is recoverable from episode metadata."
+        )
+
+    recovered = load_nested_dataset(episodes_dir)
+    recovered_episodes = len(recovered)
+    recovered_frames = int(max(recovered["dataset_to_index"])) if recovered_episodes > 0 else 0
+
+    info = load_info(local_dir)
+    # total_tasks and stats.json are deliberately left untouched: tasks.parquet is a
+    # lookup table of distinct task strings, unaffected by which episodes are considered
+    # valid, and re-deriving stats.json exactly would mean re-reading/re-decoding the
+    # surviving episodes' raw data. The numerical contribution of the handful of episodes
+    # lost to one un-rotated trailing shard is negligible against a dataset's full stats.
+    info.total_episodes = recovered_episodes
+    info.total_frames = recovered_frames
+    write_info(info, local_dir)
+
+    return recovered_episodes
+
+
 def load_image_as_numpy(
     fpath: str | Path, dtype: np.dtype = np.float32, channel_first: bool = True
 ) -> np.ndarray:

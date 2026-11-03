@@ -1,5 +1,21 @@
 # EE-space generalist merge — resume notes
 
+**Status as of 2026-09-27**: DROID's 5th pass (below) was stopped
+2026-09-13 for a physical machine move via `kill -TERM`, believed safe
+since the process exited cleanly within 2 seconds. It wasn't — Python's
+default SIGTERM handling is immediate termination, not a graceful
+shutdown, and no signal handler was ever added to flush the in-flight
+episode's buffer first. Whatever was mid-write got corrupted exactly like
+a hard kill, and the resume logic (working as designed) detected this and
+fell back to a full rebuild. Cost ~36,500 episodes (stopped at 83,325,
+restarted from 0 on 2026-09-19, back to 46,858/49% as of today). **If this
+pipeline needs to be stopped again and the machine stays powered, use
+`kill -STOP <pid>` / `kill -CONT <pid>` instead — SIGTERM is not safe for
+this process.** Full account in memory `ee-space-generalist-plan.md` under
+"SIXTH incident".
+
+---
+
 Status as of 2026-08-29. The merge ran for ~21 days, got to 30/31 sources
 done + 56% through DROID, then **crashed** on a real DROID video-split bug.
 Per-episode skip-on-error resilience + best-effort resume support was added

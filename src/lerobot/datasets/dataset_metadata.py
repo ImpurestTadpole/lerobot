@@ -518,6 +518,16 @@ class LeRobotDatasetMetadata:
         """Max size of video file in mega bytes."""
         return self.info.video_files_size_in_mb
 
+    @property
+    def metadata_files_size_in_mb(self) -> int:
+        """Max size of an episode-metadata (meta/episodes/*.parquet) file in mega bytes.
+
+        Falls back to ``data_files_size_in_mb`` when not explicitly set (the historical
+        behavior), since older datasets never had an independent value for this.
+        """
+        value = self.info.metadata_files_size_in_mb
+        return value if value is not None else self.data_files_size_in_mb
+
     def get_task_index(self, task: str) -> int | None:
         """
         Given a task in natural language, returns its task_index if the task already exists in the dataset,
@@ -609,7 +619,7 @@ class LeRobotDatasetMetadata:
 
                 av_size_per_frame = latest_size_in_mb / latest_num_frames if latest_num_frames > 0 else 0.0
 
-                if latest_size_in_mb + av_size_per_frame * num_frames >= self.data_files_size_in_mb:
+                if latest_size_in_mb + av_size_per_frame * num_frames >= self.metadata_files_size_in_mb:
                     # Size limit is reached, flush buffer and prepare new parquet file
                     self._flush_metadata_buffer()
                     chunk_idx, file_idx = update_chunk_file_indices(chunk_idx, file_idx, self.chunks_size)
@@ -721,6 +731,7 @@ class LeRobotDatasetMetadata:
         chunks_size: int | None = None,
         data_files_size_in_mb: int | None = None,
         video_files_size_in_mb: int | None = None,
+        metadata_files_size_in_mb: int | None = None,
     ) -> None:
         """Update chunk and file size settings after dataset creation.
 
@@ -732,6 +743,9 @@ class LeRobotDatasetMetadata:
             chunks_size: Maximum number of files per chunk directory. If None, keeps current value.
             data_files_size_in_mb: Maximum size for data parquet files in MB. If None, keeps current value.
             video_files_size_in_mb: Maximum size for video files in MB. If None, keeps current value.
+            metadata_files_size_in_mb: Maximum size for episode-metadata parquet files in MB.
+                If None, keeps current value (which itself falls back to data_files_size_in_mb
+                unless previously set).
         """
         if chunks_size is not None:
             if chunks_size <= 0:
@@ -748,6 +762,13 @@ class LeRobotDatasetMetadata:
                 raise ValueError(f"video_files_size_in_mb must be positive, got {video_files_size_in_mb}")
             self.info.video_files_size_in_mb = video_files_size_in_mb
 
+        if metadata_files_size_in_mb is not None:
+            if metadata_files_size_in_mb <= 0:
+                raise ValueError(
+                    f"metadata_files_size_in_mb must be positive, got {metadata_files_size_in_mb}"
+                )
+            self.info.metadata_files_size_in_mb = metadata_files_size_in_mb
+
         # Update the info file on disk
         write_info(self.info, self.root)
 
@@ -761,6 +782,7 @@ class LeRobotDatasetMetadata:
             "chunks_size": self.chunks_size,
             "data_files_size_in_mb": self.data_files_size_in_mb,
             "video_files_size_in_mb": self.video_files_size_in_mb,
+            "metadata_files_size_in_mb": self.metadata_files_size_in_mb,
         }
 
     def __repr__(self):
@@ -787,6 +809,7 @@ class LeRobotDatasetMetadata:
         chunks_size: int | None = None,
         data_files_size_in_mb: int | None = None,
         video_files_size_in_mb: int | None = None,
+        metadata_files_size_in_mb: int | None = None,
     ) -> "LeRobotDatasetMetadata":
         """Create metadata for a new LeRobot dataset from scratch.
 
@@ -810,6 +833,12 @@ class LeRobotDatasetMetadata:
                 default.
             video_files_size_in_mb: Max video file size in MB. ``None`` uses the
                 default.
+            metadata_files_size_in_mb: Max episode-metadata parquet file size in MB.
+                ``None`` falls back to ``data_files_size_in_mb`` at read time. Set this
+                explicitly (small) for very-long-running writers where the total episode
+                count will be huge, so the metadata parquet writer rotates and gets a
+                valid footer periodically instead of staying open (and unresumable if
+                interrupted) for the entire run.
 
         Returns:
             A new :class:`LeRobotDatasetMetadata` instance.
@@ -836,6 +865,7 @@ class LeRobotDatasetMetadata:
             chunks_size,
             data_files_size_in_mb,
             video_files_size_in_mb,
+            metadata_files_size_in_mb,
         )
         if len(obj.video_keys) > 0 and not use_videos:
             raise ValueError(

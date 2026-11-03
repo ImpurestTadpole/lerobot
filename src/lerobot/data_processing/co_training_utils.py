@@ -331,6 +331,58 @@ def _read_align_progress(aligned_root: Path) -> dict | None:
         return None
 
 
+_SKIPPED_EPISODES_FILENAME = "align_skipped_source_episodes.json"
+
+
+def _write_skipped_episodes(aligned_root: Path, skipped: list[int]) -> None:
+    """Persist the full list of skipped SOURCE episode indices seen so far.
+
+    Rewritten in full on every skip (rare — typically a handful out of tens of
+    thousands of episodes), so this stays cheap even over a multi-day run. Needed to
+    reconcile `align_progress.json`'s `next_source_episode` against the aligned
+    dataset's real episode count after a `repair_trailing_metadata_shard()` recovery:
+    without knowing exactly which source episodes were skipped, there's no way to tell
+    which source episode a given *output* episode count actually corresponds to.
+    """
+    path = aligned_root / "meta" / _SKIPPED_EPISODES_FILENAME
+    path.parent.mkdir(parents=True, exist_ok=True)
+    with open(path, "w", encoding="utf-8") as f:
+        json.dump(sorted(skipped), f)
+
+
+def _read_skipped_episodes(aligned_root: Path) -> list[int]:
+    path = aligned_root / "meta" / _SKIPPED_EPISODES_FILENAME
+    if not path.is_file():
+        return []
+    try:
+        with open(path, encoding="utf-8") as f:
+            data = json.load(f)
+        return sorted(int(x) for x in data) if isinstance(data, list) else []
+    except (json.JSONDecodeError, OSError, TypeError, ValueError):
+        return []
+
+
+def _source_episode_for_output_count(skipped_sorted: list[int], n_output_episodes: int) -> int:
+    """Given the sorted list of all skipped source episode indices and the number of
+    REAL (recovered) output episodes, return the source episode index to resume from.
+
+    Source episodes are processed 0, 1, 2, ... in order; each either becomes one output
+    episode (written) or is skipped. So the Nth output episode corresponds to the Nth
+    source episode that ISN'T in the skip list. This walks forward from source episode 0
+    until exactly `n_output_episodes` non-skipped source episodes have been passed,
+    which is also, by construction, the correct point to resume the source iteration
+    from (never skips a source episode that hasn't actually been accounted for yet).
+    """
+    skipped_set = set(skipped_sorted)
+    written_seen = 0
+    source_idx = 0
+    while written_seen < n_output_episodes:
+        if source_idx not in skipped_set:
+            written_seen += 1
+        source_idx += 1
+    return source_idx
+
+
 def _write_align_options(aligned_root: Path, pad_fill_mode: str) -> None:
     opts_path = aligned_root / "meta" / _ALIGN_OPTIONS_FILENAME
     opts_path.parent.mkdir(parents=True, exist_ok=True)
@@ -1094,6 +1146,7 @@ def align_single_dataset(
     # root to not exist yet (mkdir(..., exist_ok=False)); resume() mkdirs itself.
 
     aligned_ds = None
+    skipped_episodes = _read_skipped_episodes(output_root)
     if resume_from > 0:
         try:
             aligned_ds = LeRobotDataset.resume(
@@ -1101,6 +1154,37 @@ def align_single_dataset(
                 root=output_root,
                 image_writer_threads=4,
             )
+            recovered_episodes = aligned_ds.meta.total_episodes
+            if recovered_episodes < prior_n_written:
+                # repair_trailing_metadata_shard() (inside resume()) discarded a corrupt
+                # trailing meta/episodes/*.parquet shard — real, but fewer episodes than
+                # align_progress.json believed. next_source_episode must be recomputed
+                # from the ACTUAL recovered count, not trusted as-is: continuing to skip
+                # source episodes up to the old (too-high) next_source_episode would
+                # silently and permanently drop whichever source episodes correspond to
+                # the discarded output episodes — never processed, never flagged, exactly
+                # the kind of bug that's worse than the old "just wipe and rebuild"
+                # fallback this whole resume mechanism exists to improve on.
+                lost = prior_n_written - recovered_episodes
+                skipped_episodes = [s for s in skipped_episodes if s < num_episodes]
+                corrected_resume_from = _source_episode_for_output_count(skipped_episodes, recovered_episodes)
+                # n_skipped among the now-resumed range only counts skips strictly before
+                # the corrected resume point (any skip at/after it will be re-evaluated).
+                corrected_n_skipped = sum(1 for s in skipped_episodes if s < corrected_resume_from)
+                logger.warning(
+                    "Resumed %s but only recovered %d/%d previously-written episodes "
+                    "(%d lost to a corrupt trailing metadata shard) — correcting resume "
+                    "point from source episode %d to %d so no source episode is silently "
+                    "skipped.",
+                    output_root, recovered_episodes, prior_n_written, lost,
+                    resume_from, corrected_resume_from,
+                )
+                resume_from = corrected_resume_from
+                prior_n_written = recovered_episodes
+                prior_n_skipped = corrected_n_skipped
+                skipped_episodes = [s for s in skipped_episodes if s < corrected_resume_from]
+                _write_align_progress(output_root, resume_from, prior_n_written, prior_n_skipped, done=False)
+                _write_skipped_episodes(output_root, skipped_episodes)
         except Exception as e:  # noqa: BLE001 - resume() can genuinely fail: Parquet only
             # writes a valid footer at close()/finalize() time, so a HARD kill (segfault,
             # OOM-killer, kill -9 — anything that skips Python cleanup entirely) mid-run
@@ -1120,6 +1204,7 @@ def align_single_dataset(
             resume_from = 0
             prior_n_written = 0
             prior_n_skipped = 0
+            skipped_episodes = []
 
     if aligned_ds is None:
         aligned_ds = LeRobotDataset.create(
@@ -1130,6 +1215,13 @@ def align_single_dataset(
             root=output_root,
             use_videos=len(target_cam_keys) > 0,
             image_writer_threads=4,
+            # A source with a huge episode count (e.g. DROID's 95k+) can otherwise leave
+            # meta/episodes/*.parquet open, unrotated, and unresumable for the entire
+            # multi-day run — see repair_trailing_metadata_shard()'s docstring. 1MB is
+            # small enough to rotate every ~few-hundred episodes' worth of metadata (tiny
+            # per-row) without meaningfully affecting file count for the actual data/video
+            # chunks, which keep using the default data_files_size_in_mb unchanged.
+            metadata_files_size_in_mb=1,
         )
         # Write pad_fill_mode NOW, not only after a successful finish (the
         # original behaviour) — a run that crashes mid-alignment (the exact
@@ -1321,6 +1413,8 @@ def align_single_dataset(
             )
             aligned_ds.clear_episode_buffer()
             n_skipped += 1
+            skipped_episodes.append(ep_idx)
+            _write_skipped_episodes(output_root, skipped_episodes)
 
         ep_pbar.set_postfix_str(
             f"episode={ep_idx}/{num_episodes - 1} written={n_written} skipped={n_skipped}",
