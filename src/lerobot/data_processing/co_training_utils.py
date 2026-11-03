@@ -914,6 +914,7 @@ def align_single_dataset(
     forced_effective_fps: int | None = None,
     pad_fill_mode: str = "zero",
     camera_fill_mode: str = "intersection",
+    max_episodes: int | None = None,
 ) -> Path:
     """Download *source_repo* and write a feature-aligned copy to *output_root*.
 
@@ -1064,7 +1065,12 @@ def align_single_dataset(
         resize_info,
     )
 
-    num_episodes = src_meta.total_episodes
+    # *max_episodes* aligns only the first N episodes (a contiguous prefix), e.g. to
+    # keep a 95k-episode source from dominating build time. Everything below that
+    # compares against ``num_episodes`` (cache reuse, resume) then sees the capped count.
+    num_episodes = (
+        min(src_meta.total_episodes, max_episodes) if max_episodes else src_meta.total_episodes
+    )
 
     # LeRobotDataset.create() uses mkdir(..., exist_ok=False) on the dataset root.
     # A crashed run often leaves a partial directory → FileExistsError on retry.
@@ -1642,6 +1648,7 @@ def align_datasets_for_cotraining(
     override_padded_stats: bool = False,
     target_camera_keys: list[str] | None = None,
     camera_fill_mode: str = "intersection",
+    max_episodes: dict[str, int] | None = None,
 ) -> Path:
     """Align all *source_repos* and merge into one local dataset at *output_root*.
 
@@ -1846,12 +1853,22 @@ def align_datasets_for_cotraining(
             canonical_visual=canonical_visual,
         )
 
+        src_cap = (max_episodes or {}).get(src_repo)
+        n_src_episodes = (
+            min(src_meta.total_episodes, src_cap) if src_cap else src_meta.total_episodes
+        )
+
         if (
             not realign_all_sources
             and _source_matches_merge_schema(
                 src_meta, target_features, merge_fps, robot_type
             )
         ):
+            if src_cap and src_cap < src_meta.total_episodes:
+                raise ValueError(
+                    f"--max-episodes {src_repo}={src_cap}: source is already merge-ready, so it "
+                    "would be merged whole; a cap can't apply. Subset it with lerobot-edit-dataset."
+                )
             logger.info(
                 "Skipping alignment (already merge-ready): %s → %s",
                 src_repo,
@@ -1879,13 +1896,13 @@ def align_datasets_for_cotraining(
                 target_features,
                 merge_fps,
                 pad_fill_mode,
-                expected_total_episodes=src_meta.total_episodes,
+                expected_total_episodes=n_src_episodes,
             )
             if not force_rebuild and cache_matches:
                 logger.info(
                     "Reusing already-aligned cache: %s (all %d episodes confirmed present)",
                     aligned_root,
-                    src_meta.total_episodes,
+                    n_src_episodes,
                 )
             else:
                 # Do NOT shutil.rmtree(aligned_root) here even when it exists — that was a
@@ -1923,6 +1940,7 @@ def align_datasets_for_cotraining(
                     forced_effective_fps=merge_fps if canonical_visual is not None else None,
                     pad_fill_mode=pad_fill_mode,
                     camera_fill_mode=camera_fill_mode,
+                    max_episodes=src_cap,
                 )
 
         aligned_roots.append(aligned_root)
@@ -2215,6 +2233,16 @@ def main() -> None:
         ),
     )
     parser.add_argument(
+        "--max-episodes",
+        nargs="*",
+        default=[],
+        metavar="REPO=N",
+        help=(
+            "Cap a source to its first N episodes, e.g. --max-episodes Odog16/droid_ee=15000. "
+            "Only applies to sources that need alignment (not 'already merge-ready' ones)."
+        ),
+    )
+    parser.add_argument(
         "--camera-fill-mode",
         choices=CAMERA_FILL_MODES,
         default="intersection",
@@ -2275,6 +2303,7 @@ def main() -> None:
             else None
         ),
         camera_fill_mode=args.camera_fill_mode,
+        max_episodes={k: int(v) for k, v in (kv.rsplit("=", 1) for kv in args.max_episodes)} or None,
     )
 
 
