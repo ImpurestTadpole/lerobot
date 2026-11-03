@@ -91,6 +91,7 @@ def create_empty_dataset_info(
     chunks_size: int | None = None,
     data_files_size_in_mb: int | None = None,
     video_files_size_in_mb: int | None = None,
+    metadata_files_size_in_mb: int | None = None,
 ) -> DatasetInfo:
     """Create a template ``DatasetInfo`` object for a new dataset's ``meta/info.json``.
 
@@ -103,6 +104,8 @@ def create_empty_dataset_info(
         chunks_size (int | None): Max files per chunk directory. Defaults to ``DEFAULT_CHUNK_SIZE``.
         data_files_size_in_mb (int | None): Max parquet file size in MB. Defaults to ``DEFAULT_DATA_FILE_SIZE_IN_MB``.
         video_files_size_in_mb (int | None): Max video file size in MB. Defaults to ``DEFAULT_VIDEO_FILE_SIZE_IN_MB``.
+        metadata_files_size_in_mb (int | None): Max episode-metadata parquet file size in MB.
+            ``None`` (default) falls back to ``data_files_size_in_mb`` at read time.
 
     Returns:
         DatasetInfo: A typed dataset information object with initial metadata.
@@ -115,6 +118,7 @@ def create_empty_dataset_info(
         chunks_size=chunks_size or DEFAULT_CHUNK_SIZE,
         data_files_size_in_mb=data_files_size_in_mb or DEFAULT_DATA_FILE_SIZE_IN_MB,
         video_files_size_in_mb=video_files_size_in_mb or DEFAULT_VIDEO_FILE_SIZE_IN_MB,
+        metadata_files_size_in_mb=metadata_files_size_in_mb,
         data_path=DEFAULT_DATA_PATH,
         video_path=DEFAULT_VIDEO_PATH if use_videos else None,
     )

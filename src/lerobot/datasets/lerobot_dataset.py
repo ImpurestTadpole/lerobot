@@ -39,6 +39,7 @@ from .storage import (
     localize_remote_root,
     make_dataset_reader,
 )
+from .io_utils import repair_trailing_metadata_shard
 from .utils import (
     create_lerobot_dataset_card,
     get_safe_version,
@@ -792,6 +793,7 @@ class LeRobotDataset(torch.utils.data.Dataset):
         encoder_threads: int | None = None,
         video_files_size_in_mb: int | None = None,
         data_files_size_in_mb: int | None = None,
+        metadata_files_size_in_mb: int | None = None,
     ) -> "LeRobotDataset":
         """Create a new LeRobotDataset from scratch for recording data.
 
@@ -824,6 +826,11 @@ class LeRobotDataset(torch.utils.data.Dataset):
                 lets the codec decide.
             metadata_buffer_size: Number of episode metadata records to buffer
                 before flushing to parquet.
+            metadata_files_size_in_mb: Max episode-metadata parquet file size in MB.
+                ``None`` falls back to ``data_files_size_in_mb``. Set explicitly (small)
+                for very-long-running writers with a huge eventual episode count, so the
+                metadata writer rotates periodically instead of staying open (unresumable
+                if interrupted) for the whole run.
             streaming_encoding: If ``True``, encode video frames in real-time
                 during capture instead of writing images first.
             encoder_queue_maxsize: Max buffered frames per camera when using
@@ -843,6 +850,7 @@ class LeRobotDataset(torch.utils.data.Dataset):
             metadata_buffer_size=metadata_buffer_size,
             video_files_size_in_mb=video_files_size_in_mb,
             data_files_size_in_mb=data_files_size_in_mb,
+            metadata_files_size_in_mb=metadata_files_size_in_mb,
         )
         obj.repo_id = obj.meta.repo_id
         obj._requested_root = obj.meta.root
@@ -901,6 +909,7 @@ class LeRobotDataset(torch.utils.data.Dataset):
         image_writer_threads: int = 0,
         streaming_encoding: bool = False,
         encoder_queue_maxsize: int = 30,
+        repair: bool = True,
         *,
         token: str | bool | None = None,
     ) -> "LeRobotDataset":
@@ -936,6 +945,15 @@ class LeRobotDataset(torch.utils.data.Dataset):
             streaming_encoding: If ``True``, encode video in real-time during
                 capture.
             encoder_queue_maxsize: Max buffered frames per camera for streaming.
+            repair: If ``True`` (default), attempt to remove a corrupt trailing
+                ``meta/episodes/*.parquet`` shard before loading metadata — the shard
+                that was open (no valid footer yet) at the moment of a hard kill. Only
+                helps if the writer that produced this dataset was created with a small
+                ``metadata_files_size_in_mb`` so metadata actually rotated during the
+                run; with the default (never rotates until the true end), a hard kill
+                still leaves nothing recoverable and this is a no-op. Set ``False`` to
+                require metadata to already be fully valid (raise on any corruption
+                instead of silently discarding the corrupt shard).
             token: Authentication token used if metadata must be downloaded
                 from the Hub. The token is not retained on the dataset instance.
 
@@ -963,6 +981,14 @@ class LeRobotDataset(torch.utils.data.Dataset):
 
         if obj._requested_root is not None:
             obj._requested_root.mkdir(exist_ok=True, parents=True)
+
+        if repair:
+            # Must run before LeRobotDatasetMetadata() below: its constructor loads
+            # meta/episodes/*.parquet immediately, and a corrupt trailing shard (left by
+            # a hard kill before that shard's writer was ever close()d) would otherwise
+            # make the WHOLE episode index fail to load, discarding every episode ever
+            # written instead of just the ones in that one un-finalized shard.
+            repair_trailing_metadata_shard(obj._requested_root)
 
         # Load metadata (revision-safe when root is not provided)
         obj.meta = LeRobotDatasetMetadata(

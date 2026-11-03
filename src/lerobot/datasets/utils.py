@@ -207,6 +207,16 @@ class DatasetInfo:
     chunks_size: int = field(default=DEFAULT_CHUNK_SIZE)
     data_files_size_in_mb: int = field(default=DEFAULT_DATA_FILE_SIZE_IN_MB)
     video_files_size_in_mb: int = field(default=DEFAULT_VIDEO_FILE_SIZE_IN_MB)
+    # Rotation threshold for meta/episodes/*.parquet, independent of data_files_size_in_mb.
+    # None (default) falls back to data_files_size_in_mb, matching the historical behavior.
+    # Per-episode metadata rows are tiny (bytes to low-KB) compared to data/video content, so
+    # reusing the data threshold as-is means a run with a huge episode count (e.g. a 95k-episode
+    # merge) can accumulate its ENTIRE episode index in one never-rotated, never-finalized parquet
+    # writer — any interruption before the true end leaves that file without a valid footer and
+    # unreadable in full, discarding all progress even though the actual frame/video data chunks
+    # rotated and sealed normally throughout. Setting this explicitly (e.g. to a few MB) bounds
+    # that loss to whatever accumulated since the last metadata rotation instead of the whole run.
+    metadata_files_size_in_mb: int | None = field(default=None)
 
     # File path templates
     data_path: str = field(default=DEFAULT_DATA_PATH)
@@ -239,6 +249,10 @@ class DatasetInfo:
             raise ValueError(f"data_files_size_in_mb must be positive, got {self.data_files_size_in_mb}")
         if self.video_files_size_in_mb <= 0:
             raise ValueError(f"video_files_size_in_mb must be positive, got {self.video_files_size_in_mb}")
+        if self.metadata_files_size_in_mb is not None and self.metadata_files_size_in_mb <= 0:
+            raise ValueError(
+                f"metadata_files_size_in_mb must be positive or None, got {self.metadata_files_size_in_mb}"
+            )
 
     def to_dict(self) -> dict:
         """Return a JSON-serialisable dict.
