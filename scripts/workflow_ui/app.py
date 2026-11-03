@@ -213,8 +213,8 @@ def _train_stage_command(p: dict) -> str:
         args.append("--sample_weighting.type=source")
         _flag(args, "--sample_weighting.external_weight", p.get("external_weight") or "0.3")
     if p.get("wandb_enable"):
-        args.append("--wandb.enable=true")
-        _flag(args, "--wandb.project", p.get("wandb_project") or "lerobot")
+        args.append("--trackio.enable=true")
+        _flag(args, "--trackio.project", p.get("wandb_project") or "lerobot")
     if p.get("resume"):
         args.append("--resume=true")
     extra = (p.get("extra_args") or "").strip()
