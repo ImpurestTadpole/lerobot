@@ -1,0 +1,22 @@
+# Generalist co-training on the merged EE dataset ($DATASET = Odog16/generalist_ee_merged).
+steps: 60000
+save_freq: 5000
+eval_steps: 2000
+dataset.eval_split: 0.1
+dataset.image_transforms.enable: true
+dataset.image_transforms.backend: gpu
+source_sampling.group_config_path: config/generalist_source_weights.yaml
+dim_masking.sources_path: "${DATASET_ROOT}/meta/cotrain_sources.json"
+use_policy_training_preset: false   # explicit optimizer/scheduler below replace the policy preset
+optimizer.type: adamw
+optimizer.lr: 2.5e-5
+optimizer.weight_decay: 0.01
+optimizer.grad_clip_norm: 1.0
+scheduler.type: warmup_stable_decay
+scheduler.num_warmup_steps: 1000
+scheduler.num_decay_steps: 6000
+ema.type: warmup
+num_workers: 8
+policy.push_to_hub: false
+trackio.enable: true
+trackio.project: ob15

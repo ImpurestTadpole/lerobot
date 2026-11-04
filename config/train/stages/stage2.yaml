@@ -1,0 +1,14 @@
+# OB-15 fine-tune from the stage 1 checkpoint ($INIT_CKPT overrides the model's policy.path).
+# $DATASET = the OB-15 EE dataset. No source sampling or dim masking (single source).
+steps: 15000
+save_freq: 2500
+eval_steps: 1000
+dataset.eval_split: 0.1
+dataset.image_transforms.enable: true
+dataset.image_transforms.backend: gpu
+policy.optimizer_lr: 1e-5
+ema.type: warmup
+num_workers: 8
+policy.push_to_hub: false
+trackio.enable: true
+trackio.project: ob15

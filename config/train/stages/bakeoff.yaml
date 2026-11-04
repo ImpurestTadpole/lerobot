@@ -1,0 +1,13 @@
+# Same data, split, steps and seed for every model. Train on OB-15 data only ($DATASET).
+steps: 10000
+seed: 1000
+save_freq: 2500
+eval_steps: 1000
+dataset.eval_split: 0.1
+dataset.image_transforms.enable: true
+dataset.image_transforms.backend: gpu
+ema.type: warmup
+num_workers: 8
+policy.push_to_hub: false
+trackio.enable: true
+trackio.project: ob15

@@ -1,0 +1,9 @@
+# 10-step smoke run: checks the flags parse, the data loads and memory fits.
+# Dataset comes from $DATASET (repo id) and optionally $DATASET_ROOT.
+steps: 10
+save_freq: 1000000
+eval_steps: 0
+dataset.eval_split: 0
+num_workers: 2
+policy.push_to_hub: false
+trackio.enable: false
