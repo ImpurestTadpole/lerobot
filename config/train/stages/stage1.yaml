@@ -4,6 +4,7 @@
 steps: 160000
 save_freq: 10000
 eval_steps: 5000
+max_eval_samples: 2000   # 0 = whole holdout (~590k frames, hours per pass); this is subsampled per task
 dataset.eval_split: 0.1
 dataset.image_transforms.enable: true
 dataset.image_transforms.backend: gpu
