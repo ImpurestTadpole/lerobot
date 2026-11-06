@@ -1,0 +1,9 @@
+# VLA-JEPA (Qwen3-VL-2B + V-JEPA2 world model). Pretrained for 7-dim actions / 2 cameras, so the
+# action-dim-dependent layers are re-initialised for our 14-dim EE layout and Qwen is frozen.
+policy.path: lerobot/VLA-JEPA-Pretrain
+policy.freeze_qwen: true
+policy.reinit_modules: '["model.action_model.action_encoder", "model.action_model.action_decoder", "model.action_model.state_encoder"]'
+policy.optimizer_lr: 1e-4
+batch_size: 8
+accelerator.gradient_accumulation.steps: 4
+rename_map: '{"observation.images.head": "observation.images.exterior_1_left", "observation.images.left_wrist": "observation.images.exterior_2_left"}'

@@ -1,0 +1,11 @@
+# MolmoAct2 (~22 GB bf16 weights). Upstream reports 55 GiB peak on GB200, so this is unlikely to fit a
+# 24 GB card even with lora VLM; kept for a bigger GPU / to confirm with the probe stage. Needs
+# `uv sync --extra molmoact2`. Keep dataset.image_transforms.enable=true (stage1 does).
+policy.type: molmoact2
+policy.checkpoint_path: allenai/MolmoAct2
+policy.dtype: bfloat16
+policy.train_mode_vlm: lora
+policy.gradient_checkpointing: true
+policy.optimizer_lr: 1e-5
+batch_size: 1
+accelerator.gradient_accumulation.steps: 32
