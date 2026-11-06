@@ -201,6 +201,12 @@ class LeRobotDatasetMetadata:
             # different parquet shards with different column orders). Realign to the
             # writer's established schema so `write_table` doesn't reject a reordered match.
             table = table.select(self._pq_writer.schema.names)
+            # Per-episode stats can come out with a different numeric dtype than the
+            # established schema (e.g. frame_index max/min as double vs int64). Without a
+            # cast, write_table raises *after* the episode's data and video were already
+            # committed, leaving a 1-frame ghost episode. Cast to the writer's schema.
+            if not table.schema.equals(self._pq_writer.schema):
+                table = table.cast(self._pq_writer.schema)
 
         self._pq_writer.write_table(table)
 
