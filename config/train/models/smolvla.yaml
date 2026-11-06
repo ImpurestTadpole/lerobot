@@ -3,3 +3,4 @@ policy.dtype: bfloat16
 batch_size: 16
 accelerator.gradient_accumulation.steps: 2
 policy.optimizer_lr: 1e-4
+rename_map: '{"observation.images.head": "observation.images.camera1", "observation.images.left_wrist": "observation.images.camera2", "observation.images.right_wrist": "observation.images.camera3"}'
