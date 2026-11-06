@@ -1294,12 +1294,21 @@ def align_single_dataset(
             ep_info = src_meta.episodes[ep_idx]
 
             # Resolve task description string for this episode.
-            task_idx = ep_info.get("task_index", 0)
-            if isinstance(task_idx, (list, np.ndarray)):
-                task_idx = int(task_idx[0])
-            task_description = src_meta.tasks.index[int(task_idx)]
-            if not isinstance(task_description, str):
-                task_description = str(task_description)
+            # v3 episode metadata stores the instruction as `tasks` (list of strings) and has no
+            # `task_index`; falling back to task 0 collapsed every multi-task source (DROID,
+            # ob15_general_dataset_v1, ...) onto its first task string.
+            ep_tasks = ep_info.get("tasks")
+            if ep_tasks is not None and len(ep_tasks) > 0:
+                task_description = str(ep_tasks[0])
+            elif ep_tasks is not None:
+                task_description = ""
+            else:
+                task_idx = ep_info.get("task_index", 0)
+                if isinstance(task_idx, (list, np.ndarray)):
+                    task_idx = int(task_idx[0])
+                task_description = src_meta.tasks.index[int(task_idx)]
+                if not isinstance(task_description, str):
+                    task_description = str(task_description)
 
             resample_indices = _compute_resample_indices(src_fps, effective_fps, len(ep_ds))
 
