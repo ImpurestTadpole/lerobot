@@ -228,7 +228,8 @@ def make_train_eval_datasets(
 ) -> tuple[LeRobotDataset | StreamingLeRobotDataset, LeRobotDataset | None]:
     """Create train and optional eval datasets by splitting episodes based on eval_split.
 
-    The last ceil(n_episodes * eval_split) episodes per task are held out for evaluation.
+    The last ceil(n_episodes * eval_split) episodes per task are held out for evaluation,
+    for tasks with at least 10 episodes (smaller tasks are kept entirely in the train split).
     If eval_split == 0.0, returns (full_dataset, None).
     """
     full_dataset = make_dataset(cfg)
@@ -248,7 +249,9 @@ def make_train_eval_datasets(
 
     train_episodes, eval_episodes = [], []
     for eps in task_to_episodes.values():
-        n_eval = math.ceil(len(eps) * cfg.dataset.eval_split)
+        # Tasks with very few episodes (e.g. thousands of one-off DROID instructions) would be
+        # held out entirely by ceil() and never trained on; keep them all in the train split.
+        n_eval = math.ceil(len(eps) * cfg.dataset.eval_split) if len(eps) >= 10 else 0
         train_episodes.extend(eps[: len(eps) - n_eval])
         eval_episodes.extend(eps[len(eps) - n_eval :])
 
