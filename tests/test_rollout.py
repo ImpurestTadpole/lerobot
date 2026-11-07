@@ -91,7 +91,7 @@ def test_strategy_config_types():
 def test_dagger_config_invalid_input_device():
     from lerobot.rollout import DAggerStrategyConfig
 
-    with pytest.raises(ValueError, match="input_device must be 'keyboard' or 'pedal'"):
+    with pytest.raises(ValueError, match="input_device must be 'keyboard', 'pedal' or 'teleop'"):
         DAggerStrategyConfig(input_device="joystick")
 
 

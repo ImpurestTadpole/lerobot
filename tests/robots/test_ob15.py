@@ -45,9 +45,9 @@ def _build_robot(config: OB15Config) -> OB15:
 
 def test_default_topology_reproduces_original_2bus_wiring():
     config = OB15Config(cameras={})
-    # lift_port must default onto bus2 (right_arm), not bus1 — ID 9 collides with the base.
-    assert config.lift_port == config.right_arm_port == "/dev/ttyACM0"
-    assert config.left_arm_port == config.base_port == "/dev/ttyACM1"
+    # lift_port must default onto the right-arm bus, not the left/base bus — ID 9 collides with the base.
+    assert config.lift_port == config.right_arm_port == "/dev/ttyACM1"
+    assert config.left_arm_port == config.base_port == "/dev/ttyACM0"
 
     robot = _build_robot(config)
 
