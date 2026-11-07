@@ -396,7 +396,7 @@ def record_loop(
             if isinstance(teleop, Teleoperator):
                 if hasattr(teleop, "update_observation_cache"):
                     teleop.update_observation_cache(obs)
-                if getattr(teleop.config, "stream_cameras_to_vr", False) and hasattr(
+                if getattr(getattr(teleop, "config", None), "stream_cameras_to_vr", False) and hasattr(
                     teleop, "send_camera_frames"
                 ):
                     teleop.send_camera_frames(obs)
