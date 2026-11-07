@@ -12,13 +12,14 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-from lerobot.utils import ActionInterpolator as ActionInterpolator
+from lerobot.utils.action_interpolator import ActionInterpolator as ActionInterpolator
+from lerobot.utils.feature_spec import FeatureSpec
 
 from .act.configuration_act import ACTConfig as ACTConfig
-from .chunk import (
-    ChunkPolicySpec,
-    ExecutionMode,
-    FeatureSpec,
+from .chunk import ChunkPolicySpec, ExecutionMode
+from .cosmos3.configuration_cosmos3 import (
+    Cosmos3EdgeConfig as Cosmos3EdgeConfig,
+    Cosmos3NanoConfig as Cosmos3NanoConfig,
 )
 from .diffusion.configuration_diffusion import DiffusionConfig as DiffusionConfig
 from .dm05.configuration_dm05 import DM05Config as DM05Config
@@ -28,6 +29,7 @@ from .factory import get_policy_class, make_policy, make_policy_config, make_pre
 from .fastwam.configuration_fastwam import FastWAMConfig as FastWAMConfig
 from .fineart_vla.configuration_fineart_vla import FineARTVLAConfig as FineARTVLAConfig
 from .flux3.configuration_flux3 import Flux3Config as Flux3Config
+from .g05.configuration_g05 import G05Config as G05Config
 from .gaussian_actor.configuration_gaussian_actor import GaussianActorConfig as GaussianActorConfig
 from .groot.configuration_groot import GrootConfig as GrootConfig
 from .lawam.configuration_lawam import LaWAMConfig as LaWAMConfig
@@ -63,6 +65,8 @@ from .xvla.configuration_xvla import XVLAConfig as XVLAConfig
 __all__ = [
     # Configuration classes
     "ACTConfig",
+    "Cosmos3EdgeConfig",
+    "Cosmos3NanoConfig",
     "DiffusionConfig",
     "DM05Config",
     "EO1Config",
@@ -70,6 +74,7 @@ __all__ = [
     "FineARTVLAConfig",
     "Flux3Config",
     "GaussianActorConfig",
+    "G05Config",
     "Evo1Config",
     "GrootConfig",
     "LaWAMConfig",
