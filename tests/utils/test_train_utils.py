@@ -224,6 +224,7 @@ def test_dataloaders_filter_boundaries_without_consuming_policy_rng(
         persistent_workers=False,
         dataloader_multiprocessing_context=None,
         max_eval_samples=max_eval_samples,
+        source_sampling=None,
     )
     train, evaluation = make_dataloaders(cfg, Dataset(), Dataset(), 0, SimpleNamespace(device_type="cpu"))
     assert sorted(train.sampler) == expected
