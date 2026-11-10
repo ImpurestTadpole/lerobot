@@ -278,7 +278,9 @@ class OB15ArmsConfig(OB15Config):
     Head and lift are moved to a saved station pose at connect and then held; the base always
     receives zero velocity. Any base/head/lift keys in an incoming action are dropped.
 
-    Hold target precedence: explicit overrides > named ``station`` > current positions at connect.
+    Hold target precedence: explicit flags (``head_pan`` / ``head_tilt`` / ``lift_height_mm``)
+    > ``hold_from`` (pose saved with a dataset or policy) > named ``station`` > current positions
+    at connect.
     """
 
     station: str | None = None
@@ -287,6 +289,13 @@ class OB15ArmsConfig(OB15Config):
     head_tilt: float | None = None
     lift_height_mm: float | None = None
     hold_on_connect: bool = True
+    # Dataset root / Hub dataset id / checkpoint dir / Hub model id holding `ob15_hold.json`.
+    hold_from: str | None = None
+    # Arm/gripper targets (ARM_KEYS) sent before the head/lift move to the hold pose.
+    rest_pose: dict[str, float] | None = None
+    settle_timeout_s: float = 15.0
+    lift_tol_mm: float = 5.0
+    head_tol: float = 2.0
 
 
 @RobotConfig.register_subclass("ob15_arms_client")
@@ -300,3 +309,10 @@ class OB15ArmsClientConfig(OB15ClientConfig):
     head_tilt: float | None = None
     lift_height_mm: float | None = None
     hold_on_connect: bool = True
+    # Dataset root / Hub dataset id / checkpoint dir / Hub model id holding `ob15_hold.json`.
+    hold_from: str | None = None
+    # Arm/gripper targets (ARM_KEYS) sent before the head/lift move to the hold pose.
+    rest_pose: dict[str, float] | None = None
+    settle_timeout_s: float = 15.0
+    lift_tol_mm: float = 5.0
+    head_tol: float = 2.0

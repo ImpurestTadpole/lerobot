@@ -15,17 +15,21 @@ from .arms_only import (
     arms_only_result,
     arms_state_features,
     build_arms_command,
+    hold_keys,
     hold_reached,
+    hold_source,
     hold_status,
     resolve_hold_targets,
+    rest_pose_command,
 )
 from .config_ob15 import OB15ArmsConfig
+from .hold_file import build_hold_metadata
 from .ob15 import OB15
 
 logger = logging.getLogger(__name__)
 
-HOLD_SETTLE_TIMEOUT_S = 15.0
 HOLD_POLL_S = 0.1
+REST_POSE_WAIT_S = 2.0
 
 
 class OB15Arms(OB15):
@@ -40,6 +44,7 @@ class OB15Arms(OB15):
     name = "ob15_arms"
 
     def __init__(self, config: OB15ArmsConfig):
+        rest_pose_command(config)  # fail early on a bad rest_pose
         super().__init__(config)
         self._hold: dict[str, float] | None = None
 
@@ -63,27 +68,41 @@ class OB15Arms(OB15):
         return OB15.get_observation(self, skip_cameras=True, skip_depth=True)
 
     def _establish_hold(self) -> None:
+        cfg = self.config
         current = self._read_pose()
-        if self.config.hold_on_connect:
-            self._hold = resolve_hold_targets(self.config, current, self._lift_name)
-        else:
-            # Do not move to a station: just freeze head/lift where they are now.
-            self._hold = resolve_hold_targets(_NoTargets(), current, self._lift_name)
+        # hold_on_connect=False: do not move to hold_from/station, just freeze head/lift where they are.
+        self._hold = None
+        hold = resolve_hold_targets(cfg if cfg.hold_on_connect else _NoTargets(), current, self._lift_name)
+
+        rest = rest_pose_command(cfg)
+        if rest:
+            # Arms go to the rest pose first; head/lift stay where they are until that is done.
+            freeze = {k: float(current[k]) for k in hold_keys(self._lift_name) if k in current}
+            OB15.send_action(self, build_arms_command(rest, freeze))
+            time.sleep(REST_POSE_WAIT_S)
+
+        self._hold = hold
         logger.info(f"{self}: holding head/lift at {self._hold}")
 
-        deadline = time.monotonic() + HOLD_SETTLE_TIMEOUT_S
+        deadline = time.monotonic() + cfg.settle_timeout_s
         while True:
-            OB15.send_action(self, build_arms_command({}, self._hold))
-            status = hold_status(self._read_pose(), self._hold)
+            OB15.send_action(self, build_arms_command(rest or {}, self._hold))
+            status = hold_status(self._read_pose(), self._hold, cfg.head_tol, cfg.lift_tol_mm)
             if hold_reached(status):
                 return
             if time.monotonic() >= deadline:
                 bad = {k: v for k, v in status.items() if not v["ok"]}
                 logger.warning(
-                    f"{self}: head/lift did not reach the hold pose within {HOLD_SETTLE_TIMEOUT_S}s: {bad}"
+                    f"{self}: head/lift did not reach the hold pose within {cfg.settle_timeout_s}s: {bad}"
                 )
                 return
             time.sleep(HOLD_POLL_S)
+
+    def hold_metadata(self) -> dict[str, Any]:
+        """Document for ``meta/ob15_hold.json``: the resolved hold pose and how it was requested."""
+        if self._hold is None:
+            raise DeviceNotConnectedError(f"{self} is not connected.")
+        return build_hold_metadata(self.name, self._hold, hold_source(self.config))
 
     def get_observation(self, skip_cameras: bool = False, skip_depth: bool = False) -> dict[str, Any]:
         obs = super().get_observation(skip_cameras=skip_cameras, skip_depth=skip_depth)
@@ -101,7 +120,7 @@ class OB15Arms(OB15):
         """Head/lift drift vs the hold pose right now. Call at the end of a task or episode."""
         if self._hold is None:
             raise DeviceNotConnectedError(f"{self} is not connected.")
-        status = hold_status(self._read_pose(), self._hold)
+        status = hold_status(self._read_pose(), self._hold, self.config.head_tol, self.config.lift_tol_mm)
         for key, entry in status.items():
             if not entry["ok"]:
                 logger.warning(f"{self}: {key} drifted from hold pose: {entry}")
@@ -124,3 +143,4 @@ class _NoTargets:
     head_pan = None
     head_tilt = None
     lift_height_mm = None
+    hold_from = None

@@ -80,6 +80,9 @@ class DatasetRecordConfig:
     # Skip appending the date-time tag to repo_id, keeping the user-provided name as-is
     # (e.g. self-managed versioned names intended for a later `lerobot-edit-dataset merge`).
     no_stamp: bool = False
+    # OB15 arms-only robots write `meta/ob15_hold.json` (head/lift hold pose) when recording. If the
+    # dataset already has one with a different pose it is kept unless this is set.
+    overwrite_hold: bool = False
 
     def stamp_repo_id(self) -> None:
         """Append a date-time tag to ``repo_id`` so each recording session gets a unique name.

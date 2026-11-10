@@ -316,6 +316,470 @@ def test_arms_client_connect_holds_station_then_reports_drift(tmp_path):
     assert status["head_tilt.pos"]["ok"] is False
 
 
+# --- hold file / hold_from / rest_pose (task 10) ----------------------------------------------
+
+import contextlib  # noqa: E402
+import logging  # noqa: E402
+
+from lerobot.robots.ob15 import hold_file as hf  # noqa: E402
+from lerobot.robots.ob15.arms_only import hold_source, rest_pose_command  # noqa: E402
+
+HOLD = {"head_pan.pos": 0.0, "head_tilt.pos": -35.0, LIFT: 220.0}
+OBS = {"head_pan.pos": 10.0, "head_tilt.pos": -5.0, LIFT: 100.0}  # what _FakeHardware starts at
+
+
+def _meta(hold=None, robot_type="ob15_arms_client"):
+    return hf.build_hold_metadata(
+        robot_type,
+        hold or HOLD,
+        {"station": None, "hold_from": None, "overrides": {}, "hold_on_connect": True},
+    )
+
+
+def _dataset_with_hold(root, hold=None):
+    hf.write_hold_file(root, _meta(hold), head_tol=2.0, lift_tol=5.0)
+    return root
+
+
+@contextlib.contextmanager
+def _connected(monkeypatch, hw=None, **cfg):
+    """A connected OB15Arms on fake hardware; yields (robot, hw)."""
+    monkeypatch.setattr("lerobot.robots.ob15.ob15_arms.REST_POSE_WAIT_S", 0.0)
+    config = OB15ArmsConfig(cameras={}, **cfg)
+    with patch(f"{_MODULE}.FeetechMotorsBus", side_effect=_make_bus):
+        robot = OB15Arms(config)
+    hw = hw or _FakeHardware()
+    with (
+        patch.object(OB15, "connect", lambda self, calibrate=True: None),
+        patch.object(OB15, "get_observation", lambda self, **kw: hw.get_observation(**kw)),
+        patch.object(OB15, "send_action", lambda self, a: hw.send_action(a)),
+        patch.object(OB15, "disconnect", _fake_disconnect),
+    ):
+        robot.connect()
+        try:
+            yield robot, hw
+        finally:
+            robot.disconnect()
+
+
+def _hw_state(hw):
+    return {k: hw.state[k] for k in ("head_pan.pos", "head_tilt.pos", LIFT)}
+
+
+# 1. round trip
+def test_hold_file_round_trip_dataset_checkpoint_and_direct_path(tmp_path):
+    ds = _dataset_with_hold(tmp_path / "ds")
+    assert (ds / "meta" / "ob15_hold.json").is_file()
+    assert hf.read_hold_file(str(ds)) == HOLD
+
+    ckpt = tmp_path / "ckpt"
+    assert hf.copy_hold_file_to_checkpoint(ds, ckpt / "pretrained_model")
+    assert hf.read_hold_file(str(ckpt)) == HOLD  # <dir>/pretrained_model/ob15_hold.json
+    assert hf.read_hold_file(str(ckpt / "pretrained_model")) == HOLD  # <dir>/ob15_hold.json
+    assert hf.read_hold_file(str(ds / "meta" / "ob15_hold.json")) == HOLD  # direct file
+
+
+def test_hold_file_document_fields(tmp_path):
+    ds = _dataset_with_hold(tmp_path / "ds")
+    doc = json.loads((ds / "meta" / "ob15_hold.json").read_text())
+    assert doc["version"] == hf.HOLD_FILE_VERSION == 1
+    assert doc["robot_type"] == "ob15_arms_client"
+    assert doc["hold"] == HOLD
+    assert "recorded_at" in doc and "source" in doc
+    assert not list((ds / "meta").glob("*.tmp"))  # atomic write leaves no temp file
+
+
+# 2. read errors
+def test_read_hold_file_missing_lists_every_tried_path(tmp_path):
+    (tmp_path / "empty").mkdir()
+    with (
+        patch("huggingface_hub.hf_hub_download", side_effect=OSError("offline")),
+        pytest.raises(FileNotFoundError) as exc,
+    ):
+        hf.read_hold_file(str(tmp_path / "empty"))
+    msg = str(exc.value)
+    for expected in ("meta/ob15_hold.json", "pretrained_model/ob15_hold.json", "hub:dataset:", "hub:model:"):
+        assert expected in msg
+
+
+@pytest.mark.parametrize(
+    "content, match",
+    [
+        ("not json", "not valid JSON"),
+        ('{"hold": {}}', "non-empty"),
+        ('{"version": 1}', "non-empty"),
+        ('{"hold": {"head_pan.pos": "left"}}', "must be a number"),
+        ('{"hold": {"head_pan.pos": true}}', "must be a number"),
+        ("[1, 2]", "JSON object"),
+    ],
+)
+def test_read_hold_file_rejects_bad_content(tmp_path, content, match):
+    path = tmp_path / "ob15_hold.json"
+    path.write_text(content)
+    with pytest.raises(ValueError, match=match):
+        hf.read_hold_file(str(path))
+
+
+# 3. Hub
+def _fake_download(tmp_path, available):
+    def download(repo_id, filename, repo_type):
+        if (repo_type, filename) not in available:
+            raise RuntimeError(f"404 {repo_type} {filename}")
+        path = tmp_path / f"{repo_type}.json"
+        path.write_text(json.dumps(_meta(available[(repo_type, filename)])))
+        return str(path)
+
+    return download
+
+
+def test_read_hold_file_from_hub_dataset(tmp_path):
+    dl = _fake_download(tmp_path, {("dataset", "meta/ob15_hold.json"): HOLD})
+    with patch("huggingface_hub.hf_hub_download", side_effect=dl) as mock:
+        assert hf.read_hold_file("user/ob15_ds") == HOLD
+    assert mock.call_args.kwargs == {
+        "repo_id": "user/ob15_ds",
+        "filename": "meta/ob15_hold.json",
+        "repo_type": "dataset",
+    }
+
+
+def test_read_hold_file_from_hub_model_when_dataset_misses(tmp_path):
+    model_hold = {**HOLD, LIFT: 150.0}
+    dl = _fake_download(tmp_path, {("model", "ob15_hold.json"): model_hold})
+    with patch("huggingface_hub.hf_hub_download", side_effect=dl) as mock:
+        assert hf.read_hold_file("user/ob15_policy") == model_hold
+    assert [c.kwargs["repo_type"] for c in mock.call_args_list] == ["dataset", "model"]
+
+
+def test_read_hold_file_hub_miss_raises(tmp_path):
+    with (
+        patch("huggingface_hub.hf_hub_download", side_effect=_fake_download(tmp_path, {})),
+        pytest.raises(FileNotFoundError, match="user/nothing"),
+    ):
+        hf.read_hold_file("user/nothing")
+
+
+# 4. precedence (resolve_hold_targets, one test per level)
+def _cfg(tmp_path, **kw):
+    stations = tmp_path / "s.json"
+    save_station(stations, "a", {"head_pan.pos": 1.0, "head_tilt.pos": 2.0, LIFT: 3.0})
+    return OB15ArmsConfig(cameras={}, stations_file=str(stations), **kw)
+
+
+def test_precedence_current_only(tmp_path):
+    assert resolve_hold_targets(_cfg(tmp_path), OBS, "gantry") == OBS
+
+
+def test_precedence_station_over_current(tmp_path):
+    got = resolve_hold_targets(_cfg(tmp_path, station="a"), OBS, "gantry")
+    assert got == {"head_pan.pos": 1.0, "head_tilt.pos": 2.0, LIFT: 3.0}
+
+
+def test_precedence_hold_from_over_station(tmp_path):
+    ds = _dataset_with_hold(tmp_path / "ds")
+    got = resolve_hold_targets(_cfg(tmp_path, station="a", hold_from=str(ds)), OBS, "gantry")
+    assert got == HOLD
+
+
+def test_precedence_flag_over_hold_from(tmp_path, caplog):
+    ds = _dataset_with_hold(tmp_path / "ds")
+    cfg = _cfg(tmp_path, station="a", hold_from=str(ds), lift_height_mm=180.0, head_pan=7.0)
+    with caplog.at_level(logging.INFO):
+        got = resolve_hold_targets(cfg, OBS, "gantry")
+    assert got == {"head_pan.pos": 7.0, "head_tilt.pos": -35.0, LIFT: 180.0}
+    assert "sources" in caplog.text and str(ds) in caplog.text  # the log says where values came from
+
+
+def test_hold_from_missing_key_falls_back_to_station_then_current(tmp_path, caplog):
+    path = tmp_path / "partial.json"
+    path.write_text(json.dumps({"hold": {"head_tilt.pos": -20.0}}))
+    with caplog.at_level(logging.WARNING):
+        got = resolve_hold_targets(_cfg(tmp_path, station="a", hold_from=str(path)), OBS, "gantry")
+    assert got == {"head_pan.pos": 1.0, "head_tilt.pos": -20.0, LIFT: 3.0}  # station fills the gaps
+    assert "no value for" in caplog.text
+    got = resolve_hold_targets(_cfg(tmp_path, hold_from=str(path)), OBS, "gantry")
+    assert got == {"head_pan.pos": 10.0, "head_tilt.pos": -20.0, LIFT: 100.0}  # current fills the gaps
+
+
+def test_hold_from_ignores_unknown_keys_with_warning(tmp_path, caplog):
+    path = tmp_path / "x.json"
+    path.write_text(json.dumps({"hold": {**HOLD, "x.vel": 1.0, "left_arm_gripper.pos": 5.0}}))
+    with caplog.at_level(logging.WARNING):
+        got = resolve_hold_targets(_cfg(tmp_path, hold_from=str(path)), OBS, "gantry")
+    assert got == HOLD
+    assert "non-hold keys" in caplog.text
+
+
+def test_hold_from_with_lift_disabled_ignores_lift_value(tmp_path):
+    ds = _dataset_with_hold(tmp_path / "ds")
+    got = resolve_hold_targets(
+        _cfg(tmp_path, hold_from=str(ds)), {"head_pan.pos": 5.0, "head_tilt.pos": 5.0}, None
+    )
+    assert got == {"head_pan.pos": 0.0, "head_tilt.pos": -35.0}
+
+
+@pytest.mark.hardware
+def test_robot_moves_to_hold_from_and_flag_beats_it(tmp_path, monkeypatch):
+    ds = _dataset_with_hold(tmp_path / "ds")
+    with _connected(monkeypatch, hold_from=str(ds)) as (_, hw):
+        assert _hw_state(hw) == HOLD
+    with _connected(monkeypatch, hold_from=str(ds), lift_height_mm=180.0) as (_, hw):
+        assert _hw_state(hw) == {**HOLD, LIFT: 180.0}
+
+
+# 5. hold_on_connect=False
+@pytest.mark.hardware
+def test_hold_on_connect_false_ignores_hold_from(tmp_path, monkeypatch):
+    ds = _dataset_with_hold(tmp_path / "ds")
+    with _connected(monkeypatch, hold_from=str(ds), hold_on_connect=False) as (robot, hw):
+        assert _hw_state(hw) == OBS
+        assert robot._hold == OBS
+
+
+# 6. rest_pose
+@pytest.mark.hardware
+def test_rest_pose_sent_first_with_head_and_lift_frozen(tmp_path, monkeypatch):
+    ds = _dataset_with_hold(tmp_path / "ds")
+    rest = {"left_arm_shoulder_lift.pos": -90.0, "right_arm_gripper.pos": 12.0}
+    with _connected(monkeypatch, hold_from=str(ds), rest_pose=rest) as (_, hw):
+        first, second = hw.sent[0], hw.sent[1]
+        assert first["left_arm_shoulder_lift.pos"] == -90.0 and first["right_arm_gripper.pos"] == 12.0
+        assert {k: first[k] for k in OBS} == OBS  # head/lift have not moved yet
+        assert all(first[k] == 0.0 for k in BASE_KEYS)
+        assert {k: second[k] for k in HOLD} == HOLD  # then the move
+        assert second["left_arm_shoulder_lift.pos"] == -90.0  # rest pose kept while settling
+        assert _hw_state(hw) == HOLD
+
+
+def test_rest_pose_rejects_non_arm_keys():
+    assert rest_pose_command(OB15ArmsConfig(cameras={})) is None
+    assert rest_pose_command(OB15ArmsConfig(cameras={}, rest_pose={ARM_KEYS[0]: 1})) == {ARM_KEYS[0]: 1.0}
+    for bad in ("head_tilt.pos", LIFT, "x.vel"):
+        with pytest.raises(ValueError, match="rest_pose"):
+            rest_pose_command(OB15ArmsConfig(cameras={}, rest_pose={bad: 0.0}))
+    with pytest.raises(
+        ValueError, match="rest_pose"
+    ):  # robots fail at construction, before touching hardware
+        OB15ArmsClient(
+            OB15ArmsClientConfig(remote_ip="127.0.0.1", cameras={}, rest_pose={"head_pan.pos": 0.0})
+        )
+
+
+# 7. settle uses the config
+class _StuckHardware(_FakeHardware):
+    """Never moves head/lift, whatever is commanded."""
+
+    def send_action(self, action):
+        self.sent.append(dict(action))
+        return dict(action)
+
+
+@pytest.mark.hardware
+def test_settle_timeout_warns_and_does_not_hang(tmp_path, monkeypatch, caplog):
+    ds = _dataset_with_hold(tmp_path / "ds")
+    stuck = _StuckHardware()
+    with (
+        caplog.at_level(logging.WARNING),
+        _connected(monkeypatch, stuck, hold_from=str(ds), settle_timeout_s=0.05),
+    ):
+        pass
+    assert "did not reach the hold pose within 0.05s" in caplog.text
+
+
+@pytest.mark.hardware
+def test_settle_and_check_hold_use_config_tolerances(tmp_path, monkeypatch, caplog):
+    path = tmp_path / "h.json"
+    path.write_text(json.dumps({"hold": {**OBS, LIFT: 120.0}}))  # stuck lift is 20 mm off
+    stuck = _StuckHardware()
+    with (
+        caplog.at_level(logging.WARNING),
+        _connected(monkeypatch, stuck, hold_from=str(path), settle_timeout_s=0.05, lift_tol_mm=25.0) as (
+            robot,
+            _,
+        ),
+    ):
+        assert hold_reached(robot.check_hold())
+    assert "did not reach" not in caplog.text
+    with _connected(monkeypatch, _StuckHardware(), hold_from=str(path), settle_timeout_s=0.05) as (robot, _):
+        assert not hold_reached(robot.check_hold())  # default 5 mm
+
+
+# 8. hold_metadata
+@pytest.mark.hardware
+def test_hold_metadata_contents(tmp_path, monkeypatch):
+    with _connected(monkeypatch, station=None, head_tilt=-35.0, lift_height_mm=220.0) as (robot, _):
+        meta = robot.hold_metadata()
+    assert meta["robot_type"] == "ob15_arms"
+    assert meta["version"] == 1
+    assert meta["hold"] == {"gantry.height_mm": 220.0, "head_pan.pos": 10.0, "head_tilt.pos": -35.0}
+    assert meta["source"] == {
+        "station": None,
+        "hold_from": None,
+        "overrides": {"head_pan": None, "head_tilt": -35.0, "lift_height_mm": 220.0},
+        "hold_on_connect": True,
+    }
+    assert meta["recorded_at"]
+
+
+@pytest.mark.hardware
+def test_hold_metadata_requires_connection():
+    with patch(f"{_MODULE}.FeetechMotorsBus", side_effect=_make_bus):
+        robot = OB15Arms(OB15ArmsConfig(cameras={}))
+    from lerobot.utils.errors import DeviceNotConnectedError
+
+    with pytest.raises(DeviceNotConnectedError):
+        robot.hold_metadata()
+    client = OB15ArmsClient(OB15ArmsClientConfig(remote_ip="127.0.0.1", cameras={}))
+    with pytest.raises(DeviceNotConnectedError):
+        client.hold_metadata()
+
+
+def test_hold_source_reads_config_fields(tmp_path):
+    cfg = _cfg(tmp_path, station="a", hold_from="u/ds", head_pan=1.0, hold_on_connect=False)
+    assert hold_source(cfg) == {
+        "station": "a",
+        "hold_from": "u/ds",
+        "overrides": {"head_pan": 1.0, "head_tilt": None, "lift_height_mm": None},
+        "hold_on_connect": False,
+    }
+
+
+# 9. record hook helper (write_hold_file)
+def test_write_hold_file_new_resume_match_mismatch_overwrite(tmp_path, caplog):
+    root = tmp_path / "ds"
+    path = hf.write_hold_file(root, _meta(), head_tol=2.0, lift_tol=5.0)
+    original = path.read_text()
+
+    # resume with a pose inside tolerance: unchanged, no warning
+    near = {**HOLD, LIFT: 223.0, "head_tilt.pos": -34.0}
+    with caplog.at_level(logging.WARNING):
+        hf.write_hold_file(root, _meta(near), head_tol=2.0, lift_tol=5.0)
+    assert path.read_text() == original and not caplog.records
+
+    # resume with a different pose: unchanged + warning naming both poses and the flag
+    far = {**HOLD, LIFT: 150.0}
+    with caplog.at_level(logging.WARNING):
+        hf.write_hold_file(root, _meta(far), head_tol=2.0, lift_tol=5.0)
+    assert path.read_text() == original
+    assert (
+        "--dataset.overwrite_hold=true" in caplog.text and "150.0" in caplog.text and "220.0" in caplog.text
+    )
+
+    # overwrite=True replaces
+    hf.write_hold_file(root, _meta(far), overwrite=True, head_tol=2.0, lift_tol=5.0)
+    assert hf.read_hold_file(str(root)) == far
+
+
+def test_holds_match_uses_per_key_tolerance():
+    assert hf.holds_match(HOLD, {**HOLD, LIFT: 224.0}, head_tol=2.0, lift_tol=5.0)
+    assert not hf.holds_match(HOLD, {**HOLD, LIFT: 226.0}, head_tol=2.0, lift_tol=5.0)
+    assert not hf.holds_match(HOLD, {**HOLD, "head_pan.pos": 3.0}, head_tol=2.0, lift_tol=5.0)
+    assert not hf.holds_match(HOLD, {"head_pan.pos": 0.0}, head_tol=2.0, lift_tol=5.0)  # different keys
+
+
+def test_overwrite_hold_flag_defaults_off():
+    from lerobot.configs.dataset import DatasetRecordConfig
+
+    assert DatasetRecordConfig().overwrite_hold is False
+
+
+# 10. checkpoint copy
+def test_copy_hold_file_to_checkpoint(tmp_path):
+    ds = _dataset_with_hold(tmp_path / "ds")
+    out = tmp_path / "ckpt" / "pretrained_model"
+    assert hf.copy_hold_file_to_checkpoint(ds, out) is True
+    assert (out / "ob15_hold.json").read_text() == (ds / "meta" / "ob15_hold.json").read_text()
+    other = tmp_path / "plain_ds"
+    (other / "meta").mkdir(parents=True)
+    out2 = tmp_path / "ckpt2" / "pretrained_model"
+    assert hf.copy_hold_file_to_checkpoint(other, out2) is False
+    assert not out2.exists()
+
+
+def test_train_hook_copies_only_when_exactly_one_dataset_has_a_hold(tmp_path):
+    ds = _dataset_with_hold(tmp_path / "ds")
+    plain = tmp_path / "plain"
+    (plain / "meta").mkdir(parents=True)
+    single = MagicMock(spec=["root"], root=ds)
+    assert hf.copy_dataset_hold_to_checkpoint(single, tmp_path / "o1") is True
+    assert hf.copy_dataset_hold_to_checkpoint(MagicMock(spec=["root"], root=plain), tmp_path / "o2") is False
+    multi = MagicMock(
+        spec=["datasets"], datasets=[MagicMock(spec=["root"], root=ds), MagicMock(spec=["root"], root=plain)]
+    )
+    assert hf.copy_dataset_hold_to_checkpoint(multi, tmp_path / "o3") is True
+    both = MagicMock(spec=["datasets"], datasets=[MagicMock(spec=["root"], root=ds)] * 2)
+    assert hf.copy_dataset_hold_to_checkpoint(both, tmp_path / "o4") is False
+
+
+# 11. client
+def _client_with_fake_host(tmp_path, hw=None, **cfg):
+    client = OB15ArmsClient(OB15ArmsClientConfig(remote_ip="127.0.0.1", cameras={}, **cfg))
+    hw = hw or _FakeHardware()
+
+    def fake_connect(self):
+        self._is_connected = True
+        self.zmq_cmd_socket = MagicMock()
+
+    def fake_get_observation(self):
+        self.last_remote_state = dict(hw.state)
+        return dict(hw.state)
+
+    patches = (
+        patch.object(OB15Client, "connect", fake_connect),
+        patch.object(OB15ArmsClient, "get_observation", fake_get_observation),
+        patch.object(OB15ArmsClient, "_push", lambda self, command: hw.send_action(command)),
+        patch.object(OB15Client, "disconnect", lambda self: None),
+        patch("lerobot.robots.ob15.ob15_arms_client.REST_POSE_WAIT_S", 0.0),
+    )
+    return client, hw, patches
+
+
+def _run_client(client, patches):
+    with contextlib.ExitStack() as stack:
+        for p in patches:
+            stack.enter_context(p)
+        client.connect()
+
+
+def test_client_precedence_hold_from_then_flag(tmp_path):
+    ds = _dataset_with_hold(tmp_path / "ds")
+    client, hw, patches = _client_with_fake_host(tmp_path, hold_from=str(ds))
+    _run_client(client, patches)
+    assert _hw_state(hw) == HOLD
+
+    client, hw, patches = _client_with_fake_host(tmp_path, hold_from=str(ds), head_tilt=-10.0)
+    _run_client(client, patches)
+    assert _hw_state(hw) == {**HOLD, "head_tilt.pos": -10.0}
+    meta = client.hold_metadata()
+    assert meta["robot_type"] == "ob15_arms_client"
+    assert meta["source"]["hold_from"] == str(ds) and meta["source"]["overrides"]["head_tilt"] == -10.0
+
+
+def test_client_hold_on_connect_false_and_rest_pose(tmp_path):
+    ds = _dataset_with_hold(tmp_path / "ds")
+    client, hw, patches = _client_with_fake_host(tmp_path, hold_from=str(ds), hold_on_connect=False)
+    _run_client(client, patches)
+    assert _hw_state(hw) == OBS
+
+    rest = {"right_arm_shoulder_lift.pos": -80.0}
+    client, hw, patches = _client_with_fake_host(tmp_path, hold_from=str(ds), rest_pose=rest)
+    _run_client(client, patches)
+    assert hw.sent[0]["right_arm_shoulder_lift.pos"] == -80.0
+    assert {k: hw.sent[0][k] for k in OBS} == OBS  # frozen
+    assert {k: hw.sent[1][k] for k in HOLD} == HOLD
+    assert _hw_state(hw) == HOLD
+
+
+def test_client_settle_timeout_uses_config(tmp_path, caplog):
+    ds = _dataset_with_hold(tmp_path / "ds")
+    client, hw, patches = _client_with_fake_host(
+        tmp_path, _StuckHardware(), hold_from=str(ds), settle_timeout_s=0.05
+    )
+    with caplog.at_level(logging.WARNING):
+        _run_client(client, patches)
+    assert "did not reach the hold pose within 0.05s" in caplog.text
+
+
 # --- dataset conversion / head-lift report ----------------------------------------------------
 
 FULL_NAMES = [*ARM_KEYS, "head_pan.pos", "head_tilt.pos", *BASE_KEYS, LIFT]
