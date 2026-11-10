@@ -28,11 +28,11 @@ Rules: extend the existing code, do not rewrite it. Keep the flat config layout.
 
 | File | What is there |
 |---|---|
-| `src/lerobot/robots/ob15/arms_only.py` | `ARM_KEYS`, `HEAD_KEYS`, `BASE_KEYS`, `lift_key()`, `hold_keys()`, `resolve_hold_targets(config, current_obs, lift_name)` (current < station < overrides), `hold_status()`, `hold_reached()`, `build_arms_command()`, `arms_only_result()`, constants `HEAD_TOL_DEG`, `LIFT_TOL_MM` |
-| `src/lerobot/robots/ob15/ob15_arms.py` | `OB15Arms`: `connect()` → `_establish_hold()` (settle loop with module const `HOLD_SETTLE_TIMEOUT_S`), `check_hold()`, `_NoTargets` stand-in (used when `hold_on_connect=False`) |
-| `src/lerobot/robots/ob15/ob15_arms_client.py` | `OB15ArmsClient`: same pattern over ZMQ (`_wait_first_observation`, `_push`, settle loop), its own `_NoTargets` |
+| `src/lerobot/robots/ob15_arms/arms_only.py` | `ARM_KEYS`, `HEAD_KEYS`, `BASE_KEYS`, `lift_key()`, `hold_keys()`, `resolve_hold_targets(config, current_obs, lift_name)` (current < station < overrides), `hold_status()`, `hold_reached()`, `build_arms_command()`, `arms_only_result()`, constants `HEAD_TOL_DEG`, `LIFT_TOL_MM` |
+| `src/lerobot/robots/ob15_arms/ob15_arms.py` | `OB15Arms`: `connect()` → `_establish_hold()` (settle loop with module const `HOLD_SETTLE_TIMEOUT_S`), `check_hold()`, `_NoTargets` stand-in (used when `hold_on_connect=False`) |
+| `src/lerobot/robots/ob15_arms/ob15_arms_client.py` | `OB15ArmsClient`: same pattern over ZMQ (`_wait_first_observation`, `_push`, settle loop), its own `_NoTargets` |
 | `src/lerobot/robots/ob15/config_ob15.py` | `OB15ArmsConfig`, `OB15ArmsClientConfig` with flat fields `station`, `stations_file`, `head_pan`, `head_tilt`, `lift_height_mm`, `hold_on_connect` |
-| `src/lerobot/robots/ob15/stations.py` | JSON loader/saver pattern to copy (atomic write via `.tmp` + `os.replace`) |
+| `src/lerobot/robots/ob15_arms/stations.py` | JSON loader/saver pattern to copy (atomic write via `.tmp` + `os.replace`) |
 | `src/lerobot/scripts/lerobot_record.py` | `record()`: dataset `resume` (~L601) / `create` (~L633); `robot.connect()` (~L658); `push_to_hub` (~L851) |
 | `src/lerobot/scripts/lerobot_train.py` | `save_checkpoint(...)` call (~L1008), `checkpoint_dir = get_step_checkpoint_dir(...)`; `PRETRAINED_MODEL_DIR` from `lerobot.utils.constants` |
 | `tests/robots/test_ob15_arms.py` | Fixtures to reuse: `_FakeHardware`, `arms_robot`, `_make_bus`, client ZMQ tests, conversion tests with `full_dataset` |
@@ -52,7 +52,7 @@ head_tol: float = 2.0
 ```
 Update the docstring precedence line.
 
-### 3b. New `src/lerobot/robots/ob15/hold_file.py`
+### 3b. New `src/lerobot/robots/ob15_arms/hold_file.py`
 - Constants: `HOLD_FILENAME = "ob15_hold.json"`, `DATASET_HOLD_PATH = "meta/ob15_hold.json"`, `HOLD_FILE_VERSION = 1`.
 - File format:
   ```json

@@ -98,6 +98,7 @@ from lerobot.robots import (  # noqa: F401
     koch_follower,
     make_robot_from_config,
     ob15,
+    ob15_arms,
     omx_follower,
     openarm_follower,
     reachy2,

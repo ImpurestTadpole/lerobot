@@ -197,6 +197,7 @@ from lerobot.robots import (  # noqa: F401
     koch_follower,
     lekiwi,
     ob15,
+    ob15_arms,
     omx_follower,
     openarm_follower,
     reachy2,

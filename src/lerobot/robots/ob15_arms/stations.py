@@ -25,7 +25,7 @@ def _read(path: Path) -> dict:
             data = json.load(f)
     except FileNotFoundError as e:
         raise FileNotFoundError(
-            f"Station file not found: {path}. Create it (see lerobot.robots.ob15.stations) or pass "
+            f"Station file not found: {path}. Create it (see lerobot.robots.ob15_arms.stations) or pass "
             "explicit --robot.head_pan/--robot.head_tilt/--robot.lift_height_mm values."
         ) from e
     except json.JSONDecodeError as e:

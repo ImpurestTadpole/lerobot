@@ -48,6 +48,7 @@ from lerobot.robots import (  # noqa: F401
     lekiwi,
     make_robot_from_config,
     ob15,
+    ob15_arms,
     omx_follower,
     openarm_follower,
     rebot_b601_follower,
