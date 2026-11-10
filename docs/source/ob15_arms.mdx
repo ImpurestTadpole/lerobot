@@ -1,13 +1,18 @@
 # OB15 arms-only control (`ob15_arms`)
 
-`ob15_arms` (local) and `ob15_arms_client` (over ZMQ) expose only the **12 arm and gripper joints** as actions.
-The head and lift are moved to a saved *station* pose at connect and then held; the base always gets zero velocity.
-Use them for recording tasks and running policies. Keep the full-body `ob15` for VR setup, navigation and recovery.
+`ob15_arms` exposes only the **12 arm and gripper joints** as actions. It is one of two OB15 robot types:
+`ob15` (full body: arms, head, lift, base) for VR setup, navigation and recovery, and `ob15_arms` for recording
+tasks and running policies. In the usual setup both run on the robot computer (the Jetson) and the policy runs
+through remote inference, so ZMQ is not involved. The ZMQ types (`ob15_client`, `ob15_arms_client`) still exist
+for a PC-side client talking to an `ob15` host, and use the same hold options.
+The head and lift are moved to a hold pose at connect and then held; the base always gets zero velocity. The
+hold-pose code (station, `hold_from`, `rest_pose`, the dataset's `ob15_hold.json`) is part of `ob15_arms` only.
 
 - **Action space:** 12 values (both arms and grippers).
 - **Observation state:** arms, grippers, head pan/tilt and lift height. No base velocity.
 - Base, head and lift keys sent by VR teleop or a policy are dropped.
-- The host keeps running the full-body `ob15`; filtering and holding happen on the client.
+- Recording runs on the Jetson. Inference runs on the Jetson with the policy on a GPU PC through
+  [remote inference](./remote_inference) (`lerobot-policy-server` + `--inference.type=remote`).
 
 ## Station file
 
@@ -33,7 +38,7 @@ current pose and ignores `hold_from` and `station`.
 
 ## The dataset remembers the hold pose (`hold_from`)
 
-- **Recording** with `ob15_arms` / `ob15_arms_client` writes the resolved head/lift pose to
+- **Recording** with `ob15_arms` writes the resolved head/lift pose to
   `<dataset_root>/meta/ob15_hold.json` (also on resume). It is uploaded with `push_to_hub`. If the file already
   exists with a different pose (beyond the tolerances) it is kept and a warning is logged; pass
   `--dataset.overwrite_hold=true` to replace it.
@@ -45,7 +50,7 @@ current pose and ignores `hold_from` and `station`.
   id or a Hub model id. A local path that does not exist is tried as a Hub repo id.
 
 ```json
-{"version": 1, "robot_type": "ob15_arms_client",
+{"version": 1, "robot_type": "ob15_arms",
  "hold": {"gantry.height_mm": 220.0, "head_pan.pos": 0.0, "head_tilt.pos": -35.0},
  "source": {"station": null, "hold_from": null,
             "overrides": {"head_pan": null, "head_tilt": -35.0, "lift_height_mm": 220.0},
@@ -64,14 +69,16 @@ current pose and ignores `hold_from` and `station`.
 ## Commands
 
 ```bash
-# Record (VR teleop still works; base/head/lift inputs are ignored)
-lerobot-record --robot.type=ob15_arms_client --robot.remote_ip=<jetson-ip> --robot.station=kitchen_counter ...
+# Record on the Jetson (VR teleop still works; base/head/lift inputs are ignored)
+lerobot-record --robot.type=ob15_arms --robot.station=kitchen_counter ...
 
-# Run a policy
-lerobot-rollout --robot.type=ob15_arms_client --robot.remote_ip=<jetson-ip> --robot.station=kitchen_counter --policy.path=...
+# Run a policy served from the PC (on the PC: lerobot-policy-server --config_path=server.yaml)
+lerobot-rollout --robot.type=ob15_arms --robot.station=kitchen_counter \
+  --inference.type=remote --inference.endpoint=tcp/<pc-ip>:7447 --inference.deployment=<name> ...
 
 # Restore the head/lift pose the policy's data was recorded with (dataset id, policy id or local path)
-lerobot-rollout --robot.type=ob15_arms_client --robot.remote_ip=<jetson-ip> --robot.hold_from=<user>/<dataset> --policy.path=...
+lerobot-rollout --robot.type=ob15_arms --robot.hold_from=<user>/<dataset> \
+  --inference.type=remote --inference.endpoint=tcp/<pc-ip>:7447 --inference.deployment=<name> ...
 ```
 
 ## Checking head and lift

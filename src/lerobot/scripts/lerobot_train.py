@@ -1019,7 +1019,7 @@ def train(cfg: TrainPipelineConfig) -> None:
             )
             if is_main_process():
                 # OB15 arms-only: ship the head/lift hold pose with the weights (no-op otherwise).
-                from lerobot.robots.ob15.hold_file import copy_dataset_hold_to_checkpoint
+                from lerobot.robots.ob15.arms_only import copy_dataset_hold_to_checkpoint
 
                 copy_dataset_hold_to_checkpoint(dataset, checkpoint_dir / PRETRAINED_MODEL_DIR)
                 update_last_checkpoint(checkpoint_dir)
