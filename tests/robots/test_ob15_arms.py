@@ -32,16 +32,20 @@ from lerobot.robots.ob15_arms import (
     OB15ArmsClient,
     OB15ArmsClientConfig,
     OB15ArmsConfig,
-    hold_file as hf,
+    arms_only as hf,
 )
 from lerobot.robots.ob15_arms.arms_only import (
     ARM_KEYS,
     BASE_KEYS,
     build_arms_command,
+    hold_reached,
+    hold_source,
+    hold_status,
+    load_station,
+    resolve_hold_targets,
     rest_pose_command,
+    save_station,
 )
-from lerobot.robots.ob15_arms.hold import hold_reached, hold_source, hold_status, resolve_hold_targets
-from lerobot.robots.ob15_arms.stations import load_station, save_station
 
 LIFT = "gantry.height_mm"
 _MODULE = "lerobot.robots.ob15.ob15"
@@ -809,7 +813,7 @@ def full_dataset(tmp_path):
 
 
 def test_report_flags_only_episodes_where_head_or_lift_moved(full_dataset):
-    from lerobot.robots.ob15_arms.scripts.convert_to_arms_only import report
+    from lerobot.data_processing.convert_to_arms_only import report
 
     rows = report(full_dataset)
     assert [bool(r["flags"]) for r in rows] == [False, True]
@@ -821,8 +825,8 @@ def test_report_flags_only_episodes_where_head_or_lift_moved(full_dataset):
 def test_convert_to_arms_only_drops_base_and_keeps_arms(full_dataset, tmp_path):
     import numpy as np
 
+    from lerobot.data_processing.convert_to_arms_only import convert
     from lerobot.datasets import LeRobotDataset
-    from lerobot.robots.ob15_arms.scripts.convert_to_arms_only import convert
 
     out = convert(full_dataset, tmp_path / "arms", "test/ob15_arms")
     ds = LeRobotDataset("test/ob15_arms", root=out)
@@ -840,7 +844,7 @@ def test_convert_to_arms_only_drops_base_and_keeps_arms(full_dataset, tmp_path):
 
 
 def test_convert_refuses_to_overwrite(full_dataset, tmp_path):
-    from lerobot.robots.ob15_arms.scripts.convert_to_arms_only import convert
+    from lerobot.data_processing.convert_to_arms_only import convert
 
     (tmp_path / "exists").mkdir()
     with pytest.raises(FileExistsError):

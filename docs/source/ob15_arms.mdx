@@ -32,7 +32,7 @@ Stations live in `~/.ob15/stations.json` (override with `--robot.stations_file`)
 Create one from Python:
 
 ```python
-from lerobot.robots.ob15_arms.stations import save_station
+from lerobot.robots.ob15_arms.arms_only import save_station
 
 save_station("~/.ob15/stations.json", "kitchen_counter",
              {"head_pan.pos": 0.0, "head_tilt.pos": -35.0, "gantry.height_mm": 220.0})
@@ -93,13 +93,13 @@ lerobot-rollout --robot.type=ob15_arms --robot.hold_from=<user>/<dataset> \
 - `robot.check_hold()` returns, per hold key, the target, the actual value, the error and whether it is within
   tolerance (2 deg for the head, 5 mm for the lift), and logs a warning for any drift. It also runs when the
   robot disconnects. Call it at the end of a task or episode to confirm the head and lift stayed put.
-- For recorded data, `python -m lerobot.robots.ob15_arms.scripts.convert_to_arms_only --src-repo-id <repo> --report`
+- For recorded data, `python -m lerobot.data_processing.convert_to_arms_only --src-repo-id <repo> --report`
   lists, per episode, the start and end values and range of head pan/tilt and lift, plus any base motion.
 
 ## Converting an existing full-body dataset
 
 ```bash
-python -m lerobot.robots.ob15_arms.scripts.convert_to_arms_only --src-repo-id me/ob15_full --dst-repo-id me/ob15_arms
+python -m lerobot.data_processing.convert_to_arms_only --src-repo-id me/ob15_full --dst-repo-id me/ob15_arms
 ```
 
 This writes a new dataset (the source is untouched) whose `action` has the 12 arm keys and whose
