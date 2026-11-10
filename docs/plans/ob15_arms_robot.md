@@ -35,6 +35,8 @@ The full-body `ob15` type stays for VR setup, navigation and recovery.
 
 ### 10. "The dataset remembers the hold pose"
 
+> Detailed handoff for implementation and tests: `docs/plans/ob15_hold_from_task10.md`.
+
 Goal: record the lift/head hold values with each dataset, and at inference move to those exact values automatically. No numbers to retype; no hard-coded heights in source.
 
 **10a. Config fields** (add to both `OB15ArmsConfig` and `OB15ArmsClientConfig`, flat layout, all are CLI flags):
