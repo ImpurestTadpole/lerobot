@@ -35,12 +35,13 @@ class OB15Arms(OB15):
 
     On connect the head and lift move to the hold pose (overrides, hold_from, or the current
     pose) and are re-commanded on every ``send_action`` so the lift P-controller keeps holding.
-    Base, head and lift keys in incoming actions are dropped and no base command is sent (the low-level
-    base path reads a missing command as zero velocity). Everything else is inherited from ``OB15``.
+    Base, head and lift keys in incoming actions are dropped. The wheel motors are not on the bus at all
+    (``uses_base = False``), so nothing reads or writes them and an unplugged wheel cannot block connect. Everything else is inherited from ``OB15``.
     """
 
     config_class = OB15ArmsConfig
     name = "ob15_arms"
+    uses_base = False  # wheel motors are not on the bus: unplugged/unpowered wheels do not block connect
 
     def __init__(self, config: OB15ArmsConfig):
         # Same hardware as ``ob15``: use its calibration folder (robots/ob15/<id>.json) unless one is given,

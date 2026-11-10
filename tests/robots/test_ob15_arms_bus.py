@@ -32,7 +32,7 @@ import pytest
 pytest.importorskip("zmq")
 
 from lerobot.configs.dataset import DatasetRecordConfig
-from lerobot.robots.ob15 import OB15
+from lerobot.robots.ob15 import OB15, OB15Config
 from lerobot.robots.ob15_arms import OB15Arms, OB15ArmsConfig
 from lerobot.robots.ob15_arms.arms_only import (
     ARM_KEYS,
@@ -168,12 +168,52 @@ def test_arm_commands_reach_the_motors_and_nothing_else_moves(make_robot):
     # head stays at the hold pose, whatever the action said
     assert set(_writes(robot, "Goal_Position", ["head_pan"])) == {0.0}
     assert set(_writes(robot, "Goal_Position", ["head_tilt"])) == {-35.0}
-    # the wheels are told zero velocity every single tick, never a move
-    wheel_writes = _writes(robot, "Goal_Velocity", WHEELS)
-    assert len(wheel_writes) == 30 * len(WHEELS)
-    assert set(wheel_writes) == {0.0}
+    # the wheels are not on the bus: they are never written at all, not even a zero
+    assert not _writes(robot, "Goal_Velocity", WHEELS)
+    assert not any(m in WHEELS for bus in robot._buses.values() for _, v in bus.writes for m in v)
     # the lift is still at the hold height
     assert robot.get_observation()[LIFT] == pytest.approx(220.0, abs=robot.config.lift_tol_mm)
+
+
+def test_wheel_motors_are_not_on_any_bus(make_robot):
+    robot = make_robot()
+    assert robot.base_motors == []
+    assert not any(m in WHEELS for bus in robot._buses.values() for m in bus.motors)
+    # plain ob15 is unchanged: it still owns the wheels
+    with patch(_FB, side_effect=FakeBus):
+        plain = OB15(OB15Config(cameras={}))
+    assert plain.base_motors == list(WHEELS)
+
+
+def test_connect_succeeds_when_the_wheels_are_unplugged(tmp_path, monkeypatch):
+    """The real left bus handshake fails on missing wheel IDs 7/8; ob15_arms must not ask for them."""
+    monkeypatch.setattr("lerobot.robots.ob15_arms.ob15_arms.HOLD_POLL_S", 0.0)
+
+    class NoWheelsBus(FakeBus):
+        def connect(self, *a, **k):
+            missing = [m for m in self.motors if m in WHEELS]
+            if missing:
+                raise RuntimeError(f"Missing motor IDs: {missing}")
+            super().connect()
+
+    config = OB15ArmsConfig(cameras={}, calibration_dir=tmp_path / "calib")
+    with patch(_FB, side_effect=NoWheelsBus):
+        robot = OB15Arms(config)
+    robot.lift_axis._homed = True
+    robot.lift_axis._z0_deg = 100.0 / robot.lift_axis._mm_per_deg
+    with patch.object(OB15, "calibrate", lambda self: None):
+        robot.connect()
+    try:
+        assert robot.is_connected
+        assert set(robot.send_action(_arm_action())) == set(ARM_KEYS)
+    finally:
+        robot.disconnect()
+
+    # plain ob15 asks for the wheels, so the same unplugged-wheel bus stops it
+    with patch(_FB, side_effect=NoWheelsBus):
+        plain = OB15(OB15Config(cameras={}, calibration_dir=tmp_path / "calib2"))
+    with pytest.raises(RuntimeError, match="Missing motor IDs"):
+        plain.connect()
 
 
 def test_lift_drift_is_pulled_back_by_the_next_action(make_robot):
@@ -358,11 +398,9 @@ def test_lerobot_record_end_to_end(tmp_path, monkeypatch):
     hold = read_hold_file(str(root))
     assert hold == {"head_pan.pos": 0.0, "head_tilt.pos": -35.0, LIFT: 220.0}
 
-    # wheels were told zero velocity and nothing else; the head never left the hold pose
+    # the wheels were never touched; the head never left the hold pose
     all_writes = [(item, m, v) for bus in buses for item, vals in bus.writes for m, v in vals.items()]
-    wheel = [v for item, m, v in all_writes if item == "Goal_Velocity" and m in WHEELS]
-    assert wheel
-    assert set(wheel) == {0}
+    assert not [1 for item, m, v in all_writes if m in WHEELS]
     assert {v for item, m, v in all_writes if item == "Goal_Position" and m == "head_tilt"} == {-35.0}
 
     # head and lift stay at the hold pose in every recorded frame

@@ -51,6 +51,8 @@ class OB15(Robot):
 
     config_class = OB15Config
     name = "ob15"
+    # False for variants that never drive the base (ob15_arms): wheel motors are left off the bus.
+    uses_base = True
 
     def __init__(self, config: OB15Config):
         super().__init__(config)
@@ -106,6 +108,11 @@ class OB15(Robot):
             "base": self.config.base_port,
             "head": self.config.head_port,
         }
+
+        if not self.uses_base:
+            # Variants without a base (ob15_arms): the wheel motors are not part of the bus, so a
+            # missing/unpowered wheel cannot fail the connect handshake and nothing writes to them.
+            group_motors["base"] = {}
 
         # Optional gantry / Z lift axis: attaches to whichever group's bus `lift_axis.bus`
         # names, or its own dedicated port when `lift_axis.bus == "lift"`.
@@ -762,7 +769,8 @@ class OB15(Robot):
                 elif group == "head":
                     result["head_pos"] = bus.sync_read("Present_Position", self.head_motors)
                 elif group == "base":
-                    result["base_vel"] = bus.sync_read("Present_Velocity", self.base_motors)
+                    if self.base_motors:
+                        result["base_vel"] = bus.sync_read("Present_Velocity", self.base_motors)
                 elif group == "lift":
                     try:
                         result["lift_pos"] = bus.read(
@@ -801,10 +809,14 @@ class OB15(Robot):
 
         # Process base velocity
         proc_start = time.perf_counter()
-        base_vel = self._wheel_raw_to_body(
-            base_wheel_vel["base_left_wheel"],
-            base_wheel_vel["base_back_wheel"],
-            base_wheel_vel["base_right_wheel"],
+        base_vel = (
+            self._wheel_raw_to_body(
+                base_wheel_vel["base_left_wheel"],
+                base_wheel_vel["base_back_wheel"],
+                base_wheel_vel["base_right_wheel"],
+            )
+            if self.base_motors
+            else {}
         )
 
         left_arm_state = {f"{k}.pos": v for k, v in left_arm_pos.items()}
@@ -947,7 +959,7 @@ class OB15(Robot):
         ):
             if raw:
                 pos_by_port.setdefault(self._group_port[group], {}).update(raw)
-        if base_wheel_goal_vel:
+        if base_wheel_goal_vel and self.base_motors:
             vel_by_port.setdefault(self._group_port["base"], {}).update(base_wheel_goal_vel)
 
         for port, values in pos_by_port.items():
@@ -991,6 +1003,8 @@ class OB15(Robot):
         }
 
     def stop_base(self):
+        if not self.base_motors:
+            return
         try:
             base_bus = self._group_bus["base"]
             if base_bus.is_connected:
