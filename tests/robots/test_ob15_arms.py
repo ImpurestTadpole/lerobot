@@ -581,7 +581,8 @@ def test_write_hold_file_new_resume_match_mismatch_overwrite(tmp_path, caplog):
     near = {**HOLD, LIFT: 223.0, "head_tilt.pos": -34.0}
     with caplog.at_level(logging.WARNING):
         hf.write_hold_file(root, _meta(near), head_tol=2.0, lift_tol=5.0)
-    assert path.read_text() == original and not caplog.records
+    assert path.read_text() == original
+    assert not [r for r in caplog.records if r.levelno >= logging.WARNING]
 
     # resume with a different pose: unchanged + warning naming both poses and the flag
     far = {**HOLD, LIFT: 150.0}
