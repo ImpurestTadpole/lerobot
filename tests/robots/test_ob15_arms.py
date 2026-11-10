@@ -146,7 +146,7 @@ def test_send_action_ignores_head_lift_and_base_inputs(arms_robot):
     assert sent["head_pan.pos"] == 0.0
     assert sent["head_tilt.pos"] == -35.0
     assert sent[LIFT] == 220.0
-    assert all(sent[k] == 0.0 for k in BASE_KEYS)
+    assert not set(BASE_KEYS) & set(sent)  # no base command at all
     assert tuple(result) == ARM_KEYS  # only the 12 arm keys come back
 
 
@@ -238,11 +238,11 @@ def test_hold_status_flags_missing_observation_key():
     assert status[LIFT]["ok"] is False and status[LIFT]["actual"] is None
 
 
-def test_build_arms_command_drops_extras_and_zeroes_base():
+def test_build_arms_command_drops_extras_and_sends_no_base():
     cmd = build_arms_command({ARM_KEYS[0]: 3.0, "x.vel": 9.0, "head_pan.pos": 9.0}, {"head_pan.pos": 0.0})
     assert cmd[ARM_KEYS[0]] == 3.0
     assert cmd["head_pan.pos"] == 0.0
-    assert all(cmd[k] == 0.0 for k in BASE_KEYS)
+    assert not set(BASE_KEYS) & set(cmd)
 
 
 # --- client -----------------------------------------------------------------------------------
@@ -265,7 +265,7 @@ def test_arms_client_features_and_registration():
     assert "x.vel" not in client._state_order  # observation.state vector has no base velocity
 
 
-def test_arms_client_sends_hold_and_zero_base_over_zmq():
+def test_arms_client_sends_hold_and_no_base_over_zmq():
     client = OB15ArmsClient(OB15ArmsClientConfig(remote_ip="127.0.0.1", cameras={}))
     client._is_connected = True
     client.zmq_cmd_socket = MagicMock()
@@ -276,7 +276,7 @@ def test_arms_client_sends_hold_and_zero_base_over_zmq():
     payload = json.loads(client.zmq_cmd_socket.send_string.call_args[0][0])
     assert payload["head_tilt.pos"] == -35.0
     assert payload[LIFT] == 220.0
-    assert all(payload[k] == 0.0 for k in BASE_KEYS)
+    assert not set(BASE_KEYS) & set(payload)
     assert result["action"].shape == (12,)
     assert set(result) == {*ARM_KEYS, "action"}
 
@@ -545,7 +545,7 @@ def test_rest_pose_sent_first_with_head_and_lift_frozen(tmp_path, monkeypatch):
         first, second = hw.sent[0], hw.sent[1]
         assert first["left_arm_shoulder_lift.pos"] == -90.0 and first["right_arm_gripper.pos"] == 12.0
         assert {k: first[k] for k in OBS} == OBS  # head/lift have not moved yet
-        assert all(first[k] == 0.0 for k in BASE_KEYS)
+        assert not set(BASE_KEYS) & set(first)
         assert {k: second[k] for k in HOLD} == HOLD  # then the move
         assert second["left_arm_shoulder_lift.pos"] == -90.0  # rest pose kept while settling
         assert _hw_state(hw) == HOLD

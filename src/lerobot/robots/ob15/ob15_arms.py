@@ -1,4 +1,4 @@
-"""Arms-only OB15: 12 arm/gripper actions, head + lift held at a station pose, base held still."""
+"""Arms-only OB15: 12 arm/gripper actions, head + lift held at a hold pose, no base commands."""
 
 from __future__ import annotations
 
@@ -37,7 +37,8 @@ class OB15Arms(OB15):
 
     On connect the head and lift move to the hold pose (station, overrides, or the current
     pose) and are re-commanded on every ``send_action`` so the lift P-controller keeps holding.
-    Base, head and lift keys in incoming actions are dropped; the base always gets zero velocity.
+    Base, head and lift keys in incoming actions are dropped and no base command is sent (the low-level
+    base path reads a missing command as zero velocity). Everything else is inherited from ``OB15``.
     """
 
     config_class = OB15ArmsConfig

@@ -276,7 +276,8 @@ class OB15ArmsConfig(OB15Config):
     """OB15 controlled through the 12 arm/gripper joints only.
 
     Head and lift are moved to a saved station pose at connect and then held; the base always
-    receives zero velocity. Any base/head/lift keys in an incoming action are dropped.
+    is sent no command (the base driver reads that as zero velocity). Any base/head/lift keys in an
+    incoming action are dropped.
 
     Hold target precedence: explicit flags (``head_pan`` / ``head_tilt`` / ``lift_height_mm``)
     > ``hold_from`` (pose saved with a dataset or policy) > named ``station`` > current positions
