@@ -260,3 +260,43 @@ class OB15ClientConfig(RobotConfig):
     lift_axis: LiftAxisConfig = field(default_factory=LiftAxisConfig)
     polling_timeout_ms: int = 15
     connect_timeout_s: int = 5
+    # Fields read by OB15Client but previously missing here, which made the client crash on
+    # construction (AttributeError). Speed levels mirror the LeKiwi client defaults.
+    use_head: bool = True
+    base_speed_xy: tuple[float, ...] = (0.1, 0.2, 0.3)
+    base_speed_theta_deg: tuple[float, ...] = (30.0, 60.0, 90.0)
+
+
+# --- Arms-only variants: 12 arm/gripper actions; head, lift and base are held, never driven. ---
+
+
+@RobotConfig.register_subclass("ob15_arms")
+@dataclass
+class OB15ArmsConfig(OB15Config):
+    """OB15 controlled through the 12 arm/gripper joints only.
+
+    Head and lift are moved to a saved station pose at connect and then held; the base always
+    receives zero velocity. Any base/head/lift keys in an incoming action are dropped.
+
+    Hold target precedence: explicit overrides > named ``station`` > current positions at connect.
+    """
+
+    station: str | None = None
+    stations_file: str = "~/.ob15/stations.json"
+    head_pan: float | None = None
+    head_tilt: float | None = None
+    lift_height_mm: float | None = None
+    hold_on_connect: bool = True
+
+
+@RobotConfig.register_subclass("ob15_arms_client")
+@dataclass
+class OB15ArmsClientConfig(OB15ClientConfig):
+    """Remote (ZMQ) arms-only OB15. The host keeps running the full-body ``ob15`` robot."""
+
+    station: str | None = None
+    stations_file: str = "~/.ob15/stations.json"
+    head_pan: float | None = None
+    head_tilt: float | None = None
+    lift_height_mm: float | None = None
+    hold_on_connect: bool = True

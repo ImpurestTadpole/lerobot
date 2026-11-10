@@ -1,0 +1,58 @@
+# OB15 arms-only control (`ob15_arms`)
+
+`ob15_arms` (local) and `ob15_arms_client` (over ZMQ) expose only the **12 arm and gripper joints** as actions.
+The head and lift are moved to a saved *station* pose at connect and then held; the base always gets zero velocity.
+Use them for recording tasks and running policies. Keep the full-body `ob15` for VR setup, navigation and recovery.
+
+- **Action space:** 12 values (both arms and grippers).
+- **Observation state:** arms, grippers, head pan/tilt and lift height. No base velocity.
+- Base, head and lift keys sent by VR teleop or a policy are dropped.
+- The host keeps running the full-body `ob15`; filtering and holding happen on the client.
+
+## Station file
+
+Stations live in `~/.ob15/stations.json` (override with `--robot.stations_file`):
+
+```json
+{"kitchen_counter": {"head_pan.pos": 0.0, "head_tilt.pos": -35.0, "gantry.height_mm": 220}}
+```
+
+Create one from Python:
+
+```python
+from lerobot.robots.ob15.stations import save_station
+
+save_station("~/.ob15/stations.json", "kitchen_counter",
+             {"head_pan.pos": 0.0, "head_tilt.pos": -35.0, "gantry.height_mm": 220.0})
+```
+
+Hold target precedence: explicit `--robot.head_pan / head_tilt / lift_height_mm` > `--robot.station` > the
+current pose at connect. `--robot.hold_on_connect=false` freezes the current pose and never moves to a station.
+
+## Commands
+
+```bash
+# Record (VR teleop still works; base/head/lift inputs are ignored)
+lerobot-record --robot.type=ob15_arms_client --robot.remote_ip=<jetson-ip> --robot.station=kitchen_counter ...
+
+# Run a policy
+lerobot-rollout --robot.type=ob15_arms_client --robot.remote_ip=<jetson-ip> --robot.station=kitchen_counter --policy.path=...
+```
+
+## Checking head and lift
+
+- `robot.check_hold()` returns, per hold key, the target, the actual value, the error and whether it is within
+  tolerance (2 deg for the head, 5 mm for the lift), and logs a warning for any drift. It also runs when the
+  robot disconnects. Call it at the end of a task or episode to confirm the head and lift stayed put.
+- For recorded data, `python -m lerobot.robots.ob15.scripts.convert_to_arms_only --src-repo-id <repo> --report`
+  lists, per episode, the start and end values and range of head pan/tilt and lift, plus any base motion.
+
+## Converting an existing full-body dataset
+
+```bash
+python -m lerobot.robots.ob15.scripts.convert_to_arms_only --src-repo-id me/ob15_full --dst-repo-id me/ob15_arms
+```
+
+This writes a new dataset (the source is untouched) whose `action` has the 12 arm keys and whose
+`observation.state` has no base velocity, and recomputes the stats. Check the `--report` output first and consider
+dropping episodes where the head or lift moved a lot.
