@@ -17,25 +17,22 @@ from .arms_only import (
     arms_state_features,
     build_arms_command,
     build_hold_metadata,
-    hold_keys,
     hold_reached,
     hold_source,
     hold_status,
     resolve_hold_targets,
-    rest_pose_command,
 )
 from .config_ob15_arms import OB15ArmsConfig
 
 logger = logging.getLogger(__name__)
 
 HOLD_POLL_S = 0.1
-REST_POSE_WAIT_S = 2.0
 
 
 class OB15Arms(OB15):
     """OB15 whose action space is the 12 arm/gripper joints only.
 
-    On connect the head and lift move to the hold pose (station, overrides, or the current
+    On connect the head and lift move to the hold pose (overrides, hold_from, or the current
     pose) and are re-commanded on every ``send_action`` so the lift P-controller keeps holding.
     Base, head and lift keys in incoming actions are dropped and no base command is sent (the low-level
     base path reads a missing command as zero velocity). Everything else is inherited from ``OB15``.
@@ -45,7 +42,6 @@ class OB15Arms(OB15):
     name = "ob15_arms"
 
     def __init__(self, config: OB15ArmsConfig):
-        rest_pose_command(config)  # fail early on a bad rest_pose
         super().__init__(config)
         self._hold: dict[str, float] | None = None
 
@@ -71,23 +67,16 @@ class OB15Arms(OB15):
     def _establish_hold(self) -> None:
         cfg = self.config
         current = self._read_pose()
-        # hold_on_connect=False: do not move to hold_from/station, just freeze head/lift where they are.
+        # hold_on_connect=False: do not move to hold_from, just freeze head/lift where they are.
         self._hold = None
         hold = resolve_hold_targets(cfg if cfg.hold_on_connect else _NoTargets(), current, self._lift_name)
-
-        rest = rest_pose_command(cfg)
-        if rest:
-            # Arms go to the rest pose first; head/lift stay where they are until that is done.
-            freeze = {k: float(current[k]) for k in hold_keys(self._lift_name) if k in current}
-            OB15.send_action(self, build_arms_command(rest, freeze))
-            time.sleep(REST_POSE_WAIT_S)
 
         self._hold = hold
         logger.info(f"{self}: holding head/lift at {self._hold}")
 
         deadline = time.monotonic() + cfg.settle_timeout_s
         while True:
-            OB15.send_action(self, build_arms_command(rest or {}, self._hold))
+            OB15.send_action(self, build_arms_command({}, self._hold))
             status = hold_status(self._read_pose(), self._hold, cfg.head_tol, cfg.lift_tol_mm)
             if hold_reached(status):
                 return
@@ -138,9 +127,8 @@ class OB15Arms(OB15):
 
 
 class _NoTargets:
-    """Config stand-in with no station or overrides, so the current pose is held."""
+    """Config stand-in with no overrides, so the current pose is held."""
 
-    station = None
     head_pan = None
     head_tilt = None
     lift_height_mm = None

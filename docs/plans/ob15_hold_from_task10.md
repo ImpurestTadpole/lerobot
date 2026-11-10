@@ -1,5 +1,8 @@
 # Task 10 handoff: "the dataset remembers the hold pose" (`hold_from`)
 
+> **Superseded in part:** the named stations (`stations.json`, `--robot.station`) and `rest_pose` described below were
+> removed. The hold pose is now: explicit flags > `hold_from` > current position. Code lives in `robots/ob15_arms/`.
+
 For: Claude Code session **PC2 training**. Implement, test and debug on PC2.
 Parent plan: `docs/plans/ob15_arms_robot.md` (task 10). Tasks 1–9 are done in commit `3a99cff`.
 

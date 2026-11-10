@@ -28,20 +28,15 @@ class OB15ArmsConfig(OB15Config):
     """
 
     # --- Head/lift hold pose. Precedence: explicit flags (head_pan / head_tilt / lift_height_mm)
-    # > hold_from > station > current positions at connect. ---
-    # Named pose in `stations_file`.
-    station: str | None = None
-    stations_file: str = "~/.ob15/stations.json"
-    # Explicit head/lift targets; each overrides hold_from and station for that axis.
+    # > hold_from > current positions at connect. ---
+    # Explicit head/lift targets; each overrides hold_from for that axis.
     head_pan: float | None = None
     head_tilt: float | None = None
     lift_height_mm: float | None = None
-    # False = freeze head/lift where they are; ignore hold_from and station.
+    # False = freeze head/lift where they are; ignore hold_from.
     hold_on_connect: bool = True
     # Dataset root / Hub dataset id / checkpoint dir / Hub model id holding `ob15_hold.json`.
     hold_from: str | None = None
-    # Arm/gripper targets (ARM_KEYS) sent before the head/lift move to the hold pose.
-    rest_pose: dict[str, float] | None = None
     # Give up waiting for the hold pose after this long, and the tolerances for "reached".
     settle_timeout_s: float = 15.0
     lift_tol_mm: float = 5.0
@@ -54,20 +49,15 @@ class OB15ArmsClientConfig(OB15ClientConfig):
     """Remote (ZMQ) arms-only OB15. The host keeps running the full-body ``ob15`` robot."""
 
     # --- Head/lift hold pose. Precedence: explicit flags (head_pan / head_tilt / lift_height_mm)
-    # > hold_from > station > current positions at connect. ---
-    # Named pose in `stations_file`.
-    station: str | None = None
-    stations_file: str = "~/.ob15/stations.json"
-    # Explicit head/lift targets; each overrides hold_from and station for that axis.
+    # > hold_from > current positions at connect. ---
+    # Explicit head/lift targets; each overrides hold_from for that axis.
     head_pan: float | None = None
     head_tilt: float | None = None
     lift_height_mm: float | None = None
-    # False = freeze head/lift where they are; ignore hold_from and station.
+    # False = freeze head/lift where they are; ignore hold_from.
     hold_on_connect: bool = True
     # Dataset root / Hub dataset id / checkpoint dir / Hub model id holding `ob15_hold.json`.
     hold_from: str | None = None
-    # Arm/gripper targets (ARM_KEYS) sent before the head/lift move to the hold pose.
-    rest_pose: dict[str, float] | None = None
     # Give up waiting for the hold pose after this long, and the tolerances for "reached".
     settle_timeout_s: float = 15.0
     lift_tol_mm: float = 5.0
