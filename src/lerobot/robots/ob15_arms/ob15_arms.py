@@ -7,6 +7,7 @@ import time
 from functools import cached_property
 from typing import Any
 
+from lerobot.utils.constants import HF_LEROBOT_CALIBRATION, ROBOTS
 from lerobot.utils.errors import DeviceNotConnectedError
 
 from ..ob15.ob15 import OB15
@@ -42,6 +43,10 @@ class OB15Arms(OB15):
     name = "ob15_arms"
 
     def __init__(self, config: OB15ArmsConfig):
+        # Same hardware as ``ob15``: use its calibration folder (robots/ob15/<id>.json) unless one is given,
+        # otherwise connect() would not find the existing calibration and start a manual one.
+        if not config.calibration_dir:
+            config.calibration_dir = HF_LEROBOT_CALIBRATION / ROBOTS / OB15.name
         super().__init__(config)
         self._hold: dict[str, float] | None = None
 
