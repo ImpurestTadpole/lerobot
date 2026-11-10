@@ -30,7 +30,7 @@ The full-body `ob15` type stays for VR setup, navigation and recovery.
 ### 1–9. Done in `3a99cff`
 - Arms-only robot types `ob15_arms` / `ob15_arms_client` (12 actions, no base velocity in state, head/lift held, base zero).
 - `stations.py` (`~/.ob15/stations.json`), flat config fields `station`, `stations_file`, `head_pan`, `head_tilt`, `lift_height_mm`, `hold_on_connect`.
-- Conversion script `robots/ob15_arms/scripts/convert_to_arms_only.py`, tests `tests/robots/test_ob15_arms.py`, docs `docs/source/ob15_arms.mdx`.
+- Conversion script `data_processing/convert_to_arms_only.py`, tests `tests/robots/test_ob15_arms.py`, docs `docs/source/ob15_arms.mdx`.
 - Current hold priority: explicit flag > station > current position at connect.
 
 ### 10. "The dataset remembers the hold pose"
@@ -58,7 +58,7 @@ Goal: record the lift/head hold values with each dataset, and at inference move 
 ```
 - Keys in `hold` match the robot feature names (lift key = `f"{lift_axis.name}.height_mm"`).
 
-**10c. Helpers** (`robots/ob15_arms/arms_only.py` or new `robots/ob15_arms/hold_file.py`):
+**10c. Helpers** (`robots/ob15_arms/arms_only.py` or new `robots/ob15_arms/arms_only.py`):
 - `hold_metadata(robot) -> dict` — builds the JSON above from the resolved hold.
 - `write_hold_file(dataset_root: Path, meta: dict)` → writes `<root>/meta/ob15_hold.json`.
 - `read_hold_file(source: str) -> dict[str, float]`:
