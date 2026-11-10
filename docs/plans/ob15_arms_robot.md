@@ -35,28 +35,54 @@ The full-body `ob15` type stays for VR setup, navigation and recovery.
   ```
 - Clear error if the file or station is missing.
 
+### 1b. Skill file + loader (per-skill lift/head pose)
+- A **skill** = one short, reusable action with a fixed setup (station, lift height, head angle) and one prompt, run by one policy. A **task** = a user goal made of several skills, sequenced by a script or the ROS 2 behavior tree.
+- New `robots/ob15/skills.py`:
+  - `@dataclass SkillPose`: `station: str | None`, `lift_height_mm`, `head_pan`, `head_tilt`, `task_prompt` (all optional).
+  - `load_skill(path: str, name: str) -> SkillPose` (YAML, `yaml.safe_load`). Clear `KeyError` if missing.
+- Default path `~/.ob15/skills.yaml`. Same file is read later by the ROS 2 behavior tree. Example:
+  ```yaml
+  skills:
+    pick_cup_counter:
+      station: kitchen_counter
+      lift_height_mm: 220
+      head_pan: 0.0
+      head_tilt: -35.0
+      task_prompt: "pick up the cup"
+    load_dishwasher_low:
+      station: kitchen_counter
+      lift_height_mm: 120
+      head_tilt: -50.0
+      task_prompt: "put the plate in the dishwasher"
+  ```
+- Heights live in this file, **not** in code defaults.
+
 ### 2. Configs (`robots/ob15/config_ob15.py`)
-- `@RobotConfig.register_subclass("ob15_arms")` `OB15ArmsConfig(OB15Config)`.
-- `@RobotConfig.register_subclass("ob15_arms_client")` `OB15ArmsClientConfig(OB15ClientConfig)`.
-- Shared new fields on both:
-  - `station: str | None = None`
-  - `stations_file: str = "~/.ob15/stations.json"`
-  - `head_pan: float | None = None`, `head_tilt: float | None = None`, `lift_height_mm: float | None = None` (override station values)
-  - `hold_on_connect: bool = True`
-- Rule: if neither `station` nor overrides are given → hold the **current** head/lift positions read at connect.
+- New nested dataclass `ArmsOnlyHoldConfig` (all fields become CLI flags via draccus, e.g. `--robot.hold.skill=pick_cup_counter`):
+  - `skill: str | None = None`, `skills_file: str = "~/.ob15/skills.yaml"`
+  - `station: str | None = None`, `stations_file: str = "~/.ob15/stations.json"`
+  - Overrides: `lift_height_mm: float | None = None`, `head_pan: float | None = None`, `head_tilt: float | None = None`
+  - `rest_pose: dict[str, float] | None = None` (arm joints to move to before the lift/head move; None = skip)
+  - `settle_timeout_s: float = 15.0`, `lift_tol_mm: float = 5.0`, `head_tol: float = 2.0`
+- `@RobotConfig.register_subclass("ob15_arms")` `OB15ArmsConfig(OB15Config)` with `hold: ArmsOnlyHoldConfig`.
+- `@RobotConfig.register_subclass("ob15_arms_client")` `OB15ArmsClientConfig(OB15ClientConfig)` with `hold: ArmsOnlyHoldConfig`.
+- **Priority** for each held value: CLI override > skill > skill's station (or `hold.station`) > current position read at connect.
 
 ### 3. Shared key helpers (`robots/ob15/arms_only.py`)
 - `ARM_KEYS`: the 12 arm/gripper `.pos` keys, same order as `_state_ft`.
 - `BASE_KEYS = ("x.vel", "y.vel", "theta.vel")`.
 - `arms_action_features() -> dict[str, type]`.
 - `arms_state_features(full_state_ft) -> dict` (drops `BASE_KEYS`, keeps order).
-- `resolve_hold_targets(config, current_obs, lift_name) -> dict[str, float]`.
+- `resolve_hold_targets(hold_cfg, current_obs, lift_name) -> dict[str, float]` implementing the priority rule above. Returns `{"<lift>.height_mm", "head_pan.pos", "head_tilt.pos"}`.
+- `wait_until_settled(read_obs_fn, targets, lift_tol_mm, head_tol, timeout_s) -> bool` (logs a warning on timeout).
 
 ### 4. `OB15Arms(OB15)` (`robots/ob15/ob15_arms.py`)
 - `config_class = OB15ArmsConfig`, `name = "ob15_arms"`.
 - Override `action_features` → `arms_action_features()`.
 - Override `observation_features` → `arms_state_features(self._state_ft)` + `self._cameras_ft`.
-- `connect()`: `super().connect()`, read observation, compute `self._hold`, send it once via `super().send_action(self._hold)`, wait until lift is within ±5 mm and head within ±2 (timeout 15 s, log warning on timeout).
+- `connect()`: `super().connect()`, read observation, move arms to `hold.rest_pose` if set, compute `self._hold` with `resolve_hold_targets`, send it, `wait_until_settled`, log the final hold values.
+- `set_skill(name: str)`: same sequence (rest pose → resolve → move → settle). For use **between** episodes only (later: VR button / key). Never during an episode.
+- `hold_metadata() -> dict`: skill name, station, resolved hold values. Write this into the dataset (`meta/info.json` extra field or a sidecar `meta/ob15_hold.json`) at record start.
 - `get_observation()`: call super, pop `BASE_KEYS`.
 - `send_action(action)`: keep only `ARM_KEYS`, merge `self._hold`, call `super().send_action(...)`, return only `ARM_KEYS` from the result.
 
@@ -81,27 +107,37 @@ The full-body `ob15` type stays for VR setup, navigation and recovery.
 - `action_features` has exactly 12 keys in order.
 - `observation_features` has no `BASE_KEYS`.
 - `send_action` with extra base/head/lift keys → those keys never change from hold values; base keys sent as 0.
-- Station loader: missing file, missing station, override precedence.
+- Station loader: missing file, missing station.
+- Skill loader: missing file, missing skill, partial entries.
+- `resolve_hold_targets` priority: override > skill > station > current (one test per level).
 - Conversion script on a tiny synthetic dataset: shapes and names correct.
 
 ### 9. Docs
-- `docs/source/ob15_arms.mdx` (short): purpose, station file, commands below.
+- `docs/source/ob15_arms.mdx` (short): purpose, skill vs task, `skills.yaml` + `stations.json` formats, flags, commands below.
 
 ## Commands to verify on the robot
 
 ```bash
-# Record (VR teleop still works; base/head/lift inputs are ignored)
-lerobot-record --robot.type=ob15_arms_client --robot.station=kitchen_counter ...
+# Record one skill (VR teleop still works; base/head/lift inputs are ignored)
+lerobot-record --robot.type=ob15_arms_client --robot.hold.skill=pick_cup_counter \
+  --dataset.single_task="pick up the cup" ...
 
-# Run a policy
-lerobot-rollout --robot.type=ob15_arms_client --robot.station=kitchen_counter --policy.path=...
+# Quick override test
+lerobot-record --robot.type=ob15_arms_client --robot.hold.skill=pick_cup_counter \
+  --robot.hold.lift_height_mm=230 ...
+
+# Run a policy with the same skill pose
+lerobot-rollout --robot.type=ob15_arms_client --robot.hold.skill=pick_cup_counter --policy.path=...
 ```
 
 Checks:
-1. Connect → head and lift move to station pose, then stay still.
+1. Connect → arms to rest pose, then head and lift move to the skill pose, then stay still.
 2. Move VR thumbsticks for base/head/lift during recording → nothing moves.
-3. Recorded dataset: `action` shape (12,), state has no base velocity.
-4. Old dataset converted → loads with `LeRobotDataset`, trains with `lerobot-train` for a few steps.
+3. Recorded dataset: `action` shape (12,), state has no base velocity, hold metadata saved.
+4. Rollout with the same skill → lift within ±5 mm and head within ±2 of the recorded hold values.
+5. Old dataset converted → loads with `LeRobotDataset`, trains with `lerobot-train` for a few steps.
+
+Rules: always home the lift at connect for task sessions (heights are relative to the homed zero). One dataset per skill. Same skill pose in recording and inference.
 
 ## Done when
 - `uv run pytest tests/robots/test_ob15_arms.py` passes.
@@ -110,5 +146,6 @@ Checks:
 - Existing `ob15` / `ob15_client` behavior unchanged.
 
 ## Out of scope (later)
-- VR button to toggle between full and arms-only control in one session, and "Save station" wiring.
+- VR button to toggle between full and arms-only control in one session, "Save station/skill" wiring, and calling `set_skill` from a VR button between episodes.
+- Mismatch guard at inference (warn if skill hold values differ from the training dataset's saved hold metadata).
 - ROS 2 behavior tree integration (`SetLift`, `LookAt`, `RunPolicy` nodes).
