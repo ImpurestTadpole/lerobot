@@ -12,12 +12,11 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-from .config_ob15_arms import ArmsHoldOptions, OB15ArmsClientConfig, OB15ArmsConfig
+from .config_ob15_arms import OB15ArmsClientConfig, OB15ArmsConfig
 from .ob15_arms import OB15Arms
 from .ob15_arms_client import OB15ArmsClient
 
 __all__ = [
-    "ArmsHoldOptions",
     "OB15Arms",
     "OB15ArmsClient",
     "OB15ArmsClientConfig",

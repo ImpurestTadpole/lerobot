@@ -18,41 +18,57 @@ from ..config import RobotConfig
 from ..ob15.config_ob15 import OB15ClientConfig, OB15Config
 
 
+@RobotConfig.register_subclass("ob15_arms")
 @dataclass
-class ArmsHoldOptions:
-    """Head/lift hold options shared by ``ob15_arms`` and ``ob15_arms_client``.
+class OB15ArmsConfig(OB15Config):
+    """OB15 controlled through the 12 arm/gripper joints only.
 
-    Head and lift are moved to a hold pose at connect and then held. Precedence: explicit flags
-    (``head_pan`` / ``head_tilt`` / ``lift_height_mm``) > ``hold_from`` (pose saved with a dataset or
-    policy) > named ``station`` > current positions at connect.
+    Same hardware fields as ``OB15Config`` (ports, cameras, lift axis...). No base command is sent (the
+    base driver reads that as zero velocity) and base/head/lift keys in an incoming action are dropped.
     """
 
+    # --- Head/lift hold pose. Precedence: explicit flags (head_pan / head_tilt / lift_height_mm)
+    # > hold_from > station > current positions at connect. ---
+    # Named pose in `stations_file`.
     station: str | None = None
     stations_file: str = "~/.ob15/stations.json"
+    # Explicit head/lift targets; each overrides hold_from and station for that axis.
     head_pan: float | None = None
     head_tilt: float | None = None
     lift_height_mm: float | None = None
+    # False = freeze head/lift where they are; ignore hold_from and station.
     hold_on_connect: bool = True
     # Dataset root / Hub dataset id / checkpoint dir / Hub model id holding `ob15_hold.json`.
     hold_from: str | None = None
     # Arm/gripper targets (ARM_KEYS) sent before the head/lift move to the hold pose.
     rest_pose: dict[str, float] | None = None
+    # Give up waiting for the hold pose after this long, and the tolerances for "reached".
     settle_timeout_s: float = 15.0
     lift_tol_mm: float = 5.0
     head_tol: float = 2.0
 
 
-@RobotConfig.register_subclass("ob15_arms")
-@dataclass
-class OB15ArmsConfig(ArmsHoldOptions, OB15Config):
-    """OB15 controlled through the 12 arm/gripper joints only.
-
-    No base command is sent (the base driver reads that as zero velocity) and base/head/lift keys in an
-    incoming action are dropped. See ``ArmsHoldOptions`` for the hold pose.
-    """
-
-
 @RobotConfig.register_subclass("ob15_arms_client")
 @dataclass
-class OB15ArmsClientConfig(ArmsHoldOptions, OB15ClientConfig):
+class OB15ArmsClientConfig(OB15ClientConfig):
     """Remote (ZMQ) arms-only OB15. The host keeps running the full-body ``ob15`` robot."""
+
+    # --- Head/lift hold pose. Precedence: explicit flags (head_pan / head_tilt / lift_height_mm)
+    # > hold_from > station > current positions at connect. ---
+    # Named pose in `stations_file`.
+    station: str | None = None
+    stations_file: str = "~/.ob15/stations.json"
+    # Explicit head/lift targets; each overrides hold_from and station for that axis.
+    head_pan: float | None = None
+    head_tilt: float | None = None
+    lift_height_mm: float | None = None
+    # False = freeze head/lift where they are; ignore hold_from and station.
+    hold_on_connect: bool = True
+    # Dataset root / Hub dataset id / checkpoint dir / Hub model id holding `ob15_hold.json`.
+    hold_from: str | None = None
+    # Arm/gripper targets (ARM_KEYS) sent before the head/lift move to the hold pose.
+    rest_pose: dict[str, float] | None = None
+    # Give up waiting for the hold pose after this long, and the tolerances for "reached".
+    settle_timeout_s: float = 15.0
+    lift_tol_mm: float = 5.0
+    head_tol: float = 2.0
