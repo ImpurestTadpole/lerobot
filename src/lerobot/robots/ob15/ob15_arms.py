@@ -15,6 +15,7 @@ from .arms_only import (
     arms_only_result,
     arms_state_features,
     build_arms_command,
+    build_hold_metadata,
     hold_keys,
     hold_reached,
     hold_source,
@@ -23,7 +24,6 @@ from .arms_only import (
     rest_pose_command,
 )
 from .config_ob15 import OB15ArmsConfig
-from .hold_file import build_hold_metadata
 from .ob15 import OB15
 
 logger = logging.getLogger(__name__)

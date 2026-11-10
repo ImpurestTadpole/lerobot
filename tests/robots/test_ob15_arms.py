@@ -321,7 +321,7 @@ def test_arms_client_connect_holds_station_then_reports_drift(tmp_path):
 import contextlib  # noqa: E402
 import logging  # noqa: E402
 
-from lerobot.robots.ob15 import hold_file as hf  # noqa: E402
+from lerobot.robots.ob15 import arms_only as hf  # noqa: E402
 from lerobot.robots.ob15.arms_only import hold_source, rest_pose_command  # noqa: E402
 
 HOLD = {"head_pan.pos": 0.0, "head_tilt.pos": -35.0, LIFT: 220.0}

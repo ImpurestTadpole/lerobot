@@ -649,8 +649,8 @@ def record(
         robot.connect()
 
         if dataset is not None and hasattr(robot, "hold_metadata"):
-            # OB15 arms-only: remember the head/lift hold pose with the dataset (see robots/ob15/hold_file.py).
-            from lerobot.robots.ob15.hold_file import write_hold_file
+            # OB15 arms-only: remember the head/lift hold pose with the dataset (see robots/ob15/arms_only.py).
+            from lerobot.robots.ob15.arms_only import write_hold_file
 
             robot_cfg = robot.config
             write_hold_file(
