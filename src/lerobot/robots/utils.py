@@ -56,11 +56,11 @@ def make_robot_from_config(config: RobotConfig) -> Robot:
 
         return OB15Client(config)
     elif config.type == "ob15_arms":
-        from .ob15.ob15_arms import OB15Arms
+        from .ob15_arms import OB15Arms
 
         return OB15Arms(config)
     elif config.type == "ob15_arms_client":
-        from .ob15.ob15_arms_client import OB15ArmsClient
+        from .ob15_arms import OB15ArmsClient
 
         return OB15ArmsClient(config)
     elif config.type == "lekiwi":

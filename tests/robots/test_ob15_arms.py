@@ -16,7 +16,9 @@
 
 """Tests for the arms-only OB15 robot types. Hardware and ZMQ are mocked."""
 
+import contextlib
 import json
+import logging
 from unittest.mock import MagicMock, patch
 
 import pytest
@@ -24,24 +26,22 @@ import pytest
 pytest.importorskip("zmq")
 
 from lerobot.robots import make_robot_from_config
-from lerobot.robots.ob15 import (
-    OB15,
+from lerobot.robots.ob15 import OB15, OB15Client, OB15ClientConfig
+from lerobot.robots.ob15_arms import (
     OB15Arms,
     OB15ArmsClient,
     OB15ArmsClientConfig,
     OB15ArmsConfig,
-    OB15Client,
-    OB15ClientConfig,
+    hold_file as hf,
 )
-from lerobot.robots.ob15.arms_only import (
+from lerobot.robots.ob15_arms.arms_only import (
     ARM_KEYS,
     BASE_KEYS,
     build_arms_command,
-    hold_reached,
-    hold_status,
-    resolve_hold_targets,
+    rest_pose_command,
 )
-from lerobot.robots.ob15.stations import load_station, save_station
+from lerobot.robots.ob15_arms.hold import hold_reached, hold_source, hold_status, resolve_hold_targets
+from lerobot.robots.ob15_arms.stations import load_station, save_station
 
 LIFT = "gantry.height_mm"
 _MODULE = "lerobot.robots.ob15.ob15"
@@ -318,11 +318,6 @@ def test_arms_client_connect_holds_station_then_reports_drift(tmp_path):
 
 # --- hold file / hold_from / rest_pose (task 10) ----------------------------------------------
 
-import contextlib  # noqa: E402
-import logging  # noqa: E402
-
-from lerobot.robots.ob15 import arms_only as hf  # noqa: E402
-from lerobot.robots.ob15.arms_only import hold_source, rest_pose_command  # noqa: E402
 
 HOLD = {"head_pan.pos": 0.0, "head_tilt.pos": -35.0, LIFT: 220.0}
 OBS = {"head_pan.pos": 10.0, "head_tilt.pos": -5.0, LIFT: 100.0}  # what _FakeHardware starts at
@@ -344,7 +339,7 @@ def _dataset_with_hold(root, hold=None):
 @contextlib.contextmanager
 def _connected(monkeypatch, hw=None, **cfg):
     """A connected OB15Arms on fake hardware; yields (robot, hw)."""
-    monkeypatch.setattr("lerobot.robots.ob15.ob15_arms.REST_POSE_WAIT_S", 0.0)
+    monkeypatch.setattr("lerobot.robots.ob15_arms.ob15_arms.REST_POSE_WAIT_S", 0.0)
     config = OB15ArmsConfig(cameras={}, **cfg)
     with patch(f"{_MODULE}.FeetechMotorsBus", side_effect=_make_bus):
         robot = OB15Arms(config)
@@ -729,7 +724,7 @@ def _client_with_fake_host(tmp_path, hw=None, **cfg):
         patch.object(OB15ArmsClient, "get_observation", fake_get_observation),
         patch.object(OB15ArmsClient, "_push", lambda self, command: hw.send_action(command)),
         patch.object(OB15Client, "disconnect", lambda self: None),
-        patch("lerobot.robots.ob15.ob15_arms_client.REST_POSE_WAIT_S", 0.0),
+        patch("lerobot.robots.ob15_arms.ob15_arms_client.REST_POSE_WAIT_S", 0.0),
     )
     return client, hw, patches
 
@@ -814,7 +809,7 @@ def full_dataset(tmp_path):
 
 
 def test_report_flags_only_episodes_where_head_or_lift_moved(full_dataset):
-    from lerobot.robots.ob15.scripts.convert_to_arms_only import report
+    from lerobot.robots.ob15_arms.scripts.convert_to_arms_only import report
 
     rows = report(full_dataset)
     assert [bool(r["flags"]) for r in rows] == [False, True]
@@ -827,7 +822,7 @@ def test_convert_to_arms_only_drops_base_and_keeps_arms(full_dataset, tmp_path):
     import numpy as np
 
     from lerobot.datasets import LeRobotDataset
-    from lerobot.robots.ob15.scripts.convert_to_arms_only import convert
+    from lerobot.robots.ob15_arms.scripts.convert_to_arms_only import convert
 
     out = convert(full_dataset, tmp_path / "arms", "test/ob15_arms")
     ds = LeRobotDataset("test/ob15_arms", root=out)
@@ -845,7 +840,7 @@ def test_convert_to_arms_only_drops_base_and_keeps_arms(full_dataset, tmp_path):
 
 
 def test_convert_refuses_to_overwrite(full_dataset, tmp_path):
-    from lerobot.robots.ob15.scripts.convert_to_arms_only import convert
+    from lerobot.robots.ob15_arms.scripts.convert_to_arms_only import convert
 
     (tmp_path / "exists").mkdir()
     with pytest.raises(FileExistsError):

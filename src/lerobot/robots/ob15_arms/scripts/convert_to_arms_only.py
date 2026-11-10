@@ -6,10 +6,10 @@ drops the base velocities. Cameras, depth, tasks and episodes are unchanged and 
 is never modified.
 
     # Which episodes moved the head/lift/base? (also shows where each episode ended vs started)
-    python -m lerobot.robots.ob15.scripts.convert_to_arms_only --src-repo-id me/ob15_full --report
+    python -m lerobot.robots.ob15_arms.scripts.convert_to_arms_only --src-repo-id me/ob15_full --report
 
     # Convert into a new dataset
-    python -m lerobot.robots.ob15.scripts.convert_to_arms_only \
+    python -m lerobot.robots.ob15_arms.scripts.convert_to_arms_only \
         --src-repo-id me/ob15_full --dst-repo-id me/ob15_arms
 """
 
@@ -24,7 +24,7 @@ from pathlib import Path
 import numpy as np
 import pandas as pd
 
-from lerobot.robots.ob15.arms_only import ARM_KEYS, BASE_KEYS, HEAD_KEYS, HEAD_TOL_DEG, LIFT_TOL_MM
+from lerobot.robots.ob15_arms.arms_only import ARM_KEYS, BASE_KEYS, HEAD_KEYS, HEAD_TOL_DEG, LIFT_TOL_MM
 
 STATE = "observation.state"
 ACTION = "action"
