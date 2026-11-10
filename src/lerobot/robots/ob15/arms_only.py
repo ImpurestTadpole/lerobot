@@ -7,9 +7,13 @@ never part of the action space even though the head/lift stay in the observation
 
 from __future__ import annotations
 
+import logging
 from typing import Any
 
+from .hold_file import read_hold_file
 from .stations import load_station
+
+logger = logging.getLogger(__name__)
 
 ARM_KEYS: tuple[str, ...] = (
     "left_arm_shoulder_pan.pos",
@@ -51,7 +55,10 @@ def hold_keys(lift_name: str | None) -> tuple[str, ...]:
 
 
 def resolve_hold_targets(config: Any, current_obs: dict[str, Any], lift_name: str | None) -> dict[str, float]:
-    """Head/lift targets to hold. Precedence: explicit overrides > named station > current obs."""
+    """Head/lift targets to hold.
+
+    Precedence: explicit overrides > ``hold_from`` file > named station > current obs.
+    """
     keys = hold_keys(lift_name)
     targets: dict[str, float] = {}
     for key in keys:
@@ -67,10 +74,23 @@ def resolve_hold_targets(config: Any, current_obs: dict[str, Any], lift_name: st
         missing = [k for k in keys if k not in station_values]
         if missing:
             # Not fatal: the current position is held for keys the station doesn't define.
-            import logging
-
-            logging.getLogger(__name__).warning(
+            logger.warning(
                 f"Station '{station}' has no value for {missing}; holding their current positions."
+            )
+
+    hold_from = getattr(config, "hold_from", None)
+    if hold_from:
+        saved = read_hold_file(hold_from)
+        extra = sorted(k for k in saved if k not in keys)
+        if extra:
+            logger.warning(f"hold_from={hold_from!r} has non-hold keys {extra}; ignoring them.")
+        for key in keys:
+            if key in saved:
+                targets[key] = saved[key]
+        missing = [k for k in keys if k not in saved]
+        if missing:
+            logger.warning(
+                f"hold_from={hold_from!r} has no value for {missing}; using station/current for them."
             )
 
     overrides = {
@@ -83,12 +103,44 @@ def resolve_hold_targets(config: Any, current_obs: dict[str, Any], lift_name: st
         if value is not None and key in keys:
             targets[key] = float(value)
 
+    logger.info(
+        "Hold targets %s (sources: flags=%s, hold_from=%s, station=%s)",
+        targets,
+        sorted(k for k, v in overrides.items() if v is not None and k in keys),
+        hold_from,
+        station,
+    )
     missing = [k for k in keys if k not in targets]
     if missing:
         raise ValueError(
             f"No hold target for {missing}: not in the current observation, a station or an override."
         )
     return targets
+
+
+def hold_source(config: Any) -> dict[str, Any]:
+    """How the hold pose was requested, for the metadata written next to a dataset."""
+    return {
+        "station": getattr(config, "station", None),
+        "hold_from": getattr(config, "hold_from", None),
+        "overrides": {
+            "head_pan": getattr(config, "head_pan", None),
+            "head_tilt": getattr(config, "head_tilt", None),
+            "lift_height_mm": getattr(config, "lift_height_mm", None),
+        },
+        "hold_on_connect": bool(getattr(config, "hold_on_connect", True)),
+    }
+
+
+def rest_pose_command(config: Any) -> dict[str, float] | None:
+    """Arm/gripper targets to send before the head/lift move, or None if no ``rest_pose``."""
+    rest = getattr(config, "rest_pose", None)
+    if not rest:
+        return None
+    bad = sorted(k for k in rest if k not in ARM_KEYS)
+    if bad:
+        raise ValueError(f"rest_pose may only contain arm/gripper keys {list(ARM_KEYS)}; got {bad}.")
+    return {k: float(v) for k, v in rest.items()}
 
 
 def hold_status(

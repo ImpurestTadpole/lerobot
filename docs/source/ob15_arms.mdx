@@ -26,8 +26,40 @@ save_station("~/.ob15/stations.json", "kitchen_counter",
              {"head_pan.pos": 0.0, "head_tilt.pos": -35.0, "gantry.height_mm": 220.0})
 ```
 
-Hold target precedence: explicit `--robot.head_pan / head_tilt / lift_height_mm` > `--robot.station` > the
-current pose at connect. `--robot.hold_on_connect=false` freezes the current pose and never moves to a station.
+Hold target precedence: explicit `--robot.head_pan / head_tilt / lift_height_mm` > `--robot.hold_from` >
+`--robot.station` > the current pose at connect. A key missing from a higher source falls back to the next one
+(the log line "Hold targets ..." shows which sources were used). `--robot.hold_on_connect=false` freezes the
+current pose and ignores `hold_from` and `station`.
+
+## The dataset remembers the hold pose (`hold_from`)
+
+- **Recording** with `ob15_arms` / `ob15_arms_client` writes the resolved head/lift pose to
+  `<dataset_root>/meta/ob15_hold.json` (also on resume). It is uploaded with `push_to_hub`. If the file already
+  exists with a different pose (beyond the tolerances) it is kept and a warning is logged; pass
+  `--dataset.overwrite_hold=true` to replace it.
+- **Training** (`lerobot-train`) copies it to `<checkpoint>/pretrained_model/ob15_hold.json` when the training
+  dataset has one (nothing happens for other datasets). A merged dataset only carries it if you copy
+  `meta/ob15_hold.json` into it.
+- **Inference**: `--robot.hold_from=<dataset or policy>` moves the head/lift to the saved pose. It accepts a
+  local dataset root, a checkpoint directory (or its `pretrained_model/`), the JSON file itself, a Hub dataset
+  id or a Hub model id. A local path that does not exist is tried as a Hub repo id.
+
+```json
+{"version": 1, "robot_type": "ob15_arms_client",
+ "hold": {"gantry.height_mm": 220.0, "head_pan.pos": 0.0, "head_tilt.pos": -35.0},
+ "source": {"station": null, "hold_from": null,
+            "overrides": {"head_pan": null, "head_tilt": -35.0, "lift_height_mm": 220.0},
+            "hold_on_connect": true},
+ "recorded_at": "2026-11-09T12:00:00+00:00"}
+```
+
+## Rest pose and tolerances
+
+- `--robot.rest_pose='{"left_arm_shoulder_lift.pos": -90, ...}'` (arm/gripper keys only, otherwise `ValueError`):
+  sent first with head and lift frozen where they are, then after about 2 s the head/lift move to the hold pose
+  while the rest pose keeps being sent. Use it to fold the arms clear of the body before the lift moves.
+- `--robot.settle_timeout_s` (default 15), `--robot.lift_tol_mm` (5) and `--robot.head_tol` (2 deg) decide when
+  the hold pose counts as reached at connect and when `check_hold()` reports drift.
 
 ## Commands
 
@@ -37,6 +69,9 @@ lerobot-record --robot.type=ob15_arms_client --robot.remote_ip=<jetson-ip> --rob
 
 # Run a policy
 lerobot-rollout --robot.type=ob15_arms_client --robot.remote_ip=<jetson-ip> --robot.station=kitchen_counter --policy.path=...
+
+# Restore the head/lift pose the policy's data was recorded with (dataset id, policy id or local path)
+lerobot-rollout --robot.type=ob15_arms_client --robot.remote_ip=<jetson-ip> --robot.hold_from=<user>/<dataset> --policy.path=...
 ```
 
 ## Checking head and lift

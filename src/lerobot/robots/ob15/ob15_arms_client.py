@@ -17,18 +17,22 @@ from .arms_only import (
     arms_only_result,
     arms_state_features,
     build_arms_command,
+    hold_keys,
     hold_reached,
+    hold_source,
     hold_status,
     resolve_hold_targets,
+    rest_pose_command,
 )
 from .config_ob15 import OB15ArmsClientConfig
+from .hold_file import build_hold_metadata
 from .ob15_client import OB15Client
 
 logger = logging.getLogger(__name__)
 
-HOLD_SETTLE_TIMEOUT_S = 15.0
 FIRST_OBS_TIMEOUT_S = 5.0
 HOLD_POLL_S = 0.1
+REST_POSE_WAIT_S = 2.0
 
 
 class OB15ArmsClient(OB15Client):
@@ -36,6 +40,7 @@ class OB15ArmsClient(OB15Client):
     name = "ob15_arms_client"
 
     def __init__(self, config: OB15ArmsClientConfig):
+        rest_pose_command(config)  # fail early on a bad rest_pose
         super().__init__(config)
         self._hold: dict[str, float] | None = None
 
@@ -67,25 +72,41 @@ class OB15ArmsClient(OB15Client):
 
     def connect(self) -> None:
         super().connect()
+        cfg = self.config
         current = self._wait_first_observation()
-        cfg = self.config if self.config.hold_on_connect else _NoTargets()
-        self._hold = resolve_hold_targets(cfg, current, self._lift_name)
+        # hold_on_connect=False: do not move to hold_from/station, just freeze head/lift where they are.
+        hold = resolve_hold_targets(cfg if cfg.hold_on_connect else _NoTargets(), current, self._lift_name)
+
+        rest = rest_pose_command(cfg)
+        if rest:
+            # Arms go to the rest pose first; head/lift stay where they are until that is done.
+            freeze = {k: float(current[k]) for k in hold_keys(self._lift_name) if k in current}
+            self._push(build_arms_command(rest, freeze))
+            time.sleep(REST_POSE_WAIT_S)
+
+        self._hold = hold
         logger.info(f"{self}: holding head/lift at {self._hold}")
 
-        deadline = time.monotonic() + HOLD_SETTLE_TIMEOUT_S
+        deadline = time.monotonic() + cfg.settle_timeout_s
         while True:
-            self._push(build_arms_command({}, self._hold))
+            self._push(build_arms_command(rest or {}, self._hold))
             self.get_observation()
-            status = hold_status(self.last_remote_state, self._hold)
+            status = hold_status(self.last_remote_state, self._hold, cfg.head_tol, cfg.lift_tol_mm)
             if hold_reached(status):
                 return
             if time.monotonic() >= deadline:
                 bad = {k: v for k, v in status.items() if not v["ok"]}
                 logger.warning(
-                    f"{self}: head/lift did not reach the hold pose within {HOLD_SETTLE_TIMEOUT_S}s: {bad}"
+                    f"{self}: head/lift did not reach the hold pose within {cfg.settle_timeout_s}s: {bad}"
                 )
                 return
             time.sleep(HOLD_POLL_S)
+
+    def hold_metadata(self) -> dict[str, Any]:
+        """Document for ``meta/ob15_hold.json``: the resolved hold pose and how it was requested."""
+        if self._hold is None:
+            raise DeviceNotConnectedError(f"{self} is not connected.")
+        return build_hold_metadata(self.name, self._hold, hold_source(self.config))
 
     def _push(self, command: dict[str, float]) -> None:
         self.zmq_cmd_socket.send_string(json.dumps(command))
@@ -106,7 +127,9 @@ class OB15ArmsClient(OB15Client):
         if self._hold is None:
             raise DeviceNotConnectedError(f"{self} is not connected.")
         self.get_observation()
-        status = hold_status(self.last_remote_state, self._hold)
+        status = hold_status(
+            self.last_remote_state, self._hold, self.config.head_tol, self.config.lift_tol_mm
+        )
         for key, entry in status.items():
             if not entry["ok"]:
                 logger.warning(f"{self}: {key} drifted from hold pose: {entry}")
@@ -127,3 +150,4 @@ class _NoTargets:
     head_pan = None
     head_tilt = None
     lift_height_mm = None
+    hold_from = None
