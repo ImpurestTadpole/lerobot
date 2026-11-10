@@ -1,12 +1,19 @@
 # OB15 arms-only control (`ob15_arms`)
 
-`ob15_arms` exposes only the **12 arm and gripper joints** as actions. It is one of two OB15 robot types:
-`ob15` (full body: arms, head, lift, base) for VR setup, navigation and recovery, and `ob15_arms` for recording
-tasks and running policies. In the usual setup both run on the robot computer (the Jetson) and the policy runs
-through remote inference, so ZMQ is not involved. The ZMQ types (`ob15_client`, `ob15_arms_client`) still exist
-for a PC-side client talking to an `ob15` host, and use the same hold options.
-The head and lift are moved to a hold pose at connect and then held; the base always gets zero velocity. The
-hold-pose code (station, `hold_from`, `rest_pose`, the dataset's `ob15_hold.json`) is part of `ob15_arms` only.
+OB15 has two robot types. They share the same low-level code (`OB15Arms` subclasses `OB15`); the arms-only
+type just leaves the base, head and lift out of what a policy or teleop can command.
+
+| | `ob15` | `ob15_arms` |
+|---|---|---|
+| Use for | VR setup, navigation, recovery | Recording tasks and running policies |
+| Actions | 18: arms, grippers, head, base velocity, lift | 12: arms and grippers |
+| Head and lift | Commanded by teleop/policy | Moved to a hold pose at connect, then re-commanded every tick |
+| Base | Commanded | No base command is sent, so the wheels stay at zero velocity |
+| Hold-pose code (`hold_from`, `station`, `rest_pose`, `ob15_hold.json`) | No | Yes (`arms_only.py`) |
+
+In the usual setup both run on the robot computer (the Jetson) and the policy runs through remote inference, so
+ZMQ is not involved. The ZMQ types (`ob15_client`, `ob15_arms_client`) still exist for a PC-side client talking
+to an `ob15` host, and use the same hold options.
 
 - **Action space:** 12 values (both arms and grippers).
 - **Observation state:** arms, grippers, head pan/tilt and lift height. No base velocity.

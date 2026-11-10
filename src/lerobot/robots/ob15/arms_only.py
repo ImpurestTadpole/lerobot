@@ -1,7 +1,7 @@
 """Shared key helpers for the arms-only OB15 robot (``ob15_arms``).
 
 The arms-only robot exposes 12 actions (both arms + grippers). Head pan/tilt and the lift are
-moved to a hold pose and then held, and the base always gets zero velocity, so those keys are
+moved to a hold pose and then held, and no base command is ever sent, so those keys are
 never part of the action space even though the head/lift stay in the observation.
 """
 
@@ -351,13 +351,14 @@ def hold_reached(status: dict[str, dict[str, float | bool]]) -> bool:
 
 
 def build_arms_command(action: dict[str, Any], hold: dict[str, float]) -> dict[str, float]:
-    """Arm keys from ``action`` + the hold targets + explicit zero base velocity.
+    """Arm keys from ``action`` + the hold targets. No base command is included.
 
-    Any base/head/lift keys in ``action`` are ignored.
+    Any base/head/lift keys in ``action`` are ignored. ``OB15.send_action`` reads a missing base key as
+    0.0 every tick (the smoothed base velocity decays to zero), so leaving the base out keeps the
+    wheels at zero velocity without arms-only code driving the base.
     """
     command: dict[str, float] = {k: float(action[k]) for k in ARM_KEYS if k in action}
     command.update(hold)
-    command.update(dict.fromkeys(BASE_KEYS, 0.0))
     return command
 
 
