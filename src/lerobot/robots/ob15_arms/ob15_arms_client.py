@@ -19,12 +19,10 @@ from .arms_only import (
     arms_state_features,
     build_arms_command,
     build_hold_metadata,
-    hold_keys,
     hold_reached,
     hold_source,
     hold_status,
     resolve_hold_targets,
-    rest_pose_command,
 )
 from .config_ob15_arms import OB15ArmsClientConfig
 
@@ -32,7 +30,6 @@ logger = logging.getLogger(__name__)
 
 FIRST_OBS_TIMEOUT_S = 5.0
 HOLD_POLL_S = 0.1
-REST_POSE_WAIT_S = 2.0
 
 
 class OB15ArmsClient(OB15Client):
@@ -40,7 +37,6 @@ class OB15ArmsClient(OB15Client):
     name = "ob15_arms_client"
 
     def __init__(self, config: OB15ArmsClientConfig):
-        rest_pose_command(config)  # fail early on a bad rest_pose
         super().__init__(config)
         self._hold: dict[str, float] | None = None
 
@@ -74,22 +70,15 @@ class OB15ArmsClient(OB15Client):
         super().connect()
         cfg = self.config
         current = self._wait_first_observation()
-        # hold_on_connect=False: do not move to hold_from/station, just freeze head/lift where they are.
+        # hold_on_connect=False: do not move to hold_from, just freeze head/lift where they are.
         hold = resolve_hold_targets(cfg if cfg.hold_on_connect else _NoTargets(), current, self._lift_name)
-
-        rest = rest_pose_command(cfg)
-        if rest:
-            # Arms go to the rest pose first; head/lift stay where they are until that is done.
-            freeze = {k: float(current[k]) for k in hold_keys(self._lift_name) if k in current}
-            self._push(build_arms_command(rest, freeze))
-            time.sleep(REST_POSE_WAIT_S)
 
         self._hold = hold
         logger.info(f"{self}: holding head/lift at {self._hold}")
 
         deadline = time.monotonic() + cfg.settle_timeout_s
         while True:
-            self._push(build_arms_command(rest or {}, self._hold))
+            self._push(build_arms_command({}, self._hold))
             self.get_observation()
             status = hold_status(self.last_remote_state, self._hold, cfg.head_tol, cfg.lift_tol_mm)
             if hold_reached(status):
@@ -146,7 +135,6 @@ class OB15ArmsClient(OB15Client):
 
 
 class _NoTargets:
-    station = None
     head_pan = None
     head_tilt = None
     lift_height_mm = None

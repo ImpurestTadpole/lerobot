@@ -1,5 +1,8 @@
 # Plan: `ob15_arms` robot type (arms-only control, station-held head/lift/base)
 
+> **Superseded in part:** the named stations (`stations.json`, `--robot.station`) and `rest_pose` described below were
+> removed. The hold pose is now: explicit flags > `hold_from` > current position. Code lives in `robots/ob15_arms/`.
+
 Branch: `ob15-arms-robot`. Execute on PC1. Do not change the existing `ob15` / `ob15_client` behavior.
 
 ## Goal

@@ -1,8 +1,8 @@
 """Everything the arms-only OB15 robots (``ob15_arms`` / ``ob15_arms_client``) share, in one place.
 
 1. Keys and commands: the 12 arm/gripper actions, the command sent to the robot (arms + hold pose, no
-   base command), and the ``rest_pose`` option.
-2. Hold pose: resolve the head/lift targets (flags > ``hold_from`` > station > current), check drift.
+   base command).
+2. Hold pose: resolve the head/lift targets (flags > ``hold_from`` > current), check drift.
 3. Hold file: ``<dataset>/meta/ob15_hold.json`` written when recording, copied into the checkpoint
    when training, read back by ``--robot.hold_from``. Format::
 
@@ -11,17 +11,12 @@
            "robot_type": "ob15_arms",
            "hold": {"gantry.height_mm": 220.0, "head_pan.pos": 0.0, "head_tilt.pos": -35.0},
            "source": {
-               "station": null,
                "hold_from": null,
                "overrides": {"head_pan": null, "head_tilt": -35.0, "lift_height_mm": 220.0},
                "hold_on_connect": true,
            },
            "recorded_at": "<ISO UTC>",
        }
-
-4. Stations: named head/lift poses in ``~/.ob15/stations.json``::
-
-       {"kitchen_counter": {"head_pan.pos": 0.0, "head_tilt.pos": -35.0, "gantry.height_mm": 220}}
 """
 
 from __future__ import annotations
@@ -79,17 +74,6 @@ def hold_keys(lift_name: str | None) -> tuple[str, ...]:
     return (*HEAD_KEYS, lift_key(lift_name)) if lift_name else HEAD_KEYS
 
 
-def rest_pose_command(config: Any) -> dict[str, float] | None:
-    """Arm/gripper targets to send before the head/lift move, or None if no ``rest_pose``."""
-    rest = getattr(config, "rest_pose", None)
-    if not rest:
-        return None
-    bad = sorted(k for k in rest if k not in ARM_KEYS)
-    if bad:
-        raise ValueError(f"rest_pose may only contain arm/gripper keys {list(ARM_KEYS)}; got {bad}.")
-    return {k: float(v) for k, v in rest.items()}
-
-
 def build_arms_command(action: dict[str, Any], hold: dict[str, float]) -> dict[str, float]:
     """Arm keys from ``action`` + the hold targets. No base command is included.
 
@@ -113,26 +97,13 @@ def arms_only_result(sent: dict[str, Any]) -> dict[str, Any]:
 def resolve_hold_targets(config: Any, current_obs: dict[str, Any], lift_name: str | None) -> dict[str, float]:
     """Head/lift targets to hold.
 
-    Precedence: explicit overrides > ``hold_from`` file > named station > current obs.
+    Precedence: explicit overrides > ``hold_from`` file > current obs.
     """
     keys = hold_keys(lift_name)
     targets: dict[str, float] = {}
     for key in keys:
         if key in current_obs:
             targets[key] = float(current_obs[key])
-
-    station = getattr(config, "station", None)
-    if station:
-        station_values = load_station(config.stations_file, station)
-        for key in keys:
-            if key in station_values:
-                targets[key] = station_values[key]
-        missing = [k for k in keys if k not in station_values]
-        if missing:
-            # Not fatal: the current position is held for keys the station doesn't define.
-            logger.warning(
-                f"Station '{station}' has no value for {missing}; holding their current positions."
-            )
 
     hold_from = getattr(config, "hold_from", None)
     if hold_from:
@@ -146,7 +117,7 @@ def resolve_hold_targets(config: Any, current_obs: dict[str, Any], lift_name: st
         missing = [k for k in keys if k not in saved]
         if missing:
             logger.warning(
-                f"hold_from={hold_from!r} has no value for {missing}; using station/current for them."
+                f"hold_from={hold_from!r} has no value for {missing}; using the current position for them."
             )
 
     overrides = {
@@ -160,16 +131,15 @@ def resolve_hold_targets(config: Any, current_obs: dict[str, Any], lift_name: st
             targets[key] = float(value)
 
     logger.info(
-        "Hold targets %s (sources: flags=%s, hold_from=%s, station=%s)",
+        "Hold targets %s (sources: flags=%s, hold_from=%s)",
         targets,
         sorted(k for k, v in overrides.items() if v is not None and k in keys),
         hold_from,
-        station,
     )
     missing = [k for k in keys if k not in targets]
     if missing:
         raise ValueError(
-            f"No hold target for {missing}: not in the current observation, a station or an override."
+            f"No hold target for {missing}: not in the current observation, hold_from or an override."
         )
     return targets
 
@@ -177,7 +147,6 @@ def resolve_hold_targets(config: Any, current_obs: dict[str, Any], lift_name: st
 def hold_source(config: Any) -> dict[str, Any]:
     """How the hold pose was requested, for the metadata written next to a dataset."""
     return {
-        "station": getattr(config, "station", None),
         "hold_from": getattr(config, "hold_from", None),
         "overrides": {
             "head_pan": getattr(config, "head_pan", None),
@@ -374,60 +343,3 @@ def copy_dataset_hold_to_checkpoint(dataset: Any, pretrained_dir: str | os.PathL
         logger.info(f"{len(roots)} datasets have an {HOLD_FILENAME}; not copying any to the checkpoint.")
         return False
     return copy_hold_file_to_checkpoint(roots[0], pretrained_dir)
-
-
-# --- 4. Stations ------------------------------------------------------------------------------
-
-DEFAULT_STATIONS_FILE = "~/.ob15/stations.json"
-
-
-def _resolve(path: str | os.PathLike) -> Path:
-    return Path(path).expanduser()
-
-
-def _read(path: Path) -> dict:
-    try:
-        with open(path, encoding="utf-8") as f:
-            data = json.load(f)
-    except FileNotFoundError as e:
-        raise FileNotFoundError(
-            f"Station file not found: {path}. Create it (see lerobot.robots.ob15_arms.arms_only) or pass "
-            "explicit --robot.head_pan/--robot.head_tilt/--robot.lift_height_mm values."
-        ) from e
-    except json.JSONDecodeError as e:
-        raise ValueError(f"Station file {path} is not valid JSON: {e}") from e
-    if not isinstance(data, dict):
-        raise ValueError(f"Station file {path} must contain a JSON object of station name -> pose.")
-    return data
-
-
-def load_station(path: str | os.PathLike, name: str) -> dict[str, float]:
-    """Return the head/lift values of station ``name`` as ``{key: float}``."""
-    path = _resolve(path)
-    data = _read(path)
-    if name not in data:
-        raise KeyError(f"Station '{name}' not found in {path}. Available: {sorted(data) or 'none'}.")
-    station = data[name]
-    if not isinstance(station, dict) or not station:
-        raise ValueError(f"Station '{name}' in {path} must be a non-empty object of key -> number.")
-    out: dict[str, float] = {}
-    for key, value in station.items():
-        if isinstance(value, bool) or not isinstance(value, (int, float)):
-            raise ValueError(f"Station '{name}' key '{key}' must be a number, got {value!r}.")
-        out[key] = float(value)
-    return out
-
-
-def save_station(path: str | os.PathLike, name: str, values: dict[str, float]) -> None:
-    """Create or overwrite station ``name``, keeping the other stations in the file."""
-    path = _resolve(path)
-    try:
-        data = _read(path)
-    except FileNotFoundError:
-        data = {}
-    data[name] = {k: float(v) for k, v in values.items()}
-    path.parent.mkdir(parents=True, exist_ok=True)
-    tmp = path.with_suffix(path.suffix + ".tmp")
-    with open(tmp, "w", encoding="utf-8") as f:
-        json.dump(data, f, indent=2, sort_keys=True)
-    os.replace(tmp, path)

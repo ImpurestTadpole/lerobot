@@ -41,10 +41,7 @@ from lerobot.robots.ob15_arms.arms_only import (
     hold_reached,
     hold_source,
     hold_status,
-    load_station,
     resolve_hold_targets,
-    rest_pose_command,
-    save_station,
 )
 
 LIFT = "gantry.height_mm"
@@ -87,10 +84,8 @@ class _FakeHardware:
 
 @pytest.fixture
 def arms_robot(tmp_path):
-    """A connected OB15Arms on a fake hardware layer, with station 'counter' defined."""
-    stations = tmp_path / "stations.json"
-    save_station(stations, "counter", {"head_pan.pos": 0.0, "head_tilt.pos": -35.0, LIFT: 220.0})
-    config = OB15ArmsConfig(cameras={}, station="counter", stations_file=str(stations))
+    """A connected OB15Arms on a fake hardware layer, holding head 0, tilt -35, lift 220 (set by flags)."""
+    config = OB15ArmsConfig(cameras={}, head_pan=0.0, head_tilt=-35.0, lift_height_mm=220.0)
     with patch(f"{_MODULE}.FeetechMotorsBus", side_effect=_make_bus):
         robot = OB15Arms(config)
     hw = _FakeHardware()
@@ -133,7 +128,7 @@ def test_get_observation_drops_base_keys(arms_robot):
 # --- hold behaviour ---------------------------------------------------------------------------
 
 
-def test_connect_moves_head_and_lift_to_the_station(arms_robot):
+def test_connect_moves_head_and_lift_to_the_hold_pose(arms_robot):
     _, hw = arms_robot
     assert hw.state["head_pan.pos"] == 0.0
     assert hw.state["head_tilt.pos"] == -35.0
@@ -174,9 +169,9 @@ def test_check_hold_reports_ok_then_detects_drift(arms_robot):
 
 
 def test_hold_on_connect_false_freezes_the_current_pose(tmp_path):
-    stations = tmp_path / "s.json"
-    save_station(stations, "counter", {"head_pan.pos": 0.0, "head_tilt.pos": -35.0, LIFT: 220.0})
-    config = OB15ArmsConfig(cameras={}, station="counter", stations_file=str(stations), hold_on_connect=False)
+    config = OB15ArmsConfig(
+        cameras={}, head_pan=0.0, head_tilt=-35.0, lift_height_mm=220.0, hold_on_connect=False
+    )
     with patch(f"{_MODULE}.FeetechMotorsBus", side_effect=_make_bus):
         robot = OB15Arms(config)
     hw = _FakeHardware()
@@ -188,21 +183,19 @@ def test_hold_on_connect_false_freezes_the_current_pose(tmp_path):
     ):
         robot.connect()
         robot.disconnect()  # inside the patch: Robot.__del__ would otherwise run the real disconnect
-    assert hw.state["head_pan.pos"] == 10.0  # not moved to the station
+    assert hw.state["head_pan.pos"] == 10.0  # not moved to the flag targets
     assert hw.state[LIFT] == 100.0
 
 
 # --- hold target resolution -------------------------------------------------------------------
 
 
-def test_override_beats_station_beats_current(tmp_path):
-    stations = tmp_path / "s.json"
-    save_station(stations, "a", {"head_pan.pos": 1.0, "head_tilt.pos": 2.0, LIFT: 3.0})
+def test_override_beats_current(tmp_path):
     current = {"head_pan.pos": 9.0, "head_tilt.pos": 9.0, LIFT: 9.0}
 
-    cfg = OB15ArmsConfig(cameras={}, station="a", stations_file=str(stations), head_tilt=7.0)
+    cfg = OB15ArmsConfig(cameras={}, head_tilt=7.0)
     got = resolve_hold_targets(cfg, current, "gantry")
-    assert got == {"head_pan.pos": 1.0, "head_tilt.pos": 7.0, LIFT: 3.0}
+    assert got == {"head_pan.pos": 9.0, "head_tilt.pos": 7.0, LIFT: 9.0}
 
     cfg = OB15ArmsConfig(cameras={})
     assert resolve_hold_targets(cfg, current, "gantry") == current
@@ -212,28 +205,6 @@ def test_lift_disabled_has_no_lift_target():
     cfg = OB15ArmsConfig(cameras={})
     got = resolve_hold_targets(cfg, {"head_pan.pos": 0.0, "head_tilt.pos": 0.0}, None)
     assert set(got) == {"head_pan.pos", "head_tilt.pos"}
-
-
-# --- stations ---------------------------------------------------------------------------------
-
-
-def test_station_loader_errors(tmp_path):
-    with pytest.raises(FileNotFoundError, match="Station file not found"):
-        load_station(tmp_path / "missing.json", "x")
-    path = tmp_path / "s.json"
-    save_station(path, "a", {"head_pan.pos": 1.0})
-    with pytest.raises(KeyError, match="Available"):
-        load_station(path, "nope")
-    path.write_text("not json")
-    with pytest.raises(ValueError, match="not valid JSON"):
-        load_station(path, "a")
-
-
-def test_save_station_keeps_other_stations(tmp_path):
-    path = tmp_path / "s.json"
-    save_station(path, "a", {"head_pan.pos": 1.0})
-    save_station(path, "b", {"head_pan.pos": 2.0})
-    assert json.loads(path.read_text()) == {"a": {"head_pan.pos": 1.0}, "b": {"head_pan.pos": 2.0}}
 
 
 def test_hold_status_flags_missing_observation_key():
@@ -285,12 +256,10 @@ def test_arms_client_sends_hold_and_no_base_over_zmq():
     assert set(result) == {*ARM_KEYS, "action"}
 
 
-def test_arms_client_connect_holds_station_then_reports_drift(tmp_path):
-    stations = tmp_path / "s.json"
-    save_station(stations, "counter", {"head_pan.pos": 0.0, "head_tilt.pos": -35.0, LIFT: 220.0})
+def test_arms_client_connect_holds_the_pose_then_reports_drift(tmp_path):
     client = OB15ArmsClient(
         OB15ArmsClientConfig(
-            remote_ip="127.0.0.1", cameras={}, station="counter", stations_file=str(stations)
+            remote_ip="127.0.0.1", cameras={}, head_pan=0.0, head_tilt=-35.0, lift_height_mm=220.0
         )
     )
     hw = _FakeHardware()
@@ -320,7 +289,7 @@ def test_arms_client_connect_holds_station_then_reports_drift(tmp_path):
     assert status["head_tilt.pos"]["ok"] is False
 
 
-# --- hold file / hold_from / rest_pose (task 10) ----------------------------------------------
+# --- hold file / hold_from ----------------------------------------------
 
 
 HOLD = {"head_pan.pos": 0.0, "head_tilt.pos": -35.0, LIFT: 220.0}
@@ -331,7 +300,7 @@ def _meta(hold=None, robot_type="ob15_arms_client"):
     return hf.build_hold_metadata(
         robot_type,
         hold or HOLD,
-        {"station": None, "hold_from": None, "overrides": {}, "hold_on_connect": True},
+        {"hold_from": None, "overrides": {}, "hold_on_connect": True},
     )
 
 
@@ -343,7 +312,6 @@ def _dataset_with_hold(root, hold=None):
 @contextlib.contextmanager
 def _connected(monkeypatch, hw=None, **cfg):
     """A connected OB15Arms on fake hardware; yields (robot, hw)."""
-    monkeypatch.setattr("lerobot.robots.ob15_arms.ob15_arms.REST_POSE_WAIT_S", 0.0)
     config = OB15ArmsConfig(cameras={}, **cfg)
     with patch(f"{_MODULE}.FeetechMotorsBus", side_effect=_make_bus):
         robot = OB15Arms(config)
@@ -460,44 +428,35 @@ def test_read_hold_file_hub_miss_raises(tmp_path):
 
 # 4. precedence (resolve_hold_targets, one test per level)
 def _cfg(tmp_path, **kw):
-    stations = tmp_path / "s.json"
-    save_station(stations, "a", {"head_pan.pos": 1.0, "head_tilt.pos": 2.0, LIFT: 3.0})
-    return OB15ArmsConfig(cameras={}, stations_file=str(stations), **kw)
+    return OB15ArmsConfig(cameras={}, **kw)
 
 
 def test_precedence_current_only(tmp_path):
     assert resolve_hold_targets(_cfg(tmp_path), OBS, "gantry") == OBS
 
 
-def test_precedence_station_over_current(tmp_path):
-    got = resolve_hold_targets(_cfg(tmp_path, station="a"), OBS, "gantry")
-    assert got == {"head_pan.pos": 1.0, "head_tilt.pos": 2.0, LIFT: 3.0}
-
-
-def test_precedence_hold_from_over_station(tmp_path):
+def test_precedence_hold_from_over_current(tmp_path):
     ds = _dataset_with_hold(tmp_path / "ds")
-    got = resolve_hold_targets(_cfg(tmp_path, station="a", hold_from=str(ds)), OBS, "gantry")
+    got = resolve_hold_targets(_cfg(tmp_path, hold_from=str(ds)), OBS, "gantry")
     assert got == HOLD
 
 
 def test_precedence_flag_over_hold_from(tmp_path, caplog):
     ds = _dataset_with_hold(tmp_path / "ds")
-    cfg = _cfg(tmp_path, station="a", hold_from=str(ds), lift_height_mm=180.0, head_pan=7.0)
+    cfg = _cfg(tmp_path, hold_from=str(ds), lift_height_mm=180.0, head_pan=7.0)
     with caplog.at_level(logging.INFO):
         got = resolve_hold_targets(cfg, OBS, "gantry")
     assert got == {"head_pan.pos": 7.0, "head_tilt.pos": -35.0, LIFT: 180.0}
     assert "sources" in caplog.text and str(ds) in caplog.text  # the log says where values came from
 
 
-def test_hold_from_missing_key_falls_back_to_station_then_current(tmp_path, caplog):
+def test_hold_from_missing_key_falls_back_to_current(tmp_path, caplog):
     path = tmp_path / "partial.json"
     path.write_text(json.dumps({"hold": {"head_tilt.pos": -20.0}}))
     with caplog.at_level(logging.WARNING):
-        got = resolve_hold_targets(_cfg(tmp_path, station="a", hold_from=str(path)), OBS, "gantry")
-    assert got == {"head_pan.pos": 1.0, "head_tilt.pos": -20.0, LIFT: 3.0}  # station fills the gaps
-    assert "no value for" in caplog.text
-    got = resolve_hold_targets(_cfg(tmp_path, hold_from=str(path)), OBS, "gantry")
+        got = resolve_hold_targets(_cfg(tmp_path, hold_from=str(path)), OBS, "gantry")
     assert got == {"head_pan.pos": 10.0, "head_tilt.pos": -20.0, LIFT: 100.0}  # current fills the gaps
+    assert "no value for" in caplog.text
 
 
 def test_hold_from_ignores_unknown_keys_with_warning(tmp_path, caplog):
@@ -533,35 +492,6 @@ def test_hold_on_connect_false_ignores_hold_from(tmp_path, monkeypatch):
     with _connected(monkeypatch, hold_from=str(ds), hold_on_connect=False) as (robot, hw):
         assert _hw_state(hw) == OBS
         assert robot._hold == OBS
-
-
-# 6. rest_pose
-@pytest.mark.hardware
-def test_rest_pose_sent_first_with_head_and_lift_frozen(tmp_path, monkeypatch):
-    ds = _dataset_with_hold(tmp_path / "ds")
-    rest = {"left_arm_shoulder_lift.pos": -90.0, "right_arm_gripper.pos": 12.0}
-    with _connected(monkeypatch, hold_from=str(ds), rest_pose=rest) as (_, hw):
-        first, second = hw.sent[0], hw.sent[1]
-        assert first["left_arm_shoulder_lift.pos"] == -90.0 and first["right_arm_gripper.pos"] == 12.0
-        assert {k: first[k] for k in OBS} == OBS  # head/lift have not moved yet
-        assert not set(BASE_KEYS) & set(first)
-        assert {k: second[k] for k in HOLD} == HOLD  # then the move
-        assert second["left_arm_shoulder_lift.pos"] == -90.0  # rest pose kept while settling
-        assert _hw_state(hw) == HOLD
-
-
-def test_rest_pose_rejects_non_arm_keys():
-    assert rest_pose_command(OB15ArmsConfig(cameras={})) is None
-    assert rest_pose_command(OB15ArmsConfig(cameras={}, rest_pose={ARM_KEYS[0]: 1})) == {ARM_KEYS[0]: 1.0}
-    for bad in ("head_tilt.pos", LIFT, "x.vel"):
-        with pytest.raises(ValueError, match="rest_pose"):
-            rest_pose_command(OB15ArmsConfig(cameras={}, rest_pose={bad: 0.0}))
-    with pytest.raises(
-        ValueError, match="rest_pose"
-    ):  # robots fail at construction, before touching hardware
-        OB15ArmsClient(
-            OB15ArmsClientConfig(remote_ip="127.0.0.1", cameras={}, rest_pose={"head_pan.pos": 0.0})
-        )
 
 
 # 7. settle uses the config
@@ -606,13 +536,12 @@ def test_settle_and_check_hold_use_config_tolerances(tmp_path, monkeypatch, capl
 # 8. hold_metadata
 @pytest.mark.hardware
 def test_hold_metadata_contents(tmp_path, monkeypatch):
-    with _connected(monkeypatch, station=None, head_tilt=-35.0, lift_height_mm=220.0) as (robot, _):
+    with _connected(monkeypatch, head_tilt=-35.0, lift_height_mm=220.0) as (robot, _):
         meta = robot.hold_metadata()
     assert meta["robot_type"] == "ob15_arms"
     assert meta["version"] == 1
     assert meta["hold"] == {"gantry.height_mm": 220.0, "head_pan.pos": 10.0, "head_tilt.pos": -35.0}
     assert meta["source"] == {
-        "station": None,
         "hold_from": None,
         "overrides": {"head_pan": None, "head_tilt": -35.0, "lift_height_mm": 220.0},
         "hold_on_connect": True,
@@ -634,9 +563,8 @@ def test_hold_metadata_requires_connection():
 
 
 def test_hold_source_reads_config_fields(tmp_path):
-    cfg = _cfg(tmp_path, station="a", hold_from="u/ds", head_pan=1.0, hold_on_connect=False)
+    cfg = _cfg(tmp_path, hold_from="u/ds", head_pan=1.0, hold_on_connect=False)
     assert hold_source(cfg) == {
-        "station": "a",
         "hold_from": "u/ds",
         "overrides": {"head_pan": 1.0, "head_tilt": None, "lift_height_mm": None},
         "hold_on_connect": False,
@@ -728,7 +656,6 @@ def _client_with_fake_host(tmp_path, hw=None, **cfg):
         patch.object(OB15ArmsClient, "get_observation", fake_get_observation),
         patch.object(OB15ArmsClient, "_push", lambda self, command: hw.send_action(command)),
         patch.object(OB15Client, "disconnect", lambda self: None),
-        patch("lerobot.robots.ob15_arms.ob15_arms_client.REST_POSE_WAIT_S", 0.0),
     )
     return client, hw, patches
 
@@ -754,19 +681,11 @@ def test_client_precedence_hold_from_then_flag(tmp_path):
     assert meta["source"]["hold_from"] == str(ds) and meta["source"]["overrides"]["head_tilt"] == -10.0
 
 
-def test_client_hold_on_connect_false_and_rest_pose(tmp_path):
+def test_client_hold_on_connect_false_freezes_current_pose(tmp_path):
     ds = _dataset_with_hold(tmp_path / "ds")
     client, hw, patches = _client_with_fake_host(tmp_path, hold_from=str(ds), hold_on_connect=False)
     _run_client(client, patches)
     assert _hw_state(hw) == OBS
-
-    rest = {"right_arm_shoulder_lift.pos": -80.0}
-    client, hw, patches = _client_with_fake_host(tmp_path, hold_from=str(ds), rest_pose=rest)
-    _run_client(client, patches)
-    assert hw.sent[0]["right_arm_shoulder_lift.pos"] == -80.0
-    assert {k: hw.sent[0][k] for k in OBS} == OBS  # frozen
-    assert {k: hw.sent[1][k] for k in HOLD} == HOLD
-    assert _hw_state(hw) == HOLD
 
 
 def test_client_settle_timeout_uses_config(tmp_path, caplog):
