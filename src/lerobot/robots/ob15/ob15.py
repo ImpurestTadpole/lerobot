@@ -1040,6 +1040,8 @@ class OB15(Robot):
         for bus in self._buses.values():
             bus.disconnect(self.config.disable_torque_on_disconnect)
         for cam in self.cameras.values():
-            cam.disconnect()
+            # A camera that failed to connect (connect() continues without it) is not connected here.
+            if cam.is_connected:
+                cam.disconnect()
 
         logger.info(f"{self} disconnected.")
