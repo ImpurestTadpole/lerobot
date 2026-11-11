@@ -49,6 +49,8 @@ class OB15Arms(OB15):
         # otherwise connect() would not find the existing calibration and start a manual one.
         if not config.calibration_dir:
             config.calibration_dir = HF_LEROBOT_CALIBRATION / ROBOTS / OB15.name
+        # Homing parks the lift at the top; do not release its torque afterwards (that lets it fall).
+        config.lift_axis.release_torque_after_home = False
         super().__init__(config)
         self._hold: dict[str, float] | None = None
 

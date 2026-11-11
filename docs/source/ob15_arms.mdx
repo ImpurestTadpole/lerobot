@@ -29,6 +29,10 @@ current pose at connect (the lift and head pan have no default and keep their cu
 "Hold targets ..." shows which sources were used). `--robot.hold_on_connect=false` freezes the current pose (no default tilt) and
 ignores `hold_from`.
 
+The lift is homed to the top at connect and **stays torqued there**. (Plain `ob15` releases the lift's torque after
+homing so gravity lowers it; `ob15_arms` sets `lift_axis.release_torque_after_home=False`.) With no
+`--robot.lift_height_mm` it holds at the homed top position.
+
 ## The dataset remembers the hold pose (`hold_from`)
 
 - **Recording** with `ob15_arms` writes the resolved head/lift pose to

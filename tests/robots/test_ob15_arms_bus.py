@@ -436,3 +436,46 @@ def test_disconnect_skips_cameras_that_never_connected(make_robot):
     robot.disconnect()
     up.disconnect.assert_called_once()
     down.disconnect.assert_not_called()
+
+
+class _HomingBus:
+    """Lift motor that moves with its commanded velocity and stalls at a hard stop (the top limit)."""
+
+    def __init__(self):
+        self.pos, self.vel, self.writes = 2000.0, 0.0, []
+        self.motors = {}
+
+    def write(self, item, motor, value, **kw):
+        self.writes.append((item, motor, value))
+        if item == "Goal_Velocity":
+            self.vel = float(value)
+
+    def read(self, item, motor, normalize=True, **kw):
+        if item == "Present_Position":
+            self.pos = min(self.pos + self.vel * 0.03, 3000.0)  # hard stop at 3000
+            return self.pos
+        return 0.0  # Present_Current
+
+
+@pytest.mark.parametrize(("release", "expect_torque_off"), [(True, True), (False, False)])
+def test_home_releases_lift_torque_only_when_asked(monkeypatch, release, expect_torque_off):
+    from lerobot.robots.ob15.lift_axis import LiftAxis, LiftAxisConfig
+
+    monkeypatch.setattr("lerobot.robots.ob15.lift_axis.time.sleep", lambda s: None)
+    bus = _HomingBus()
+    lift = LiftAxis(
+        LiftAxisConfig(enabled=True, home_on_connect=False, release_torque_after_home=release), bus
+    )
+    lift.configure()
+    lift.home()
+    assert lift._homed
+    torque_off = [w for w in bus.writes if w[:2] == ("Torque_Enable", "gantry") and w[2] == 0]
+    assert bool(torque_off) is expect_torque_off
+
+
+def test_ob15_arms_keeps_the_lift_torqued_after_homing(tmp_path):
+    with patch(_FB, side_effect=FakeBus):
+        robot = OB15Arms(OB15ArmsConfig(cameras={}, calibration_dir=tmp_path / "c"))
+        plain = OB15(OB15Config(cameras={}))
+    assert robot.lift_axis.cfg.release_torque_after_home is False
+    assert plain.lift_axis.cfg.release_torque_after_home is True  # ob15 keeps its original behaviour

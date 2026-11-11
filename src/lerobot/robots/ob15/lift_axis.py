@@ -78,6 +78,10 @@ class LiftAxisConfig:
     # Leave False for tasks where the policy needs to move the lift.
     freeze_after_home: bool = False
 
+    # After homing, cut the lift motor's torque so gravity pulls the lift down to a safe resting
+    # position (the original ob15 behaviour). Set False to keep the lift torqued and held at the top.
+    release_torque_after_home: bool = True
+
 
 class LiftAxis:
     """Gantry/Z-axis controller that plugs into an existing Feetech bus."""
@@ -380,13 +384,15 @@ class LiftAxis:
                     break
             logger.info(f"LiftAxis: backoff {moved_mm:.1f} mm from limit")
 
-        # Stop, then disable torque so gravity pulls lift down to safe position (home is at top)
+        # Stop, then (unless release_torque_after_home is False) disable torque so gravity pulls the
+        # lift down to a safe position (home is at top)
         self._bus.write("Goal_Velocity", name, 0)
         time.sleep(0.5)
-        try:
-            self._bus.write("Torque_Enable", name, 0)
-        except Exception:
-            pass
+        if self.cfg.release_torque_after_home:
+            try:
+                self._bus.write("Torque_Enable", name, 0)
+            except Exception:
+                pass
 
         self._update_extended_ticks()
         self._z0_deg = self._extended_deg()
