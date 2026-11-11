@@ -17,7 +17,7 @@ def test_invalid_pixels_are_black_and_valid_ones_are_not():
 
 
 def test_near_and_far_get_different_colours_and_clamp():
-    near, far = colorize_depth(np.full((4, 4), 200.0)), colorize_depth(np.full((4, 4), 3000.0))
+    near, far = colorize_depth(np.full((4, 4), 200.0)), colorize_depth(np.full((4, 4), 1500.0))
     assert not np.array_equal(near[0, 0], far[0, 0])
     assert np.array_equal(colorize_depth(np.full((4, 4), 50_000.0)), far)  # beyond far clamps to far
     assert np.array_equal(colorize_depth(np.full((4, 4), 100.0)), near)  # nearer than near clamps to near
