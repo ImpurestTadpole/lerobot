@@ -242,7 +242,7 @@ def test_observation_and_action_spaces_have_no_base(make_robot):
 def test_no_flags_tilts_the_head_down_and_holds_pan_and_lift(make_robot):
     robot = make_robot()
     obs = robot.get_observation()
-    assert obs["head_tilt.pos"] == pytest.approx(DEFAULT_HEAD_TILT_DEG) == pytest.approx(47.0)
+    assert obs["head_tilt.pos"] == pytest.approx(DEFAULT_HEAD_TILT_DEG) == pytest.approx(65.0)
     assert obs["head_pan.pos"] == pytest.approx(10.0)  # no default: the current pan is kept
 
 
