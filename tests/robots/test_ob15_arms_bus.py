@@ -67,8 +67,9 @@ class FakeBus:
     def connect(self, *a, **k):
         self.is_connected = True
 
-    def disconnect(self, *a, **k):
+    def disconnect(self, disable_torque=True, *a, **k):
         self.is_connected = False
+        self.torque_released = sorted(self.motors) if disable_torque else []
 
     def __getattr__(self, name):  # torque, configure_motors, write_calibration... are no-ops
         mock = MagicMock(name=name)
@@ -478,3 +479,22 @@ def test_ob15_arms_keeps_the_lift_torqued_after_homing(tmp_path):
         plain = OB15(OB15Config(cameras={}))
     assert robot.lift_axis.cfg.release_torque_after_home is False
     assert plain.lift_axis.cfg.release_torque_after_home is True  # ob15 keeps its original behaviour
+
+
+def test_disconnect_releases_the_arms_but_keeps_the_lift_torqued(make_robot):
+    robot = make_robot(disable_torque_on_disconnect=True)
+    lift_bus = robot._group_bus["lift"]
+    robot.send_action(_arm_action())
+    robot.disconnect()
+    assert "gantry" not in lift_bus.torque_released  # the lift is never released (it would fall)
+    assert {"right_arm_gripper", "head_tilt"} <= set(lift_bus.torque_released)  # everything else is
+    assert "gantry" in lift_bus.motors  # and the bus is left as it was
+    stops = [v["gantry"] for item, v in lift_bus.writes if item == "Goal_Velocity" and "gantry" in v]
+    assert stops and stops[-1] == 0  # stopped, not left moving
+
+
+def test_disconnect_with_torque_kept_changes_nothing(make_robot):
+    robot = make_robot(disable_torque_on_disconnect=False)
+    lift_bus = robot._group_bus["lift"]
+    robot.disconnect()
+    assert lift_bus.torque_released == []

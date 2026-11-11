@@ -137,7 +137,19 @@ class OB15Arms(OB15):
             except Exception as e:  # never block a disconnect on the diagnostic
                 logger.debug(f"hold check at disconnect failed: {e}")
         self._hold = None
-        super().disconnect()
+        # disable_torque_on_disconnect releases every motor on a bus, which would let the lift fall. Stop the lift,
+        # then hide it from the bus while the others are released, so it stays torqued where it is.
+        lift_bus, lift = self._group_bus.get("lift"), self._lift_name
+        keep_lift = bool(lift and lift_bus is not None and lift in lift_bus.motors and self.is_connected)
+        if keep_lift and self.config.disable_torque_on_disconnect:
+            self.lift_axis.stop()
+            lift_motor = lift_bus.motors.pop(lift)
+            try:
+                super().disconnect()
+            finally:
+                lift_bus.motors[lift] = lift_motor
+        else:
+            super().disconnect()
 
 
 class _NoTargets:
