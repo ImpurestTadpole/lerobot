@@ -34,7 +34,7 @@ import numpy as np
 INVALID_BELOW_MM = 15.0
 
 
-def colorize_depth(depth_mm: np.ndarray, near_mm: float = 200.0, far_mm: float = 3000.0) -> np.ndarray:
+def colorize_depth(depth_mm: np.ndarray, near_mm: float = 200.0, far_mm: float = 1500.0) -> np.ndarray:
     """(H, W) or (1, H, W) depth in mm -> (H, W, 3) uint8 RGB. Near is red, far is blue, invalid is black."""
     import cv2
 
@@ -55,7 +55,7 @@ def export_preview(
     episode: int = 0,
     camera: str = "observation.images.head_depth",
     near_mm: float = 200.0,
-    far_mm: float = 3000.0,
+    far_mm: float = 1500.0,
     with_rgb: bool = False,
 ) -> int:
     """Write the preview and return the number of frames."""
@@ -109,7 +109,7 @@ def main() -> None:
     p.add_argument("--camera", default="observation.images.head_depth")
     p.add_argument("--out", type=Path, default=Path("depth_preview.mp4"))
     p.add_argument("--near-mm", type=float, default=200.0)
-    p.add_argument("--far-mm", type=float, default=3000.0)
+    p.add_argument("--far-mm", type=float, default=1500.0)
     p.add_argument("--with-rgb", action="store_true", help="put the matching RGB camera beside the depth")
     a = p.parse_args()
     n = export_preview(a.repo_id, a.out, a.root, a.episode, a.camera, a.near_mm, a.far_mm, a.with_rgb)
