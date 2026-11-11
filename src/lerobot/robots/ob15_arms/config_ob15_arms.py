@@ -41,6 +41,10 @@ class OB15ArmsConfig(OB15Config):
     settle_timeout_s: float = 15.0
     lift_tol_mm: float = 5.0
     head_tol: float = 2.0
+    # Anti-flicker (see robots/ob15/camera_tuning.py): 60 Hz mains = 120 Hz light flicker; 8.33 ms is one period.
+    # Set camera_power_line_hz=50 on 50 Hz mains, or None / wrist_exposure_ms=None to leave the cameras alone.
+    camera_power_line_hz: int | None = 60
+    wrist_exposure_ms: float | None = 8.33
 
 
 @RobotConfig.register_subclass("ob15_arms_client")

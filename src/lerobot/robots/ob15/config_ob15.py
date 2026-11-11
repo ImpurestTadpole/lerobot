@@ -163,6 +163,9 @@ class OB15Config(RobotConfig):
     port2: str | None = None
 
     camera_start_order: tuple[str, ...] | None = ("head", "left_wrist", "right_wrist")
+    # Anti-flicker for the cameras (see camera_tuning.py). None leaves the camera defaults alone.
+    camera_power_line_hz: int | None = None  # 50 or 60: the mains frequency of the lights
+    wrist_exposure_ms: float | None = None  # lock the wrist (OpenCV) cameras to this exposure; 8.33 = one 120 Hz flicker period
     camera_start_delay_s: float = 2.0  # Increased delay to allow cameras to initialize properly (especially right_wrist)
     disable_torque_on_disconnect: bool = True
 
