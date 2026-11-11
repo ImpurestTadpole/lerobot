@@ -92,3 +92,28 @@ python -m lerobot.data_processing.convert_to_arms_only --src-repo-id me/ob15_ful
 This writes a new dataset (the source is untouched) whose `action` has the 12 arm keys and whose
 `observation.state` has no base velocity, and recomputes the stats. Check the `--report` output first and consider
 dropping episodes where the head or lift moved a lot.
+
+## Looking at the depth camera
+
+Depth is stored as lossless 12-bit HEVC (`gray12le`, mm on a log scale). Browsers cannot decode that, so the
+Hugging Face dataset visualizer shows an empty `head_depth` panel even though the data is fine. Export a
+colour-mapped preview (near = red, far = blue, no reading = black) that plays anywhere:
+
+```bash
+python -m lerobot.data_processing.depth_preview --repo-id <user/dataset> --episode 0 --with-rgb --out depth_preview.mp4
+```
+
+## Control rate on the Jetson
+
+Measured on the Orin Nano with `ob15_arms` (2 short episodes, 3 cameras + depth, 30 Hz target):
+
+| head RGB | frame saving | control rate |
+|---|---|---|
+| 640x360 | PNG (default) | 29.6 Hz |
+| 960x540 | PNG (default) | 29.6 Hz |
+| 1280x720 | PNG (default) | 25.3 Hz |
+| 1280x720 | `--dataset.streaming_encoding=true` | 20.7 Hz |
+| 640x360 | `--dataset.streaming_encoding=true` | 24.4 Hz |
+
+Keep the default PNG saving: the Orin Nano has no hardware video encoder, so streaming encoding runs inside
+the control loop and makes it slower. 960x540 is the largest head image that still holds 30 Hz.
