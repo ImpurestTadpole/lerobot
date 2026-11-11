@@ -14,6 +14,7 @@ from lerobot.utils.errors import DeviceNotConnectedError
 
 from ..ob15.ob15_client import OB15Client
 from .arms_only import (
+    DEFAULT_HEAD_TILT_DEG,
     arms_action_features,
     arms_only_result,
     arms_state_features,
@@ -22,7 +23,6 @@ from .arms_only import (
     hold_reached,
     hold_source,
     hold_status,
-    DEFAULT_HEAD_TILT_DEG,
     resolve_hold_targets,
 )
 from .config_ob15_arms import OB15ArmsClientConfig
