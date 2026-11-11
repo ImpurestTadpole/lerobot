@@ -47,6 +47,15 @@ class OB15ArmsConfig(OB15Config):
     # Set camera_power_line_hz=50 on 50 Hz mains, or None / wrist_exposure_ms=None to leave the cameras alone.
     camera_power_line_hz: int | None = 60
     wrist_exposure_ms: float | None = 8.33
+    # Lift motor protection. The lift stays torqued holding the arms, so it is watched: warn at lift_temp_warn_c and
+    # release its torque at lift_temp_stop_c (it will lower; None disables). lift_stall_guard_s: stop driving a lift
+    # that is not moving (a command pushing against a stop overheats the motor); 0 disables.
+    lift_temp_warn_c: float = 55.0
+    lift_temp_stop_c: float | None = 65.0
+    lift_health_period_s: float = 5.0
+    lift_stall_guard_s: float = 3.0
+    # True: release the lift's torque when a session ends (it lowers). False: keep it holding at the top.
+    release_lift_on_disconnect: bool = False
 
 
 @RobotConfig.register_subclass("ob15_arms_client")

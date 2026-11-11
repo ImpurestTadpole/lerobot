@@ -24,7 +24,7 @@ to an `ob15` host, and use the same hold options.
 ## Hold pose
 
 Hold target precedence: explicit `--robot.head_pan / head_tilt / lift_height_mm` > `--robot.hold_from` > the
-default head tilt of **+65** (head tilt is in -100..+100 units across the calibrated range, positive = down;
+default head tilt of **+62** (head tilt is in -100..+100 units across the calibrated range, positive = down;
 kept 5 units inside the end of the range) (camera angled down at the table; positive tilt is down, negative is up) > the
 current pose at connect (the lift and head pan have no default and keep their current position). A key missing from a higher source falls back to the next one (the log line
 "Hold targets ..." shows which sources were used). `--robot.hold_on_connect=false` freezes the current pose (no default tilt) and
@@ -120,3 +120,16 @@ Measured on the Orin Nano with `ob15_arms` (2 short episodes, 3 cameras + depth,
 
 Keep the default PNG saving: the Orin Nano has no hardware video encoder, so streaming encoding runs inside
 the control loop and makes it slower. 960x540 is the largest head image that still holds 30 Hz.
+
+## Lift motor protection
+
+The lift motor holds the arms' weight, so it is protected against overheating:
+
+- **Stall guard** (`--robot.lift_stall_guard_s`, default 3): if the lift is being driven but has not moved 0.3 mm for
+  that long (a command pushing against the top stop or a jam), it stops driving for 10 s.
+- **Temperature guard** (checked every `--robot.lift_health_period_s`, default 5 s): a warning at
+  `--robot.lift_temp_warn_c` (55 C); at `--robot.lift_temp_stop_c` (65 C, `None` disables) the lift's torque is released
+  so it cannot burn out. The lift then lowers, and `ob15_arms` does not command it again until the next connect.
+- **End of session**: the lift stays torqued at the top and a warning says so. Cut the robot's power when you walk
+  away, or pass `--robot.release_lift_on_disconnect=true` to let it lower on exit instead.
+- The top is approached no closer than 1 mm (`soft_min_mm`), and homing's brief stall at the hard stop is unchanged.

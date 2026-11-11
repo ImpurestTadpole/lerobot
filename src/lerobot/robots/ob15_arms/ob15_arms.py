@@ -55,9 +55,13 @@ class OB15Arms(OB15):
         config.lift_axis.release_torque_after_home = False
         # 0 mm is the top hard stop itself (not the point homing backs off to), and 0 is reachable.
         config.lift_axis.zero_at_limit = True
-        config.lift_axis.soft_min_mm = 0.0
+        config.lift_axis.soft_min_mm = 1.0  # never commands the last millimetre against the stop
+        config.lift_axis.stall_guard_s = config.lift_stall_guard_s
         super().__init__(config)
         self._hold: dict[str, float] | None = None
+        self._lift_released = False  # True once the thermal guard has released the lift's torque
+        self._last_health_check = 0.0
+        self._last_temp_warning = 0.0
 
     @property
     def _lift_name(self) -> str | None:
@@ -73,6 +77,8 @@ class OB15Arms(OB15):
 
     def connect(self, calibrate: bool = True) -> None:
         super().connect(calibrate)
+        self._lift_released = False
+        self._last_health_check = time.monotonic()
         self._establish_hold()
 
     def _read_pose(self) -> dict[str, Any]:
@@ -134,8 +140,39 @@ class OB15Arms(OB15):
     def send_action(self, action: dict[str, Any]) -> dict[str, Any]:
         if self._hold is None:
             raise DeviceNotConnectedError(f"{self} is not connected.")
-        sent = super().send_action(build_arms_command(action, self._hold))
+        self._check_lift_health()
+        hold = self._hold
+        if self._lift_released:  # the thermal guard let go of the lift: do not command it again
+            hold = {k: v for k, v in hold.items() if k != f"{self._lift_name}.height_mm"}
+        sent = super().send_action(build_arms_command(action, hold))
         return arms_only_result(sent)
+
+    def _check_lift_health(self) -> None:
+        """Every lift_health_period_s: warn when the lift motor runs hot, release it before it can burn out."""
+        cfg, name = self.config, self._lift_name
+        now = time.monotonic()
+        if not name or self._lift_released or now - self._last_health_check < cfg.lift_health_period_s:
+            return
+        self._last_health_check = now
+        try:
+            temp = float(self._group_bus["lift"].read("Present_Temperature", name, normalize=False))
+        except Exception as e:  # a failed read is not a reason to stop recording
+            logger.debug(f"lift temperature read failed: {e}")
+            return
+        if cfg.lift_temp_stop_c is not None and temp >= cfg.lift_temp_stop_c:
+            logger.error(
+                f"{self}: lift motor at {temp:.0f} C (limit {cfg.lift_temp_stop_c:.0f} C) -- releasing its torque "
+                "to protect it. The lift will lower; let it cool before continuing."
+            )
+            self.lift_axis.stop()
+            try:
+                self._group_bus["lift"].write("Torque_Enable", name, 0, normalize=False)
+            except Exception as e:
+                logger.error(f"could not release the lift torque: {e}")
+            self._lift_released = True
+        elif temp >= cfg.lift_temp_warn_c and now - self._last_temp_warning > 60.0:
+            self._last_temp_warning = now
+            logger.warning(f"{self}: lift motor is warm: {temp:.0f} C (warning {cfg.lift_temp_warn_c:.0f} C)")
 
     def check_hold(self) -> dict[str, dict[str, float | bool]]:
         """Head/lift drift vs the hold pose right now. Call at the end of a task or episode."""
@@ -158,7 +195,15 @@ class OB15Arms(OB15):
         # then hide it from the bus while the others are released, so it stays torqued where it is.
         lift_bus, lift = self._group_bus.get("lift"), self._lift_name
         keep_lift = bool(lift and lift_bus is not None and lift in lift_bus.motors and self.is_connected)
-        if keep_lift and self.config.disable_torque_on_disconnect:
+        if (
+            keep_lift
+            and self.config.disable_torque_on_disconnect
+            and not self.config.release_lift_on_disconnect
+        ):
+            logger.warning(
+                f"{self}: the lift motor is left torqued, holding the arms at the top. Cut the robot's power when "
+                "you walk away, or pass --robot.release_lift_on_disconnect=true to let it lower on exit."
+            )
             self.lift_axis.stop()
             lift_motor = lift_bus.motors.pop(lift)
             try:
