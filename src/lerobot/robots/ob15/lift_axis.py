@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import contextlib
 import logging
 import time
 from dataclasses import dataclass
@@ -86,6 +87,13 @@ class LiftAxisConfig:
     # home_backoff_mm below the hard stop. True: at the hard stop itself, so 0 mm is the top.
     zero_at_limit: bool = False
 
+    # Stall guard (0 = off, the original ob15 behaviour). If the lift has been driven for stall_guard_s seconds
+    # without moving stall_move_mm, stop driving it for stall_halt_s seconds: a motor pushing against a hard stop or
+    # a jam with a command that is never satisfied overheats.
+    stall_guard_s: float = 0.0
+    stall_move_mm: float = 0.3
+    stall_halt_s: float = 10.0
+
 
 class LiftAxis:
     """Gantry/Z-axis controller that plugs into an existing Feetech bus."""
@@ -106,6 +114,9 @@ class LiftAxis:
 
         self._cached_height_mm: float = 0.0
         self._cached_velocity: float = 0.0
+        self._drive_since: float | None = None  # stall guard: when the current drive command began
+        self._drive_ref_mm: float = 0.0
+        self._stall_halt_until: float = 0.0
         self._velocity_alpha: float = 0.3
         self._filtered_velocity: float = 0.0
 
@@ -276,13 +287,20 @@ class LiftAxis:
             err = target_mm - cur_mm
             abs_err = abs(err)
 
+            now = time.monotonic()
+            if now < self._stall_halt_until:  # the stall guard stopped the lift; let it rest
+                self._bus.write("Goal_Velocity", self.cfg.name, 0)
+                return
+
             # Soft limits — clamp at range boundaries regardless of zone
             at_ceiling = cur_mm <= self.cfg.soft_min_mm and err < 0
             at_floor = cur_mm >= self.cfg.soft_max_mm and err > 0
             if at_ceiling or at_floor:
+                self._drive_since = None
                 self._bus.write("Goal_Velocity", self.cfg.name, 0)
             elif abs_err <= self.cfg.on_target_mm:
                 # Zone A
+                self._drive_since = None
                 self._bus.write("Goal_Velocity", self.cfg.name, 0)
             else:
                 if abs_err < self.cfg.near_target_threshold_mm:
@@ -298,6 +316,20 @@ class LiftAxis:
                     v_limit = int(self.cfg.v_max * self.cfg.max_cmd_vel_frac)
                     v_cmd = self.cfg.kp_vel * err
                     v_cmd = max(-float(v_limit), min(float(v_limit), v_cmd))
+
+                if self.cfg.stall_guard_s > 0:
+                    if self._drive_since is None or abs(cur_mm - self._drive_ref_mm) >= self.cfg.stall_move_mm:
+                        self._drive_since, self._drive_ref_mm = now, cur_mm  # moving (or just started)
+                    elif now - self._drive_since >= self.cfg.stall_guard_s:
+                        self._bus.write("Goal_Velocity", self.cfg.name, 0)
+                        self._stall_halt_until = now + self.cfg.stall_halt_s
+                        self._drive_since = None
+                        logger.error(
+                            f"LiftAxis: driven for {self.cfg.stall_guard_s:.0f}s without moving "
+                            f"(at {cur_mm:.1f} mm, target {target_mm:.1f} mm) -- stopping for "
+                            f"{self.cfg.stall_halt_s:.0f}s to protect the motor"
+                        )
+                        return
 
                 sign = -1 if self.cfg.home_at_top else 1
                 self._bus.write(
@@ -396,10 +428,8 @@ class LiftAxis:
         self._bus.write("Goal_Velocity", name, 0)
         time.sleep(0.5)
         if self.cfg.release_torque_after_home:
-            try:
+            with contextlib.suppress(Exception):
                 self._bus.write("Torque_Enable", name, 0)
-            except Exception:
-                pass
 
         self._update_extended_ticks()
         self._z0_deg = stall_deg if self.cfg.zero_at_limit else self._extended_deg()

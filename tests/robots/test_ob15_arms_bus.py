@@ -80,6 +80,8 @@ class FakeBus:
         return self.pos.setdefault(motor, 0.0)
 
     def read(self, item, motor, normalize=True, num_retry=0):
+        if item == "Present_Temperature":
+            return getattr(self, "temp_c", 35.0)
         return self._pos(motor) if item == "Present_Position" else self.vel.get(motor, 0.0)
 
     def sync_read(self, item, motors=None, normalize=True, num_retry=0):
@@ -242,7 +244,7 @@ def test_observation_and_action_spaces_have_no_base(make_robot):
 def test_no_flags_tilts_the_head_down_and_holds_pan_and_lift(make_robot):
     robot = make_robot()
     obs = robot.get_observation()
-    assert obs["head_tilt.pos"] == pytest.approx(DEFAULT_HEAD_TILT_DEG) == pytest.approx(65.0)
+    assert obs["head_tilt.pos"] == pytest.approx(DEFAULT_HEAD_TILT_DEG) == pytest.approx(62.0)
     assert obs["head_pan.pos"] == pytest.approx(10.0)  # no default: the current pan is kept
 
 
@@ -518,7 +520,7 @@ def test_ob15_arms_zeroes_the_lift_at_the_top_and_can_reach_zero(tmp_path):
     with patch(_FB, side_effect=FakeBus):
         robot = OB15Arms(OB15ArmsConfig(cameras={}, calibration_dir=tmp_path / "c"))
     assert robot.lift_axis.cfg.zero_at_limit is True
-    assert robot.lift_axis.cfg.soft_min_mm == 0.0
+    assert robot.lift_axis.cfg.soft_min_mm == 1.0  # one millimetre of margin so it never presses the stop
 
 
 def test_no_flags_holds_the_lift_at_the_top(make_robot):
@@ -548,3 +550,118 @@ def test_default_head_tilt_stays_inside_the_end_of_the_range(make_robot, monkeyp
         id=8, drive_mode=0, homing_offset=0, range_min=1500, range_max=2181
     )  # +-29.9 deg
     assert robot._default_head_tilt() == pytest.approx(29.9 - 2.0, abs=0.2)
+
+
+class _StuckBus:
+    """A lift motor that never moves, whatever it is commanded (pushing against a stop / a jam)."""
+
+    def __init__(self):
+        self.writes, self.motors = [], {}
+
+    def write(self, item, motor, value, **kw):
+        self.writes.append((item, motor, value))
+
+    def read(self, item, motor, normalize=True, **kw):
+        return 3000.0 if item == "Present_Position" else 0.0
+
+
+def _stuck_lift(stall_guard_s, monkeypatch):
+    from lerobot.robots.ob15.lift_axis import LiftAxis, LiftAxisConfig
+
+    clock = {"t": 1000.0}
+    monkeypatch.setattr("lerobot.robots.ob15.lift_axis.time.monotonic", lambda: clock["t"])
+    bus = _StuckBus()
+    lift = LiftAxis(LiftAxisConfig(enabled=True, home_on_connect=False, stall_guard_s=stall_guard_s), bus)
+    lift.configure()
+    lift._homed = True
+    return lift, bus, clock
+
+
+def _drive(lift, bus, clock, seconds, target=100.0, step=0.1):
+    out = []
+    for _ in range(int(seconds / step)):
+        clock["t"] += step
+        n = len(bus.writes)
+        lift.apply_action({"gantry.height_mm": target})
+        out += [w[2] for w in bus.writes[n:] if w[0] == "Goal_Velocity"]
+    return out
+
+
+def test_stall_guard_stops_a_lift_that_is_driven_but_not_moving(monkeypatch):
+    lift, bus, clock = _stuck_lift(3.0, monkeypatch)
+    first = _drive(lift, bus, clock, 2.5)
+    assert first and all(v != 0 for v in first)  # still trying for the first 3 s
+    halted = _drive(lift, bus, clock, 5.0)  # guard fires at 3 s, then rests for stall_halt_s
+    assert halted[-1] == 0 and set(halted[-20:]) == {0}
+    assert any(v != 0 for v in halted[:6])  # (it was still driving until the guard fired)
+    resumed = _drive(lift, bus, clock, 8.0)  # past the 10 s rest it tries again
+    assert any(v != 0 for v in resumed)
+
+
+def test_stall_guard_is_off_by_default(monkeypatch):
+    lift, bus, clock = _stuck_lift(0.0, monkeypatch)
+    driven = _drive(lift, bus, clock, 30.0)
+    assert driven and all(v != 0 for v in driven)  # original ob15 behaviour: keeps driving
+
+
+def test_arms_only_enables_the_stall_guard_plain_ob15_does_not(tmp_path):
+    with patch(_FB, side_effect=FakeBus):
+        arms = OB15Arms(OB15ArmsConfig(cameras={}, calibration_dir=tmp_path / "c"))
+        plain = OB15(OB15Config(cameras={}))
+    assert arms.lift_axis.cfg.stall_guard_s == 3.0 and arms.lift_axis.cfg.soft_min_mm == 1.0
+    assert plain.lift_axis.cfg.stall_guard_s == 0.0
+
+
+def _heat(robot, temp_c):
+    robot._group_bus["lift"].temp_c = temp_c
+    robot._last_health_check = -1e9  # due now
+
+
+def test_a_warm_lift_motor_warns_but_keeps_holding(make_robot, caplog):
+    robot = make_robot()
+    _heat(robot, 58.0)
+    with caplog.at_level("WARNING"):
+        robot.send_action(_arm_action())
+    assert any("lift motor is warm" in r.message for r in caplog.records)
+    assert not robot._lift_released
+    assert not [
+        w for w in robot._group_bus["lift"].writes if w[0] == "Torque_Enable" and w[1] == {"gantry": 0}
+    ]
+
+
+def test_an_overheating_lift_motor_is_released_and_not_commanded_again(make_robot, caplog):
+    robot = make_robot()
+    lift_bus = robot._group_bus["lift"]
+    _heat(robot, 66.0)
+    with caplog.at_level("ERROR"):
+        robot.send_action(_arm_action())
+    assert robot._lift_released
+    assert any("releasing its torque" in r.message for r in caplog.records)
+    assert ("Torque_Enable", {"gantry": 0}) in lift_bus.writes
+    n = len(lift_bus.writes)
+    for _ in range(20):
+        robot.send_action(_arm_action())
+    assert not [
+        w for w in lift_bus.writes[n:] if w[0] == "Goal_Velocity" and "gantry" in w[1]
+    ]  # never driven again
+
+
+def test_a_failing_temperature_read_does_not_break_recording(make_robot):
+    robot = make_robot()
+    robot._group_bus["lift"].read = MagicMock(side_effect=RuntimeError("bus error"))
+    robot._last_health_check = -1e9
+    robot.send_action(_arm_action())  # must not raise
+
+
+def test_lift_exit_option_releases_it_when_asked(make_robot, caplog):
+    kept = make_robot(disable_torque_on_disconnect=True)
+    kept_bus = kept._group_bus["lift"]
+    with caplog.at_level("WARNING"):
+        kept.disconnect()
+    assert "gantry" not in kept_bus.torque_released
+    assert any("lift motor is left torqued" in r.message for r in caplog.records)
+
+    released = make_robot(disable_torque_on_disconnect=True, release_lift_on_disconnect=True)
+    released_bus = released._group_bus["lift"]
+    released.disconnect()
+    assert "gantry" in released_bus.torque_released
