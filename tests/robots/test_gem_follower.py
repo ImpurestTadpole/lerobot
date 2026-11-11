@@ -68,10 +68,7 @@ def test_construction_splits_motors_across_feetech_and_odrive_buses():
 
 def test_action_and_observation_features_cover_all_8_joints():
     robot = _build_robot()
-    expected = {
-        f"{j}.pos"
-        for j in ("joint_1", "joint_2", "joint_3", "joint_4", "joint_5", "joint_6", "joint_7", "gripper")
-    }
+    expected = {f"{j}.pos" for j in ("joint_1", "joint_2", "joint_3", "joint_4", "joint_5", "joint_6", "joint_7", "gripper")}
     assert set(robot.action_features) == expected
     assert set(robot.observation_features) >= expected
 
@@ -97,16 +94,6 @@ def test_send_action_routes_odrive_joint_to_pending_target_not_feetech_bus():
 
 
 def test_custom_feetech_motor_ids_are_respected():
-    robot = _build_robot(
-        feetech_motor_ids={
-            "joint_2": 20,
-            "joint_3": 21,
-            "joint_4": 22,
-            "joint_5": 23,
-            "joint_6": 24,
-            "joint_7": 25,
-            "gripper": 26,
-        }
-    )
+    robot = _build_robot(feetech_motor_ids={"joint_2": 20, "joint_3": 21, "joint_4": 22, "joint_5": 23, "joint_6": 24, "joint_7": 25, "gripper": 26})
     assert robot.feetech_bus.motors["joint_2"].id == 20
     assert robot.feetech_bus.motors["gripper"].id == 26

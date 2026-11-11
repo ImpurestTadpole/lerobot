@@ -57,9 +57,7 @@ def test_shares_one_feetech_bus_with_prefixed_left_right_motors():
     robot = _build_robot()
 
     expected_arm_motors = {
-        f"{side}_{joint}"
-        for side in ("left", "right")
-        for joint in ("joint_2", "joint_3", "joint_4", "joint_5", "joint_6", "joint_7", "gripper")
+        f"{side}_{joint}" for side in ("left", "right") for joint in ("joint_2", "joint_3", "joint_4", "joint_5", "joint_6", "joint_7", "gripper")
     }
     expected_neck_motors = {"neck_pan", "neck_nod_left", "neck_nod_right"}
     assert set(robot.feetech_bus.motors) == expected_arm_motors | expected_neck_motors
@@ -80,17 +78,7 @@ def test_two_independent_odrive_buses():
 
 def test_duplicate_feetech_motor_ids_across_arms_raise():
     with pytest.raises(ValueError, match="unique"):
-        _build_robot(
-            right_arm_motor_ids={
-                "joint_2": 2,
-                "joint_3": 3,
-                "joint_4": 4,
-                "joint_5": 5,
-                "joint_6": 6,
-                "joint_7": 7,
-                "gripper": 8,
-            }
-        )
+        _build_robot(right_arm_motor_ids={"joint_2": 2, "joint_3": 3, "joint_4": 4, "joint_5": 5, "joint_6": 6, "joint_7": 7, "gripper": 8})
 
 
 def test_send_action_routes_each_side_odrive_joint_independently():
