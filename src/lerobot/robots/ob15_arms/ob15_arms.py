@@ -14,6 +14,8 @@ from ..ob15.ob15 import OB15
 from .arms_only import (
     BASE_KEYS,
     DEFAULT_HEAD_TILT_DEG,
+    HEAD_TILT_MARGIN_DEG,
+    HEAD_TILT_MARGIN_UNITS,
     arms_action_features,
     arms_only_result,
     arms_state_features,
@@ -85,7 +87,7 @@ class OB15Arms(OB15):
             cfg if cfg.hold_on_connect else _NoTargets(),
             current,
             self._lift_name,
-            default_head_tilt=DEFAULT_HEAD_TILT_DEG if cfg.hold_on_connect else None,
+            default_head_tilt=self._default_head_tilt() if cfg.hold_on_connect else None,
             # homed lift: hold at the top (0 mm) unless told otherwise
             default_lift_mm=0.0 if (cfg.hold_on_connect and self.lift_axis._homed) else None,
         )
@@ -106,6 +108,16 @@ class OB15Arms(OB15):
                 )
                 return
             time.sleep(HOLD_POLL_S)
+
+    def _default_head_tilt(self) -> float:
+        """DEFAULT_HEAD_TILT_DEG, kept a margin inside the end of this robot's calibrated tilt range."""
+        cal = self.calibration.get("head_tilt")
+        if self.config.use_degrees:
+            if cal is None:
+                return DEFAULT_HEAD_TILT_DEG
+            half_range_deg = (cal.range_max - cal.range_min) / 2 * 360 / 4095
+            return min(DEFAULT_HEAD_TILT_DEG, half_range_deg - HEAD_TILT_MARGIN_DEG)
+        return min(DEFAULT_HEAD_TILT_DEG, 100.0 - HEAD_TILT_MARGIN_UNITS)
 
     def hold_metadata(self) -> dict[str, Any]:
         """Document for ``meta/ob15_hold.json``: the resolved hold pose and how it was requested."""

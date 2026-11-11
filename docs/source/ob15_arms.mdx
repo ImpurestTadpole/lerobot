@@ -24,7 +24,8 @@ to an `ob15` host, and use the same hold options.
 ## Hold pose
 
 Hold target precedence: explicit `--robot.head_pan / head_tilt / lift_height_mm` > `--robot.hold_from` > the
-default head tilt of **+40°** (camera angled down at the table; positive tilt is down, negative is up) > the
+default head tilt of **+47** (head tilt is in -100..+100 units across the calibrated range, positive = down;
+kept 5 units inside the end of the range) (camera angled down at the table; positive tilt is down, negative is up) > the
 current pose at connect (the lift and head pan have no default and keep their current position). A key missing from a higher source falls back to the next one (the log line
 "Hold targets ..." shows which sources were used). `--robot.hold_on_connect=false` freezes the current pose (no default tilt) and
 ignores `hold_from`.

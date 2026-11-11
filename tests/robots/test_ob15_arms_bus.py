@@ -242,7 +242,7 @@ def test_observation_and_action_spaces_have_no_base(make_robot):
 def test_no_flags_tilts_the_head_down_and_holds_pan_and_lift(make_robot):
     robot = make_robot()
     obs = robot.get_observation()
-    assert obs["head_tilt.pos"] == pytest.approx(DEFAULT_HEAD_TILT_DEG) == pytest.approx(40.0)
+    assert obs["head_tilt.pos"] == pytest.approx(DEFAULT_HEAD_TILT_DEG) == pytest.approx(47.0)
     assert obs["head_pan.pos"] == pytest.approx(10.0)  # no default: the current pan is kept
 
 
@@ -532,3 +532,20 @@ def test_explicit_lift_height_and_hold_on_connect_false_still_win(make_robot):
     assert make_robot(lift_height_mm=40.0).get_observation()[LIFT] == pytest.approx(40.0, abs=5.0)
     frozen = make_robot(hold_on_connect=False)
     assert frozen.get_observation()[LIFT] == pytest.approx(100.0, abs=1.0)  # keeps where it was
+
+
+def test_default_head_tilt_stays_inside_the_end_of_the_range(make_robot, monkeypatch):
+    from lerobot.motors import MotorCalibration
+
+    robot = make_robot()
+    assert not robot.config.use_degrees  # head_tilt.pos is -100..100 of the calibrated range
+    assert robot._default_head_tilt() == DEFAULT_HEAD_TILT_DEG
+    monkeypatch.setattr("lerobot.robots.ob15_arms.ob15_arms.DEFAULT_HEAD_TILT_DEG", 120.0)
+    assert robot._default_head_tilt() == 95.0  # never asks for the very end of the range
+
+    # in degrees mode the margin is measured against this robot's calibrated tilt travel
+    robot.config.use_degrees = True
+    robot.calibration["head_tilt"] = MotorCalibration(
+        id=8, drive_mode=0, homing_offset=0, range_min=1500, range_max=2181
+    )  # +-29.9 deg
+    assert robot._default_head_tilt() == pytest.approx(29.9 - 2.0, abs=0.2)
