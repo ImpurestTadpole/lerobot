@@ -319,6 +319,7 @@ class _VRLikeTeleop(Teleoperator):
 
     def __init__(self, config):
         super().__init__(config)
+        self.config = config  # older record loops read teleop.config
         self._t = 0
         self._connected = False
 
