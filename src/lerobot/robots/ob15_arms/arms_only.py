@@ -53,9 +53,12 @@ HEAD_KEYS: tuple[str, ...] = ("head_pan.pos", "head_tilt.pos")
 BASE_KEYS: tuple[str, ...] = ("x.vel", "y.vel", "theta.vel")
 
 # Defaults for "has the head/lift reached the hold pose".
-DEFAULT_HEAD_TILT_DEG: float = (
-    40.0  # camera angled down at the table; positive tilt = down (verified on the robot)
-)
+# Camera angled down at the table; positive tilt = down (verified on the robot). head_tilt.pos is in normalized
+# units, -100..+100 across the calibrated tilt range (degrees only when use_degrees=True), so 47 is about halfway
+# to the down end. The robot keeps defaults HEAD_TILT_MARGIN inside the end of the range.
+DEFAULT_HEAD_TILT_DEG: float = 47.0
+HEAD_TILT_MARGIN_DEG = 2.0  # margin when the tilt is in degrees
+HEAD_TILT_MARGIN_UNITS = 5.0  # margin when the tilt is in -100..100 units
 HEAD_TOL_DEG = 2.0
 LIFT_TOL_MM = 5.0
 

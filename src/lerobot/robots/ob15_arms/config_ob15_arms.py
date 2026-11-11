@@ -39,7 +39,9 @@ class OB15ArmsConfig(OB15Config):
     hold_from: str | None = None
     # Give up waiting for the hold pose after this long, and the tolerances for "reached".
     settle_timeout_s: float = 15.0
-    lift_tol_mm: float = 5.0
+    lift_tol_mm: float = (
+        2.5  # wait until the lift is this close to its target (it stops commanding within 2 mm)
+    )
     head_tol: float = 2.0
     # Anti-flicker (see robots/ob15/camera_tuning.py): 60 Hz mains = 120 Hz light flicker; 8.33 ms is one period.
     # Set camera_power_line_hz=50 on 50 Hz mains, or None / wrist_exposure_ms=None to leave the cameras alone.
