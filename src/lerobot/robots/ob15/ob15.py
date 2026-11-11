@@ -26,6 +26,7 @@ from typing import Any
 import numpy as np
 
 from lerobot.cameras.utils import make_cameras_from_configs
+from .camera_tuning import tune_camera
 from lerobot.motors import Motor, MotorCalibration, MotorNormMode
 from lerobot.motors.feetech import (
     FeetechMotorsBus,
@@ -312,6 +313,11 @@ class OB15(Robot):
             try:
                 cam.connect()
                 logger.info(f"✅ Camera '{cam_name}' connected successfully")
+                tune_camera(
+                    cam,
+                    self.config.camera_power_line_hz,
+                    self.config.wrist_exposure_ms if "wrist" in cam_name else None,
+                )
             except Exception as e:
                 logger.warning(f"⚠️  Camera '{cam_name}' failed to connect: {e}")
                 logger.warning(f"   Continuing without camera '{cam_name}' - robot will still function")
