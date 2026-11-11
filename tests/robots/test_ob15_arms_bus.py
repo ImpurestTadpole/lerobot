@@ -407,3 +407,13 @@ def test_lerobot_record_end_to_end(tmp_path, monkeypatch):
     states = np.stack(dataset.hf_dataset.to_pandas()["observation.state"].to_numpy())
     assert np.allclose(states[:, state_names.index("head_tilt.pos")], -35.0, atol=2.0)
     assert np.allclose(states[:, state_names.index(LIFT)], 220.0, atol=5.0)
+
+
+def test_disconnect_skips_cameras_that_never_connected(make_robot):
+    """connect() carries on when a camera fails to open; disconnect() must not then raise for it."""
+    robot = make_robot()
+    up, down = MagicMock(is_connected=True), MagicMock(is_connected=False)
+    robot.cameras = {"up": up, "down": down}
+    robot.disconnect()
+    up.disconnect.assert_called_once()
+    down.disconnect.assert_not_called()
