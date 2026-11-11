@@ -35,9 +35,9 @@ from lerobot.configs.dataset import DatasetRecordConfig
 from lerobot.robots.ob15 import OB15, OB15Config
 from lerobot.robots.ob15_arms import OB15Arms, OB15ArmsConfig
 from lerobot.robots.ob15_arms.arms_only import (
-    DEFAULT_HEAD_TILT_DEG,
     ARM_KEYS,
     BASE_KEYS,
+    DEFAULT_HEAD_TILT_DEG,
     hold_reached,
     read_hold_file,
     write_hold_file,
@@ -250,7 +250,9 @@ def test_head_tilt_precedence_flag_over_hold_from_over_default(make_robot, tmp_p
     recorded = make_robot(head_tilt=25.0)
     write_hold_file(tmp_path / "ds", recorded.hold_metadata(), head_tol=2.0, lift_tol=5.0)
     recorded.disconnect()
-    assert make_robot(hold_from=str(tmp_path / "ds")).get_observation()["head_tilt.pos"] == pytest.approx(25.0)
+    assert make_robot(hold_from=str(tmp_path / "ds")).get_observation()["head_tilt.pos"] == pytest.approx(
+        25.0
+    )
     assert make_robot(head_tilt=10.0, hold_from=str(tmp_path / "ds")).get_observation()[
         "head_tilt.pos"
     ] == pytest.approx(10.0)

@@ -53,7 +53,9 @@ HEAD_KEYS: tuple[str, ...] = ("head_pan.pos", "head_tilt.pos")
 BASE_KEYS: tuple[str, ...] = ("x.vel", "y.vel", "theta.vel")
 
 # Defaults for "has the head/lift reached the hold pose".
-DEFAULT_HEAD_TILT_DEG: float = 40.0  # camera angled down at the table; positive tilt = down (verified on the robot)
+DEFAULT_HEAD_TILT_DEG: float = (
+    40.0  # camera angled down at the table; positive tilt = down (verified on the robot)
+)
 HEAD_TOL_DEG = 2.0
 LIFT_TOL_MM = 5.0
 
