@@ -22,6 +22,7 @@ from .arms_only import (
     hold_reached,
     hold_source,
     hold_status,
+    DEFAULT_HEAD_TILT_DEG,
     resolve_hold_targets,
 )
 from .config_ob15_arms import OB15ArmsClientConfig
@@ -71,7 +72,12 @@ class OB15ArmsClient(OB15Client):
         cfg = self.config
         current = self._wait_first_observation()
         # hold_on_connect=False: do not move to hold_from, just freeze head/lift where they are.
-        hold = resolve_hold_targets(cfg if cfg.hold_on_connect else _NoTargets(), current, self._lift_name)
+        hold = resolve_hold_targets(
+            cfg if cfg.hold_on_connect else _NoTargets(),
+            current,
+            self._lift_name,
+            default_head_tilt=DEFAULT_HEAD_TILT_DEG if cfg.hold_on_connect else None,
+        )
 
         self._hold = hold
         logger.info(f"{self}: holding head/lift at {self._hold}")

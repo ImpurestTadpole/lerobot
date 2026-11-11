@@ -53,6 +53,7 @@ HEAD_KEYS: tuple[str, ...] = ("head_pan.pos", "head_tilt.pos")
 BASE_KEYS: tuple[str, ...] = ("x.vel", "y.vel", "theta.vel")
 
 # Defaults for "has the head/lift reached the hold pose".
+DEFAULT_HEAD_TILT_DEG: float = 40.0  # camera angled down at the table; positive tilt = down (verified on the robot)
 HEAD_TOL_DEG = 2.0
 LIFT_TOL_MM = 5.0
 
@@ -94,16 +95,23 @@ def arms_only_result(sent: dict[str, Any]) -> dict[str, Any]:
 # --- 2. Hold pose -----------------------------------------------------------------------------
 
 
-def resolve_hold_targets(config: Any, current_obs: dict[str, Any], lift_name: str | None) -> dict[str, float]:
+def resolve_hold_targets(
+    config: Any,
+    current_obs: dict[str, Any],
+    lift_name: str | None,
+    default_head_tilt: float | None = None,
+) -> dict[str, float]:
     """Head/lift targets to hold.
 
-    Precedence: explicit overrides > ``hold_from`` file > current obs.
+    Precedence: explicit overrides > ``hold_from`` file > ``default_head_tilt`` (head tilt only) > current obs.
     """
     keys = hold_keys(lift_name)
     targets: dict[str, float] = {}
     for key in keys:
         if key in current_obs:
             targets[key] = float(current_obs[key])
+    if default_head_tilt is not None and "head_tilt.pos" in keys:
+        targets["head_tilt.pos"] = float(default_head_tilt)
 
     hold_from = getattr(config, "hold_from", None)
     if hold_from:
