@@ -51,6 +51,9 @@ class OB15Arms(OB15):
             config.calibration_dir = HF_LEROBOT_CALIBRATION / ROBOTS / OB15.name
         # Homing parks the lift at the top; do not release its torque afterwards (that lets it fall).
         config.lift_axis.release_torque_after_home = False
+        # 0 mm is the top hard stop itself (not the point homing backs off to), and 0 is reachable.
+        config.lift_axis.zero_at_limit = True
+        config.lift_axis.soft_min_mm = 0.0
         super().__init__(config)
         self._hold: dict[str, float] | None = None
 
@@ -83,6 +86,8 @@ class OB15Arms(OB15):
             current,
             self._lift_name,
             default_head_tilt=DEFAULT_HEAD_TILT_DEG if cfg.hold_on_connect else None,
+            # homed lift: hold at the top (0 mm) unless told otherwise
+            default_lift_mm=0.0 if (cfg.hold_on_connect and self.lift_axis._homed) else None,
         )
 
         self._hold = hold

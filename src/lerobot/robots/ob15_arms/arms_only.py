@@ -102,10 +102,12 @@ def resolve_hold_targets(
     current_obs: dict[str, Any],
     lift_name: str | None,
     default_head_tilt: float | None = None,
+    default_lift_mm: float | None = None,
 ) -> dict[str, float]:
     """Head/lift targets to hold.
 
-    Precedence: explicit overrides > ``hold_from`` file > ``default_head_tilt`` (head tilt only) > current obs.
+    Precedence: explicit overrides > ``hold_from`` file > the defaults (``default_head_tilt``, ``default_lift_mm``)
+    > current obs.
     """
     keys = hold_keys(lift_name)
     targets: dict[str, float] = {}
@@ -114,6 +116,8 @@ def resolve_hold_targets(
             targets[key] = float(current_obs[key])
     if default_head_tilt is not None and "head_tilt.pos" in keys:
         targets["head_tilt.pos"] = float(default_head_tilt)
+    if default_lift_mm is not None and lift_name and lift_key(lift_name) in keys:
+        targets[lift_key(lift_name)] = float(default_lift_mm)
 
     hold_from = getattr(config, "hold_from", None)
     if hold_from:
