@@ -35,6 +35,7 @@ from lerobot.configs.dataset import DatasetRecordConfig
 from lerobot.robots.ob15 import OB15, OB15Config
 from lerobot.robots.ob15_arms import OB15Arms, OB15ArmsConfig
 from lerobot.robots.ob15_arms.arms_only import (
+    DEFAULT_HEAD_TILT_DEG,
     ARM_KEYS,
     BASE_KEYS,
     hold_reached,
@@ -237,12 +238,27 @@ def test_observation_and_action_spaces_have_no_base(make_robot):
     assert set(robot.send_action(_arm_action())) == set(ARM_KEYS)
 
 
-def test_no_flags_holds_the_current_pose(make_robot):
+def test_no_flags_tilts_the_head_down_and_holds_pan_and_lift(make_robot):
     robot = make_robot()
     obs = robot.get_observation()
-    assert obs["head_pan.pos"] == pytest.approx(10.0)
-    assert obs["head_tilt.pos"] == pytest.approx(-5.0)
+    assert obs["head_tilt.pos"] == pytest.approx(DEFAULT_HEAD_TILT_DEG) == pytest.approx(40.0)
+    assert obs["head_pan.pos"] == pytest.approx(10.0)  # no default: the current pan is kept
     assert obs[LIFT] == pytest.approx(100.0, abs=1.0)
+
+
+def test_head_tilt_precedence_flag_over_hold_from_over_default(make_robot, tmp_path):
+    recorded = make_robot(head_tilt=25.0)
+    write_hold_file(tmp_path / "ds", recorded.hold_metadata(), head_tol=2.0, lift_tol=5.0)
+    recorded.disconnect()
+    assert make_robot(hold_from=str(tmp_path / "ds")).get_observation()["head_tilt.pos"] == pytest.approx(25.0)
+    assert make_robot(head_tilt=10.0, hold_from=str(tmp_path / "ds")).get_observation()[
+        "head_tilt.pos"
+    ] == pytest.approx(10.0)
+
+
+def test_hold_on_connect_false_freezes_the_current_tilt(make_robot):
+    robot = make_robot(hold_on_connect=False)
+    assert robot.get_observation()["head_tilt.pos"] == pytest.approx(-5.0)
 
 
 def test_hold_from_a_recorded_dataset_restores_the_pose(make_robot, tmp_path):

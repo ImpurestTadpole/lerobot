@@ -24,8 +24,9 @@ to an `ob15` host, and use the same hold options.
 ## Hold pose
 
 Hold target precedence: explicit `--robot.head_pan / head_tilt / lift_height_mm` > `--robot.hold_from` > the
-current pose at connect. A key missing from a higher source falls back to the next one (the log line
-"Hold targets ..." shows which sources were used). `--robot.hold_on_connect=false` freezes the current pose and
+default head tilt of **+40°** (camera angled down at the table; positive tilt is down, negative is up) > the
+current pose at connect (the lift and head pan have no default and keep their current position). A key missing from a higher source falls back to the next one (the log line
+"Hold targets ..." shows which sources were used). `--robot.hold_on_connect=false` freezes the current pose (no default tilt) and
 ignores `hold_from`.
 
 ## The dataset remembers the hold pose (`hold_from`)
@@ -43,9 +44,9 @@ ignores `hold_from`.
 
 ```json
 {"version": 1, "robot_type": "ob15_arms",
- "hold": {"gantry.height_mm": 220.0, "head_pan.pos": 0.0, "head_tilt.pos": -35.0},
+ "hold": {"gantry.height_mm": 220.0, "head_pan.pos": 0.0, "head_tilt.pos": 40.0},
  "source": {"hold_from": null,
-            "overrides": {"head_pan": null, "head_tilt": -35.0, "lift_height_mm": 220.0},
+            "overrides": {"head_pan": null, "head_tilt": 40.0, "lift_height_mm": 220.0},
             "hold_on_connect": true},
  "recorded_at": "2026-11-09T12:00:00+00:00"}
 ```
@@ -59,10 +60,10 @@ hold pose counts as reached at connect and when `check_hold()` reports drift.
 
 ```bash
 # Record on the Jetson (VR teleop still works; base/head/lift inputs are ignored)
-lerobot-record --robot.type=ob15_arms --robot.head_tilt=-35 --robot.lift_height_mm=220 ...
+lerobot-record --robot.type=ob15_arms --robot.head_tilt=40 --robot.lift_height_mm=220 ...
 
 # Run a policy served from the PC (on the PC: lerobot-policy-server --config_path=server.yaml)
-lerobot-rollout --robot.type=ob15_arms --robot.head_tilt=-35 --robot.lift_height_mm=220 \
+lerobot-rollout --robot.type=ob15_arms --robot.head_tilt=40 --robot.lift_height_mm=220 \
   --inference.type=remote --inference.endpoint=tcp/<pc-ip>:7447 --inference.deployment=<name> ...
 
 # Restore the head/lift pose the policy's data was recorded with (dataset id, policy id or local path)
