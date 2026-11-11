@@ -82,6 +82,10 @@ class LiftAxisConfig:
     # position (the original ob15 behaviour). Set False to keep the lift torqued and held at the top.
     release_torque_after_home: bool = True
 
+    # Where 0 mm is after homing. False (original ob15): at the point the lift backed off to, which is
+    # home_backoff_mm below the hard stop. True: at the hard stop itself, so 0 mm is the top.
+    zero_at_limit: bool = False
+
 
 class LiftAxis:
     """Gantry/Z-axis controller that plugs into an existing Feetech bus."""
@@ -370,6 +374,9 @@ class LiftAxis:
             if stuck >= stuck_required:
                 break
 
+        self._update_extended_ticks()
+        stall_deg = self._extended_deg()  # position of the hard stop
+
         # Backoff: move opposite direction to unjam motor from limit
         if self.cfg.home_backoff_mm > 0:
             backoff_vel = -home_vel
@@ -395,11 +402,11 @@ class LiftAxis:
                 pass
 
         self._update_extended_ticks()
-        self._z0_deg = self._extended_deg()
+        self._z0_deg = stall_deg if self.cfg.zero_at_limit else self._extended_deg()
 
         # ADDED: two lines only
         self._homed = True
-        self._cached_height_mm = 0.0
+        self._cached_height_mm = self.get_height_mm() if self.cfg.zero_at_limit else 0.0
         if self.cfg.home_at_top:
             logger.info(f"LiftAxis: homed — 0 mm = top, {self.cfg.soft_max_mm:.0f} mm = bottom")
         else:

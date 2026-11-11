@@ -244,7 +244,6 @@ def test_no_flags_tilts_the_head_down_and_holds_pan_and_lift(make_robot):
     obs = robot.get_observation()
     assert obs["head_tilt.pos"] == pytest.approx(DEFAULT_HEAD_TILT_DEG) == pytest.approx(40.0)
     assert obs["head_pan.pos"] == pytest.approx(10.0)  # no default: the current pan is kept
-    assert obs[LIFT] == pytest.approx(100.0, abs=1.0)
 
 
 def test_head_tilt_precedence_flag_over_hold_from_over_default(make_robot, tmp_path):
@@ -499,3 +498,37 @@ def test_disconnect_with_torque_kept_changes_nothing(make_robot):
     lift_bus = robot._group_bus["lift"]
     robot.disconnect()
     assert lift_bus.torque_released == []
+
+
+@pytest.mark.parametrize(("zero_at_limit", "expected_mm"), [(False, 0.0), (True, 10.0)])
+def test_home_zero_is_at_the_hard_stop_only_when_asked(monkeypatch, zero_at_limit, expected_mm):
+    """After backing off 10 mm the lift reads 0 mm (original ob15) or ~10 mm below the stop (zero_at_limit)."""
+    from lerobot.robots.ob15.lift_axis import LiftAxis, LiftAxisConfig
+
+    monkeypatch.setattr("lerobot.robots.ob15.lift_axis.time.sleep", lambda s: None)
+    bus = _HomingBus()
+    cfg = LiftAxisConfig(enabled=True, home_on_connect=False, zero_at_limit=zero_at_limit)
+    lift = LiftAxis(cfg, bus)
+    lift.configure()
+    lift.home()
+    assert lift.get_height_mm() == pytest.approx(expected_mm, abs=1.5)
+    assert lift._cached_height_mm == pytest.approx(expected_mm, abs=1.5)
+
+
+def test_ob15_arms_zeroes_the_lift_at_the_top_and_can_reach_zero(tmp_path):
+    with patch(_FB, side_effect=FakeBus):
+        robot = OB15Arms(OB15ArmsConfig(cameras={}, calibration_dir=tmp_path / "c"))
+    assert robot.lift_axis.cfg.zero_at_limit is True
+    assert robot.lift_axis.cfg.soft_min_mm == 0.0
+
+
+def test_no_flags_holds_the_lift_at_the_top(make_robot):
+    robot = make_robot()  # the fixture's lift starts 100 mm below the top
+    assert robot.get_observation()[LIFT] == pytest.approx(0.0, abs=robot.config.lift_tol_mm)
+    assert robot.hold_metadata()["hold"][LIFT] == 0.0
+
+
+def test_explicit_lift_height_and_hold_on_connect_false_still_win(make_robot):
+    assert make_robot(lift_height_mm=40.0).get_observation()[LIFT] == pytest.approx(40.0, abs=5.0)
+    frozen = make_robot(hold_on_connect=False)
+    assert frozen.get_observation()[LIFT] == pytest.approx(100.0, abs=1.0)  # keeps where it was
