@@ -212,39 +212,41 @@ def decode_video_frames_pyav(
     first_ts = min(timestamps)
     last_ts = max(timestamps)
 
-    loaded_frames: list[torch.Tensor] = []
-    loaded_ts: list[float] = []
+    # Seek margins (in frames). With a 1 frame margin the seek can land on a CRA keyframe whose
+    # following IDR_N_LP/RASL pictures the decoder silently drops (seen at some HEVC lossless depth
+    # episode starts: the frame right after the landing keyframe is missing). Retry with a larger
+    # margin only when a requested timestamp is missing, so frames that already decode are unchanged.
+    for margin_frames in (1, 4, 16):
+        loaded_frames, loaded_ts = [], []
+        with av.open(video_path) as container:
+            stream = container.streams.video[0]
+            fps_guess = float(stream.average_rate) if stream.average_rate else 30.0
+            # Seek to the nearest keyframe at or before `first_ts` minus the margin.
+            # `container.seek` with a stream expects the offset in stream.time_base units.
+            seek_pts = round(first_ts / stream.time_base) - (
+                1 if margin_frames == 1 else round(margin_frames / fps_guess / stream.time_base)
+            )
+            container.seek(seek_pts, backward=True, any_frame=False, stream=stream)
 
-    # Seek + decode. `container.seek(offset)` with no `stream` argument expects the offset in
-    # av.time_base units (microseconds). `backward=True` lands us on the nearest keyframe at or
-    # before `first_ts`, so we can then decode forward until we cover `last_ts`. See:
-    # https://pyav.basswood-io.com/docs/stable/api/container.html#av.container.InputContainer.seek
-    with av.open(video_path) as container:
-        stream = container.streams.video[0]
-        # Seek to the nearest keyframe at or before `first_ts` with a 1 frame margin
-        container.seek(
-            round(first_ts / stream.time_base) - 1,
-            backward=True,
-            any_frame=False,
-            stream=stream,
-        )
+            for frame in container.decode(stream):
+                if frame.pts is None:
+                    continue
+                current_ts = float(frame.pts * stream.time_base)
+                if log_loaded_timestamps:
+                    logger.info(f"frame loaded at timestamp={current_ts:.4f}")
+                if is_depth:
+                    arr = frame.to_ndarray(format="gray12le")  # (H, W) uint12
+                    loaded_frames.append(torch.from_numpy(arr).unsqueeze(0).contiguous())
+                else:
+                    arr = frame.to_ndarray(format="rgb24")  # (H, W, 3)
+                    # Convert to CHW uint8 to match torchcodec's output layout.
+                    loaded_frames.append(torch.from_numpy(arr).permute(2, 0, 1).contiguous())
+                loaded_ts.append(current_ts)
+                if current_ts >= last_ts:
+                    break
 
-        for frame in container.decode(stream):
-            if frame.pts is None:
-                continue
-            current_ts = float(frame.pts * stream.time_base)
-            if log_loaded_timestamps:
-                logger.info(f"frame loaded at timestamp={current_ts:.4f}")
-            if is_depth:
-                arr = frame.to_ndarray(format="gray12le")  # (H, W) uint12
-                loaded_frames.append(torch.from_numpy(arr).unsqueeze(0).contiguous())
-            else:
-                arr = frame.to_ndarray(format="rgb24")  # (H, W, 3)
-                # Convert to CHW uint8 to match torchcodec's output layout.
-                loaded_frames.append(torch.from_numpy(arr).permute(2, 0, 1).contiguous())
-            loaded_ts.append(current_ts)
-            if current_ts >= last_ts:
-                break
+        if loaded_ts and all(min(abs(t - lt) for lt in loaded_ts) <= tolerance_s for t in timestamps):
+            break
 
     if not loaded_frames:
         raise FrameTimestampError(
