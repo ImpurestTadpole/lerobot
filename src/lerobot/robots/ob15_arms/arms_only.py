@@ -55,9 +55,9 @@ BASE_KEYS: tuple[str, ...] = ("x.vel", "y.vel", "theta.vel")
 # Defaults for "has the head/lift reached the hold pose".
 # Camera angled down at the table; positive tilt = down (verified on the robot). head_tilt.pos is in normalized
 # units, -100..+100 across the calibrated tilt range (degrees only when use_degrees=True). On this robot (lift at the
-# top) 47 shows a third wall, 60-70 shows the whole table with the grippers, 80+ loses the far edge. 62 = 65 nudged up. The robot keeps
-# defaults HEAD_TILT_MARGIN inside the end of the range.
-DEFAULT_HEAD_TILT_DEG: float = 62.0
+# top) 47 shows a third wall, 60-70 shows the whole table with the grippers, 80+ loses the far edge. 65 matches the green-bracket
+# dataset's pose. The robot keeps defaults HEAD_TILT_MARGIN inside the end of the range.
+DEFAULT_HEAD_TILT_DEG: float = 65.0
 HEAD_TILT_MARGIN_DEG = 2.0  # margin when the tilt is in degrees
 HEAD_TILT_MARGIN_UNITS = 5.0  # margin when the tilt is in -100..100 units
 HEAD_TOL_DEG = 2.0
