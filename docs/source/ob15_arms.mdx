@@ -164,3 +164,5 @@ the session that created it; a later session with a pose beyond the tolerances l
 The headset plays a different chime for each event (`vr_app.js` in XLeVR): **start** a rising three-note chime, **stop** a
 lower falling three-note chime, **restart** a fast falling four-note buzzy "rewind" blip. After a restart you press LEFT X
 again to open the gate for the new attempt, which plays the start chime.
+The chimes do not depend on `--teleop.stream_cameras_to_vr`: they play with camera streaming on or off (turning streaming
+off saves CPU). The headset page must have been reloaded after `vr_app.js` changes.

@@ -42,12 +42,17 @@ def test_start_and_stop_send_distinct_events_with_the_recording_flag():
     ]
 
 
-@pytest.mark.parametrize("kwargs", [{"stream_cameras_to_vr": False}, {"monitor": False}])
-def test_no_event_is_sent_without_the_vr_stream(kwargs):
-    t = _teleop(**kwargs)
+@pytest.mark.parametrize("event", ["start", "stop", "restart"])
+def test_chimes_are_sent_even_when_camera_streaming_to_the_headset_is_off(event):
+    """The chimes do not depend on --teleop.stream_cameras_to_vr (it is often turned off to save CPU)."""
+    t = _teleop(stream_cameras_to_vr=False)
+    t.send_episode_event(event)
+    assert [c.args[0]["episode_event"] for c in t.vr_monitor.send_status.call_args_list] == [event]
+
+
+def test_no_event_is_sent_and_nothing_raises_when_the_vr_monitor_is_not_running():
+    t = _teleop(monitor=False)
     t.send_episode_event("start")  # must not raise
-    if t.vr_monitor is not None:
-        t.vr_monitor.send_status.assert_not_called()
 
 
 def test_restart_is_its_own_event_and_does_not_mark_recording_active():
