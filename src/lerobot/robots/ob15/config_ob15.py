@@ -66,8 +66,8 @@ def ob15_cameras_config() -> dict[str, CameraConfig]:
         "head": RealSenseCameraConfig(
             serial_number_or_name="342222071125",
             fps=30,
-            width=640,
-            height=360,
+            width=960,
+            height=540,
             color_mode=ColorMode.RGB,
             rotation=Cv2Rotation.NO_ROTATION,
             use_depth=True,
@@ -143,8 +143,13 @@ class OB15Config(RobotConfig):
     # Bus 1 = left arm + base (base wheels 7-9 live on the left arm's bus).
     # Bus 2 = right arm + head + lift (head pan/tilt 7-8 and lift motor 9 live on the
     # right arm's bus).
-    left_arm_port: str = "/dev/ttyACM0"  # left arm motors, IDs 1-6
-    right_arm_port: str = "/dev/ttyACM1"  # right arm motors, IDs 1-6
+    # Named by each Feetech adapter's USB serial, not /dev/ttyACM*: the ACM numbers swap
+    # between boots (this default was flipped back and forth for exactly that reason).
+    # Verified 2026-11-02 by read-only ping: 5AE6086368 has IDs 1-6 + wheel-mode 7/8/9
+    # (bus1), 5AE6080648 has IDs 1-6 + head 7/8 + wheel-mode lift 9 (bus2). The ROS side
+    # (ros2_ws ob15_description/config/ob15_*motors.yaml) uses the same paths.
+    left_arm_port: str = "/dev/serial/by-id/usb-1a86_USB_Single_Serial_5AE6086368-if00"  # left arm motors, IDs 1-6
+    right_arm_port: str = "/dev/serial/by-id/usb-1a86_USB_Single_Serial_5AE6080648-if00"  # right arm motors, IDs 1-6
     # None means "follow left_arm_port/right_arm_port" (resolved in __post_init__), so
     # overriding --robot.left_arm_port also moves the base's port unless base_port is set
     # explicitly. A class-level default of `left_arm_port` here would only capture that
@@ -155,7 +160,7 @@ class OB15Config(RobotConfig):
     # the lift motor attaches to whichever group's bus `lift_axis.bus` names.
     # Default matches bus2 (right_arm+head+lift). Must NOT default to bus1 — ID 9 collides
     # with base_right_wheel there.
-    lift_port: str = "/dev/ttyACM1"
+    lift_port: str = "/dev/serial/by-id/usb-1a86_USB_Single_Serial_5AE6080648-if00"
     # Legacy aliases from XLerobotConfig (port1=bus1, port2=bus2). If set, they override the
     # corresponding per-limb ports in __post_init__ so old CLI/Guide.sh flags keep working:
     #   --robot.port1=/dev/ttyACM0 --robot.port2=/dev/ttyACM1

@@ -34,6 +34,20 @@ from ..config import TeleoperatorConfig
 #   reset_position       - reset the robot to its rest pose (momentary, held)
 #   toggle_intervention   - DAgger human/policy handover (RIGHT B today)
 #   upload_dataset        - push the recorded dataset to the Hub on demand
+#   nav_next_waypoint     - cycle the "selected" saved nav waypoint (ROS2 nav relay)
+#   nav_confirm_goal      - send a Nav2 goal for the selected waypoint
+#   nav_cancel            - cancel the active Nav2 goal, return to manual driving
+#   nav_save_waypoint     - record the robot's current pose as a new named waypoint
+#   nav_toggle_explore    - start/stop autonomous frontier exploration
+#
+# The five nav_* actions are unbound by default (see DEFAULT_VR_BUTTON_MAP below --
+# every button is already spoken for by recording/DAgger controls) and are no-ops
+# unless `nav_relay_ip` is also configured (see below). Opt in for a navigation
+# session by remapping a button you're not using for recording at the time, e.g.
+# --teleop.button_map='{"right.thumbstick": "nav_toggle_explore"}'. They forward a
+# small JSON command to nav_goal_relay_node (see ros2_ws/), which owns the actual
+# Nav2 action client and waypoints file -- this teleoperator never talks to ROS2
+# directly.
 #
 # LEFT MENU is special-cased in VREventHandler regardless of what it's mapped to here: a quick
 # tap dispatches its button_map semantic (stop_session by default) as usual, but holding it past
@@ -55,7 +69,9 @@ DEFAULT_VR_BUTTON_MAP: dict[str, str] = {
     # "left.x": "rerecord_episode",
     "left.y": "rerecord_episode",
     "left.menu": "stop_session",  # tap; long-press toggles passthrough instead (see above)
-    "left.thumbstick": "reset_position",
+    # LEFT thumbstick click is left unmapped: holding it boosts base speed (see
+    # XLerobotVRTeleopConfig.base_boost_multiplier), so it must not also fire reset_position.
+    # "left.thumbstick": "reset_position",
     # RIGHT A ends and saves the current episode (matches the operator workflow: LEFT X starts
     # recording, RIGHT A finishes it). Was previously mapped to toggle_intervention, which is now
     # on RIGHT B instead.
@@ -75,6 +91,11 @@ class XLerobotVRTeleopConfig(TeleoperatorConfig):
 
     kp: float = 1.0  # Proportional gain for arm control
 
+    # Hold the LEFT thumbstick click to multiply base translation/rotation speed by this factor
+    # (the RIGHT click toggles the depth view). 1.0 disables the boost. The robot still smooths
+    # and caps wheel speed, so the boost ramps in rather than jerking.
+    base_boost_multiplier: float = 3.0
+
     # XLeVR checkout (serves the WebXR page + certs, provides the xlevr package).
     # None = auto-resolve: XLEVR_PATH env var, then ~/XLeRobot/XLeVR and other
     # well-known locations (see vr_monitor._resolve_xlevr_path).
@@ -86,16 +107,23 @@ class XLerobotVRTeleopConfig(TeleoperatorConfig):
     # "stop_session"}') without touching motion bindings.
     button_map: dict[str, str] = field(default_factory=lambda: dict(DEFAULT_VR_BUTTON_MAP))
 
+    # Optional ROS2 nav relay (nav_goal_relay_node, see ros2_ws/) for the nav_*
+    # button_map actions above. None (default) disables it entirely -- no socket is
+    # opened and any button mapped to a nav_* action is a silent no-op, so setting a
+    # nav_* binding in button_map has zero effect on users who don't also set this.
+    nav_relay_ip: str | None = None
+    nav_relay_port: int = 5560
+
     # Stream the robot's camera feeds to the VR headset for display while teleoperating.
     stream_cameras_to_vr: bool = True
-    camera_stream_fps: float = 10.0
+    camera_stream_fps: float = 30.0
     camera_stream_jpeg_quality: int = 80
     # Downscale frames to at most this width before JPEG-encoding for the VR stream, independent
     # of the camera's captured/recorded resolution (set in the robot's camera config). Keeps the
     # per-frame encode+send cost fixed even if capture resolution is bumped up for dataset
     # quality. Aspect ratio is preserved; frames already at or below this width pass through
     # unscaled. Set to 0 to disable and stream at full captured resolution.
-    camera_stream_max_width: int = 480
+    camera_stream_max_width: int = 680
     # Depth values (mm) beyond this are clipped before normalizing to the 0-255 false-color depth
     # view sent to the headset (toggled via RIGHT thumbstick click). Tune to the working distance
     # of the task — e.g. lower this for close-up manipulation to get more color contrast in the

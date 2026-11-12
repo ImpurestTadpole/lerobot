@@ -1,0 +1,34 @@
+# Jetson (JetPack 6 / L4T R36.4) local-inference image for ob15 rollouts.
+#
+# Built FROM dustynv/lerobot:r36.4.0-cu128-24.04 specifically (not the plain r36.4.0 tag):
+# it ships Python 3.12.3 + torch 2.7.0 with working CUDA, which is what this repo's
+# pyproject.toml actually requires (requires-python>=3.12, torch>=2.7,<2.12.0). The plain
+# r36.4.0 tag only has Python 3.10 + torch 2.5.0, which hits two hard walls: lerobot's code
+# uses `typing.Self` (Python 3.11+ only), and torch 2.5.0 predates the >=2.7 floor.
+#
+# This layer only adds what current lerobot needs beyond the base image's own baked-in deps
+# (that image still has its own old lerobot 0.1.0 install with an older dependency set) —
+# --no-deps on the final `-e .` avoids the resolver dragging in a generic PyPI torch/opencv
+# and breaking the image's matched CUDA build. rerun-sdk is safe here (needs numpy>=2, and
+# this image's numpy is already 2.2.5) — unlike the older r36.4.0 (Python 3.10) image, where
+# forcing numpy>=2 broke that image's numpy-1.x-compiled native cv2 binary.
+#
+# Build once:  docker build -f docker/Dockerfile.ob15-eval -t lerobot-ob15:latest .
+# Rebuild only when pyproject.toml's dependency versions change.
+FROM dustynv/lerobot:r36.4.0-cu128-24.04
+
+RUN pip install --index-url https://pypi.org/simple --no-cache-dir \
+    'draccus>=0.11.6,<0.12.0' 'huggingface-hub[hf-transfer]>=1.6.0,<2.0.0' \
+    'requests>=2.32.0,<3.0.0' 'gymnasium>=1.1.1,<2.0.0' 'safetensors>=0.4.3,<1.0.0' \
+    'packaging>=24.2,<26.0' 'termcolor>=2.4.0,<4.0.0' 'sentencepiece>=0.2.0,<1.0.0' \
+    'tqdm>=4.66.0,<5.0.0' 'einops>=0.8.0,<0.9.0' \
+    'Pillow>=10.0.0,<13.0.0' 'cmake>=3.29.0.1,<4.2.0' 'setuptools>=71.0.0,<82.0.0' \
+    'datasets>=4.8.0,<5.0.0' 'pandas>=2.0.0,<3.0.0' 'pyarrow>=21.0.0,<30.0.0' \
+    'av>=15.0.0,<16.0.0' 'jsonlines>=4.0.0,<5.0.0' 'pynput>=1.7.7,<1.9.0' \
+    'pyserial>=3.5,<4.0' 'deepdiff>=7.0.1,<9.0.0' 'feetech-servo-sdk>=1.0.0,<2.0.0' \
+    'rerun-sdk>=0.24.0,<0.34.0' 'transformers>=5.4.0,<5.6.0' 'num2words>=0.5.14,<0.6.0' \
+    'accelerate>=1.14.0,<2.0.0' 'peft>=0.18.0,<1.0.0' 'scipy>=1.14.0,<2.0.0'
+
+# lerobot itself is NOT installed here — the run command mounts the live repo at /opt/lerobot
+# and does `pip install --no-deps -e .` at container start, so local code edits (and switching
+# branches/commits) are picked up without rebuilding this image.

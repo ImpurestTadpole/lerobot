@@ -606,21 +606,24 @@ class SimpleHeadControl:
         return action
 
 
-def get_vr_base_action(left_goal, right_goal, robot):
+def get_vr_base_action(left_goal, right_goal, robot, boost_multiplier: float = 1.0):
     """
     Get base control commands from VR thumbstick input.
-    
+
     Refactored to follow xlerobot's keyboard base control exactly.
     Control mapping (matching xlerobot keyboard layout):
     - Right thumbstick Y-axis: forward (positive) / backward (negative) [like 'i'/'k' keys]
-    - Right thumbstick X-axis: left (negative) / right (positive) [like 'j'/'l' keys]  
+    - Right thumbstick X-axis: left (negative) / right (positive) [like 'j'/'l' keys]
     - Left thumbstick X-axis: rotate left (negative) / rotate right (positive) [like 'u'/'o' keys]
-    
+    - Left thumbstick click (held): scale translation and rotation by ``boost_multiplier``.
+      The LEFT stick is used because the RIGHT stick click toggles the depth view.
+
     Args:
         left_goal: Left VR controller goal data (for rotation control)
         right_goal: Right VR controller goal data (for translation control)
         robot: Robot instance with speed_levels attribute
-        
+        boost_multiplier: Speed scale applied while the left thumbstick is held down
+
     Returns:
         dict: Base velocity commands {"x.vel": float, "y.vel": float, "theta.vel": float}
     """
@@ -643,6 +646,12 @@ def get_vr_base_action(left_goal, right_goal, robot):
     # Safety: if VR thumbstick metadata is stale, force base to stop.
     STALE_MS = 300
 
+    # Hold LEFT thumbstick click to boost base speed (RIGHT click is the depth-view toggle).
+    left_meta = _safe_metadata(left_goal)
+    if bool(_safe_buttons(left_meta).get("thumbstick", False)) and boost_multiplier > 1.0:
+        xy_speed *= boost_multiplier
+        theta_speed *= boost_multiplier
+
     # Right thumbstick controls XY translation (like keyboard i/k/j/l)
     right_meta = _safe_metadata(right_goal)
     if right_meta:
@@ -660,7 +669,6 @@ def get_vr_base_action(left_goal, right_goal, robot):
             y_cmd = -thumb_x * xy_speed
 
     # Left thumbstick X-axis controls rotation (like keyboard u/o); Y used for lift in get_vr_lift_action
-    left_meta = _safe_metadata(left_goal)
     if left_meta:
         if left_meta.get("base_stop", False) is True:
             return {"x.vel": 0.0, "y.vel": 0.0, "theta.vel": 0.0}
@@ -815,6 +823,13 @@ class XLerobotVRTeleop(Teleoperator):
         # (RIGHT A by default), read by s1_process / DAgger via get_teleop_events()
         self._intervention_active = False
 
+        # Optional ROS2 nav relay (see config.nav_relay_ip) for the nav_* button_map
+        # actions. Lazily created in connect() only if nav_relay_ip is set, so pyzmq
+        # (an optional lerobot extra, see pyproject.toml's pyzmq-dep) is never
+        # required just to use VR teleop without navigation.
+        self._nav_relay_context = None
+        self._nav_relay_socket = None
+
         self.logs = {}
 
     @property
@@ -906,7 +921,12 @@ class XLerobotVRTeleop(Teleoperator):
             self._connected = True
             
             # Initialize VR event handler
-            self.vr_event_handler = VREventHandler(self.vr_monitor, button_map=self.config.button_map)
+            self._connect_nav_relay()
+            self.vr_event_handler = VREventHandler(
+                self.vr_monitor,
+                button_map=self.config.button_map,
+                nav_relay_push=self._push_nav_relay if self._nav_relay_socket is not None else None,
+            )
             logger.info("🎮 VR event handler initialized")
             
             # Store robot reference for use in get_action
@@ -1338,7 +1358,9 @@ class XLerobotVRTeleop(Teleoperator):
             head_action = self.head_control.p_control_action(robot_obs) if self.head_control is not None else self._get_noop_head_action(robot_obs)
             
             # Base control - ALWAYS try to get base action (even if goals are None)
-            base_action = get_vr_base_action(left_goal, right_goal, self.robot)
+            base_action = get_vr_base_action(
+                left_goal, right_goal, self.robot, self.config.base_boost_multiplier
+            )
             # Lift axis - left thumbstick Y (up/down), normalized and smoothed
             lift_action = get_vr_lift_action(left_goal, self.robot, self._lift_state)
 
@@ -1438,19 +1460,61 @@ class XLerobotVRTeleop(Teleoperator):
     def configure(self) -> None:
         pass
 
+    def _connect_nav_relay(self) -> None:
+        """Open the optional ZMQ PUSH socket to nav_goal_relay_node, if configured.
+
+        No-op (and no pyzmq import) when `config.nav_relay_ip` is unset -- this keeps
+        the nav_* button_map actions harmless no-ops for anyone who hasn't set up the
+        ROS2 nav stack (see ros2_ws/README.md).
+        """
+        if not self.config.nav_relay_ip:
+            return
+        try:
+            import zmq
+        except ImportError:
+            logger.warning(
+                "nav_relay_ip is set but pyzmq is not installed (pip install "
+                "'lerobot[pyzmq-dep]'); nav_* button_map actions will be no-ops."
+            )
+            return
+
+        self._nav_relay_context = zmq.Context()
+        self._nav_relay_socket = self._nav_relay_context.socket(zmq.PUSH)
+        self._nav_relay_socket.setsockopt(zmq.CONFLATE, 1)
+        self._nav_relay_socket.connect(
+            f"tcp://{self.config.nav_relay_ip}:{self.config.nav_relay_port}"
+        )
+        logger.info(
+            f"🧭 Nav relay connected to {self.config.nav_relay_ip}:{self.config.nav_relay_port}"
+        )
+
+    def _push_nav_relay(self, command: dict) -> None:
+        """Forward one nav_* button_map command to nav_goal_relay_node. See _dispatch_semantic."""
+        if self._nav_relay_socket is None:
+            return
+        import json
+
+        self._nav_relay_socket.send_string(json.dumps(command))
+
     def disconnect(self) -> None:
         """Disconnect VR connection"""
         if not self.is_connected:
             raise RuntimeError(
                 "XLerobot VR is not connected."
             )
-        
+
         try:
             self._stop_camera_stream_thread()
 
             if self.vr_monitor:
                 # VR Monitor usually runs in a thread, stop the thread
                 pass
+
+            if self._nav_relay_socket is not None:
+                self._nav_relay_socket.close()
+                self._nav_relay_context.term()
+                self._nav_relay_socket = None
+                self._nav_relay_context = None
 
             self._connected = False
             self._calibrated = False
@@ -1666,6 +1730,17 @@ def init_vr_listener(teleop_vr):
     
     return vr_listener, events
 
+# Maps the nav_* button_map semantics (see configuration_xlerobot_vr.py) to the
+# JSON command dicts nav_goal_relay_node expects on its ZMQ PULL socket.
+_NAV_RELAY_COMMANDS: dict[str, dict] = {
+    "nav_next_waypoint": {"cmd": "next_waypoint"},
+    "nav_confirm_goal": {"cmd": "confirm_goal"},
+    "nav_cancel": {"cmd": "cancel"},
+    "nav_save_waypoint": {"cmd": "save_waypoint"},
+    "nav_toggle_explore": {"cmd": "toggle_explore"},
+}
+
+
 class VREventHandler:
     """
     VR event handler: turns discrete controller button presses into session /
@@ -1692,12 +1767,21 @@ class VREventHandler:
     # A tap does nothing: operators instinctively press X again once recording is under way (see DEFAULT_VR_BUTTON_MAP).
     _X_HOLD_RESTART_S = 1.0
 
-    def __init__(self, vr_monitor, button_map: dict[str, str] | None = None):
+    def __init__(
+        self,
+        vr_monitor,
+        button_map: dict[str, str] | None = None,
+        nav_relay_push=None,
+    ):
         self.vr_monitor = vr_monitor
         # NOTE: check `is None`, not truthiness -- an explicitly empty `{}` must
         # disable all session/DAgger buttons rather than silently falling back
         # to the defaults.
         self.button_map = dict(button_map) if button_map is not None else dict(DEFAULT_VR_BUTTON_MAP)
+        # Callable[[dict], None] forwarding nav_* semantics to nav_goal_relay_node
+        # (see XLerobotVRTeleop._push_nav_relay). None if no nav relay is configured,
+        # in which case nav_* button_map bindings are logged but otherwise no-ops.
+        self.nav_relay_push = nav_relay_push
         self.events = {
             "exit_early": False,       # Episode: exit loop early (save & continue)
             "rerecord_episode": False, # Episode: discard and re-record
@@ -1811,6 +1895,15 @@ class VREventHandler:
             logger.info("🎮 VR %s.%s held -> Passthrough %s", controller, button, state_str)
             if self.vr_monitor is not None:
                 self.vr_monitor.send_status({"passthrough_enabled": self._passthrough_enabled})
+        elif semantic in _NAV_RELAY_COMMANDS:
+            logger.info("🧭 VR %s.%s pressed -> nav relay %r", controller, button, semantic)
+            if self.nav_relay_push is not None:
+                self.nav_relay_push(_NAV_RELAY_COMMANDS[semantic])
+            else:
+                logger.debug(
+                    "%s has no effect: configure --teleop.nav_relay_ip to enable nav_* actions",
+                    semantic,
+                )
         elif semantic is not None:
             logger.debug("VR %s.%s is mapped to unknown semantic action %r", controller, button, semantic)
 
@@ -2064,6 +2157,11 @@ class VREventHandler:
         "reset_position": "Reset robot to rest pose",
         "toggle_intervention": "Toggle intervention ON/OFF (DAgger handover)",
         "upload_dataset": "Upload dataset to Hub on demand",
+        "nav_next_waypoint": "Nav: cycle selected waypoint (requires nav_relay_ip)",
+        "nav_confirm_goal": "Nav: send Nav2 goal for selected waypoint",
+        "nav_cancel": "Nav: cancel active Nav2 goal",
+        "nav_save_waypoint": "Nav: save current pose as a new waypoint",
+        "nav_toggle_explore": "Nav: start/stop autonomous frontier exploration",
     }
     _BUTTON_LABELS = {
         "left.x": "LEFT X button",

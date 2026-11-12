@@ -295,18 +295,22 @@ lerobot-record \
 # Pick-up task dataset (current OB15 hardware — robot.type renamed xlerobot -> ob15;
 # teleop stays xlerobot_vr). Edit repo_id/single_task/num_episodes for your specific task.
 # --resume=true requires --dataset.root explicitly (writes to the Hub revision cache otherwise
-# refuses, to avoid corrupting it) — reuse the same root on every batch for the same repo_id.
+# refuses, to avoid corrupting it) — reuse the same root on every batch
+ for the same repo_id.
 lerobot-record \
     --robot.type=ob15 \
     --teleop.type=xlerobot_vr \
     --dataset.repo_id=Odog16/keys_into_bowl_ob15 \
     --dataset.root=/home/jetson/.cache/huggingface/lerobot/Odog16/keys_into_bowl_ob15 \
-    --dataset.single_task="pick up the keys and place it in the blue bowl" \
+    --dataset.single_task="pick up the keys and put them in the blue bowl" \
     --dataset.num_episodes=20 \
     --dataset.episode_time_s=180 \
     --dataset.reset_time_s=10 \
     --dataset.fps=30 \
     --dataset.push_to_hub=true \
+    --dataset.streaming_encoding=true \
+    --dataset.encoder_threads=2 \
+    --dataset.rgb_encoder.vcodec=h264 \
     --resume=true
 
 
@@ -1553,6 +1557,39 @@ python -m lerobot.async_inference.robot_client \
     --pretrained_name_or_path=Odog16/trash_pickup_SmolVLA_v2.1_rabc_15k\
     --policy_device=cuda \
     --actions_per_chunk=42 \
+    --chunk_size_threshold=0.5 \
+    --aggregate_fn_name=weighted_average \
+    --fps=30
+
+
+# KEYS INTO BOWL — SmolVLA async inference (dataset recorded: Odog16/keys_into_bowl_ob15,
+# robot.type=ob15). No policy trained yet as of 2026-09-06 — train it first, e.g.:
+#   lerobot-train --dataset.repo_id=Odog16/keys_into_bowl_ob15 --policy.type=smolvla \
+#     --policy.repo_id=Odog16/keys_into_bowl_ob15_SmolVLA_v1 --policy.push_to_hub=true \
+#     --policy.pretrained_path=lerobot/smolvla_base --policy.train_expert_only=true \
+#     --policy.train_state_proj=true --policy.use_amp=true --policy.num_vlm_layers=16 \
+#     --policy.chunk_size=35 --policy.n_action_steps=35 \
+#     --output_dir=outputs/train/keys_into_bowl_ob15_SmolVLA_v1 \
+#     --job_name=keys_into_bowl_ob15_SmolVLA_v1 --batch_size=16 --steps=20000 \
+#     --save_freq=5000 --log_freq=200 --num_workers=4 \
+#     --scheduler.type=cosine_decay_with_warmup --scheduler.peak_lr=1e-4 \
+#     --scheduler.decay_lr=2.5e-6 --scheduler.num_warmup_steps=1000 \
+#     --scheduler.num_decay_steps=18000 --seed=1000 --wandb.enable=true --wandb.project=lerobot
+#
+# Step 1 — ON EXTERNAL GPU MACHINE: start the policy server (same as other tasks above):
+#   python -m lerobot.async_inference.policy_server \
+#     --host=0.0.0.0 --port=8080 --fps=30 --inference_latency=0.033 --obs_queue_timeout=1.0
+#
+# Step 2 — ON JETSON: run the robot client (edit --server_address to the GPU machine's LAN IP,
+# and --pretrained_name_or_path once training above produces a checkpoint/Hub repo):
+python -m lerobot.async_inference.robot_client \
+    --server_address=<GPU_MACHINE_IP>:8080 \
+    --robot.type=ob15 \
+    --task="pick up the keys and put them in the blue bowl" \
+    --policy_type=smolvla \
+    --pretrained_name_or_path=Odog16/keys_into_bowl_ob15_SmolVLA_v1 \
+    --policy_device=cuda \
+    --actions_per_chunk=35 \
     --chunk_size_threshold=0.5 \
     --aggregate_fn_name=weighted_average \
     --fps=30
