@@ -167,3 +167,81 @@ def test_dispatch_semantic_is_idempotent_when_unmapped_button_omitted(semantic):
         "upload_dataset": ("upload_requested", True),
     }[semantic]
     assert handler.events[expected[0]] is expected[1]
+
+
+# --- hold LEFT X to restart the episode -----------------------------------------------------------------------
+
+
+@pytest.fixture
+def clock(monkeypatch):
+    t = {"now": 1000.0}
+    monkeypatch.setattr("lerobot.teleoperators.xlerobot_vr.xlerobot_vr.time.monotonic", lambda: t["now"])
+    return t
+
+
+def _hold_x(handler, clock, seconds, step=0.1):
+    """Press X, keep holding it for ``seconds``, release it."""
+    handler._process_left_controller(_meta({"x": True}))
+    for _ in range(int(seconds / step)):
+        clock["now"] += step
+        handler._process_left_controller(_meta({"x": True}))
+    handler._process_left_controller(_meta({"x": False}))
+
+
+def _gate_open(handler, clock):
+    handler.reset_recording_gate()
+    handler._process_left_controller(_meta({"x": True}))
+    handler._process_left_controller(_meta({"x": False}))
+    clock["now"] += 0.2
+    assert handler.awaiting_recording_start is False
+
+
+def test_holding_x_to_open_the_recording_gate_does_not_restart_the_episode(clock):
+    handler = VREventHandler(vr_monitor=None)
+    handler.reset_recording_gate()
+    _hold_x(handler, clock, 3.0)  # a long hold that opens the gate
+    assert handler.events["recording_gate_open"] is True
+    assert handler.events["rerecord_episode"] is False and handler.events["exit_early"] is False
+
+
+def test_a_quick_x_tap_after_the_gate_is_still_harmless(clock):
+    handler = VREventHandler(vr_monitor=None)
+    _gate_open(handler, clock)
+    for _ in range(4):  # instinctive re-presses
+        _hold_x(handler, clock, 0.3)
+        clock["now"] += 0.3
+    assert handler.events["rerecord_episode"] is False and handler.events["exit_early"] is False
+
+
+def test_holding_x_after_the_gate_restarts_the_episode_once(clock):
+    handler = VREventHandler(vr_monitor=None)
+    _gate_open(handler, clock)
+    handler._process_left_controller(_meta({"x": True}))
+    clock["now"] += 0.9
+    handler._process_left_controller(_meta({"x": True}))
+    assert handler.events["rerecord_episode"] is False  # not yet: held for less than 1 s
+    clock["now"] += 0.2
+    handler._process_left_controller(_meta({"x": True}))
+    assert handler.events["rerecord_episode"] is True and handler.events["exit_early"] is True
+    handler.events["rerecord_episode"] = handler.events["exit_early"] = False
+    clock["now"] += 2.0
+    handler._process_left_controller(_meta({"x": True}))  # still held: must not fire a second time
+    assert handler.events["rerecord_episode"] is False
+
+
+def test_left_y_still_restarts_with_a_single_tap(clock):
+    handler = VREventHandler(vr_monitor=None)
+    _gate_open(handler, clock)
+    handler._process_left_controller(_meta({"y": True}))
+    assert handler.events["rerecord_episode"] is True
+
+
+def test_a_dropped_packet_mid_hold_does_not_reset_the_hold_timer(clock):
+    handler = VREventHandler(vr_monitor=None)
+    _gate_open(handler, clock)
+    handler._process_left_controller(_meta({"x": True}))
+    clock["now"] += 0.6
+    handler._process_left_controller(_meta({}))  # a packet without the 'x' key is a glitch, not a release
+    clock["now"] += 0.6
+    handler._process_left_controller(_meta({"x": True}))
+    assert handler.events["rerecord_episode"] is True

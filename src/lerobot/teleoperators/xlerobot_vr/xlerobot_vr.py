@@ -1141,7 +1141,8 @@ class XLerobotVRTeleop(Teleoperator):
 
     def send_episode_event(self, event: str) -> None:
         """Notify the VR headset that episode recording has started or stopped, so it can play a
-        distinct audio cue. `event` is "start" or "stop". Sent as its own status ping (not tied
+        distinct audio cue. `event` is "start", "stop" or "restart" (the episode is being discarded
+        and re-recorded). Sent as its own status ping (not tied
         to the once-a-second recording status cadence) so the sound plays right when it happens.
         No-op unless config.stream_cameras_to_vr is enabled.
         """
@@ -1686,6 +1687,9 @@ class VREventHandler:
     # instead of a tap (its normal button_map semantic, dispatched on release). See
     # ``_process_left_menu``.
     _LONG_PRESS_S = 0.6
+    # Holding LEFT X this long (after the recording gate has opened) restarts the episode, like a tap of LEFT Y.
+    # A tap does nothing: operators instinctively press X again once recording is under way (see DEFAULT_VR_BUTTON_MAP).
+    _X_HOLD_RESTART_S = 1.0
 
     def __init__(self, vr_monitor, button_map: dict[str, str] | None = None):
         self.vr_monitor = vr_monitor
@@ -1713,6 +1717,8 @@ class VREventHandler:
             'trigger': False,
             # Left controller buttons
             'button_x': False,
+            'x_press_start_ts': None,  # when the current post-gate X press began (None: not counting)
+            'x_hold_fired': False,
             'button_y': False,
             'button_thumbstick': False,
             'button_menu': False,
@@ -1919,6 +1925,9 @@ class VREventHandler:
             if pressed and not prev_pressed:
                 self.awaiting_recording_start = False
                 self.events["recording_gate_open"] = True
+                # The press that opens the gate must not count towards the hold-to-restart below.
+                self.prev_states['x_press_start_ts'] = None
+                self.prev_states['x_hold_fired'] = False
                 logger.info("🎮 VR left.x pressed -> Recording gate open")
                 if self.vr_monitor is not None:
                     self.vr_monitor.send_status({"recording_enabled": True})
@@ -1928,6 +1937,23 @@ class VREventHandler:
             # lerobot_record.py's wait loop; later packets in the same 0.5s record_loop
             # burst would otherwise overwrite it back to False via events.update() and
             # the wait would never observe the press.
+            # Hold-to-restart: only presses that BEGIN after the gate opened are timed, so holding X to start
+            # recording (or a stray tap) never discards anything.
+            now = time.monotonic()
+            if pressed and not prev_pressed:
+                self.prev_states['x_press_start_ts'] = now
+                self.prev_states['x_hold_fired'] = False
+            elif pressed and prev_pressed:
+                start = self.prev_states.get('x_press_start_ts')
+                if (
+                    start is not None
+                    and not self.prev_states.get('x_hold_fired')
+                    and now - start >= self._X_HOLD_RESTART_S
+                ):
+                    self.prev_states['x_hold_fired'] = True
+                    self._dispatch_semantic("rerecord_episode", "left", "x (hold)")
+            elif not pressed:
+                self.prev_states['x_press_start_ts'] = None
             # `pressed` already absorbed the missing-key guard above, so no need to pass
             # guard_missing/raw_buttons through here too.
             self._process_button("left", "x", pressed, "button_x", ts_key="left_x_last_press_ts")
@@ -2086,8 +2112,9 @@ class VREventHandler:
             (tap instead for its normal button_map action above)
           - LEFT X button: at the start of each episode, robot is driven but NOT recorded
             until X is pressed once (plays a ding) — reposition freely first, then press X
-            to start capturing frames. After that, X does nothing by default (not bound in
-            button_map) so pressing it again mid-episode can't accidentally discard progress.
+            to start capturing frames. After that a quick X tap does nothing (so pressing it again
+            mid-episode can't accidentally discard progress); HOLD X for ~{self._X_HOLD_RESTART_S:.1f}s to
+            restart (discard and re-record) the episode, same as tapping LEFT Y.
         ===================================================================
         """
         logger.info(guide)
