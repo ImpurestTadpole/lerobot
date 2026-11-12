@@ -937,7 +937,7 @@ class OB15(Robot):
             present_pos_right = self._group_bus["right_arm"].sync_read("Present_Position", self.right_arm_motors)
 
             # Combine all present positions
-            present_pos = {**present_pos_left, **present_pos_right}
+            present_pos = {f"{k}.pos": v for k, v in {**present_pos_left, **present_pos_right}.items()}
 
             # Ensure safe goal position for each arm
             goal_present_pos = {

@@ -227,7 +227,7 @@ class DAggerStrategyConfig(RolloutStrategyConfig):
     3. **upload** — push dataset to hub on demand (corrections-only mode).
 
     ``input_device="teleop"`` polls ``teleop.get_teleop_events()`` each control
-    tick and follows its ``is_intervention`` toggle (e.g. the RIGHT A button on
+    tick and follows its ``is_intervention`` toggle (e.g. the RIGHT B button on
     the xlerobot VR teleop): ON drives AUTONOMOUS → PAUSED → CORRECTING, OFF
     drives CORRECTING → PAUSED → AUTONOMOUS.  A keyboard listener stays active
     for ESC (stop) and upload only.
