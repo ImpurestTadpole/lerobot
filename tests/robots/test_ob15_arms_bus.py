@@ -665,3 +665,81 @@ def test_lift_exit_option_releases_it_when_asked(make_robot, caplog):
     released_bus = released._group_bus["lift"]
     released.disconnect()
     assert "gantry" in released_bus.torque_released
+
+
+def test_record_resume_appends_a_second_task_to_the_same_dataset(tmp_path, monkeypatch):
+    """One combined dataset: later sessions resume it and only change the task string (and arm/bracket)."""
+    monkeypatch.setattr("lerobot.robots.ob15_arms.ob15_arms.HOLD_POLL_S", 0.0)
+    real_init = OB15Arms.__init__
+
+    def init_homed(self, config):
+        real_init(self, config)
+        self.lift_axis._homed = True
+        self.lift_axis._z0_deg = 100.0 / self.lift_axis._mm_per_deg
+
+    root = tmp_path / "combined"
+    green = "cleaning up green brackets with the right arm"
+    brown = "cleaning up brown brackets with the left arm"
+
+    def session(task, resume, head_tilt):
+        cfg = RecordConfig(
+            robot=OB15ArmsConfig(
+                cameras={}, calibration_dir=tmp_path / "cal", head_tilt=head_tilt, lift_height_mm=0.0
+            ),
+            teleop=_VRLikeTeleopConfig(),
+            dataset=DatasetRecordConfig(
+                repo_id="local/cleaning_up_brackets",
+                single_task=task,
+                root=root,
+                fps=10,
+                episode_time_s=1,
+                reset_time_s=0,
+                num_episodes=2,
+                push_to_hub=False,
+                video=False,
+                no_stamp=True,  # the name stays exactly as given, so a later session finds the same dataset
+            ),
+            resume=resume,
+            play_sounds=False,
+        )
+        with (
+            patch(_FB, side_effect=FakeBus),
+            patch.object(OB15Arms, "__init__", init_homed),
+            patch.object(OB15, "calibrate", lambda self: None),
+            patch("lerobot.scripts.lerobot_record.make_teleoperator_from_config", _VRLikeTeleop),
+        ):
+            return record(cfg)
+
+    first = session(green, resume=False, head_tilt=65.0)
+    assert (first.num_episodes, first.num_frames) == (2, 20)
+    # a slightly different head pose than the first session, like the real green/brown sessions
+    second = session(brown, resume=True, head_tilt=62.0)
+
+    assert (second.num_episodes, second.num_frames) == (4, 40)  # appended, not a new dataset
+    assert set(second.meta.tasks.index) == {green, brown}
+    import glob
+
+    import pandas as pd
+
+    episodes = pd.concat(
+        [
+            pd.read_parquet(f)
+            for f in sorted(glob.glob(str(root / "meta" / "episodes" / "**" / "*.parquet"), recursive=True))
+        ]
+    )
+    assert [list(t) for t in episodes.sort_values("episode_index")["tasks"]] == [
+        [green],
+        [green],
+        [brown],
+        [brown],
+    ]
+    frames = pd.concat(
+        [
+            pd.read_parquet(f)
+            for f in sorted(glob.glob(str(root / "data" / "**" / "*.parquet"), recursive=True))
+        ]
+    )
+    task_index = frames.sort_values("index")["task_index"].to_numpy()
+    assert set(task_index[:20]) != set(task_index[20:])  # frames carry their own task
+    # the dataset keeps its original hold pose; the differing second session is reported, not silently mixed
+    assert read_hold_file(str(root))["head_tilt.pos"] == 65.0

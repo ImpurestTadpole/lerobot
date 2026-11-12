@@ -133,3 +133,18 @@ The lift motor holds the arms' weight, so it is protected against overheating:
 - **End of session**: the lift stays torqued at the top and a warning says so. Cut the robot's power when you walk
   away, or pass `--robot.release_lift_on_disconnect=true` to let it lower on exit instead.
 - The top is approached no closer than 1 mm (`soft_min_mm`), and homing's brief stall at the hard stop is unchanged.
+
+## One dataset, several tasks
+
+Keep recording into the same dataset and change only the task string. `lerobot-record` appends a timestamp to
+`--dataset.repo_id` unless you pass `--dataset.no_stamp=true`, so a plain re-run starts a *new* dataset. To append:
+
+```bash
+lerobot-record --robot.type=ob15_arms --teleop.type=xlerobot_vr \
+    --dataset.repo_id=<user>/cleaning_up_brackets --dataset.no_stamp=true --resume=true \
+    --dataset.single_task="cleaning up brown brackets with the left arm" ...
+```
+
+Each episode keeps its own task (`meta/tasks.parquet`, `task_index`). The dataset's `ob15_hold.json` keeps the pose of
+the session that created it; a later session with a pose beyond the tolerances logs a warning and does not overwrite it
+(`--dataset.overwrite_hold=true` replaces it). Resuming needs the `deepdiff` package (`pip install deepdiff`).
