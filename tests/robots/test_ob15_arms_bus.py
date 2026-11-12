@@ -38,6 +38,7 @@ from lerobot.robots.ob15_arms.arms_only import (
     ARM_KEYS,
     BASE_KEYS,
     DEFAULT_HEAD_TILT_DEG,
+    DEFAULT_LIFT_MM,
     hold_reached,
     read_hold_file,
     write_hold_file,
@@ -524,10 +525,13 @@ def test_ob15_arms_zeroes_the_lift_at_the_top_and_can_reach_zero(tmp_path):
     assert robot.lift_axis.cfg.soft_min_mm == 1.0  # one millimetre of margin so it never presses the stop
 
 
-def test_no_flags_holds_the_lift_at_the_top(make_robot):
+def test_no_flags_holds_the_default_lift_height(make_robot):
     robot = make_robot()  # the fixture's lift starts 100 mm below the top
-    assert robot.get_observation()[LIFT] == pytest.approx(0.0, abs=robot.config.lift_tol_mm)
-    assert robot.hold_metadata()["hold"][LIFT] == 0.0
+    assert DEFAULT_LIFT_MM == 25.0
+    assert robot.get_observation()[LIFT] == pytest.approx(DEFAULT_LIFT_MM, abs=robot.config.lift_tol_mm)
+    assert robot.hold_metadata()["hold"][LIFT] == DEFAULT_LIFT_MM
+    # an explicit height still wins, and 0 is still the top
+    assert make_robot(lift_height_mm=0.0).hold_metadata()["hold"][LIFT] == 0.0
 
 
 def test_explicit_lift_height_and_hold_on_connect_false_still_win(make_robot):

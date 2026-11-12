@@ -32,8 +32,10 @@ ignores `hold_from`.
 
 The lift is homed to the top at connect and **stays torqued there**. (Plain `ob15` releases the lift's torque after
 homing so gravity lowers it; `ob15_arms` sets `lift_axis.release_torque_after_home=False`.) With no
-`--robot.lift_height_mm` it holds at the top (0 mm = the top hard stop itself, `lift_axis.zero_at_limit=True`;
-plain `ob15` zeroes 10 mm lower, at the point homing backs off to). A height you pass is measured down from the top.
+`--robot.lift_height_mm` it holds **25 mm below the top** (`DEFAULT_LIFT_MM`; 0 mm = the top hard stop itself,
+`lift_axis.zero_at_limit=True`; plain `ob15` zeroes 10 mm lower, at the point homing backs off to). The lift carries the
+arms, not the head camera: lowering it sinks the arms in the head view (measured: 25 mm keeps them clearly in view,
+50 mm partly, 75 mm barely). `--robot.lift_height_mm=0` is the top. A height you pass is measured down from the top.
 Datasets recorded before this change have lift heights measured from the old zero, 10 mm lower.
 
 ## The dataset remembers the hold pose (`hold_from`)
@@ -130,7 +132,7 @@ The lift motor holds the arms' weight, so it is protected against overheating:
 - **Temperature guard** (checked every `--robot.lift_health_period_s`, default 5 s): a warning at
   `--robot.lift_temp_warn_c` (55 C); at `--robot.lift_temp_stop_c` (65 C, `None` disables) the lift's torque is released
   so it cannot burn out. The lift then lowers, and `ob15_arms` does not command it again until the next connect.
-- **End of session**: the lift stays torqued at the top and a warning says so. Cut the robot's power when you walk
+- **End of session**: the lift stays torqued where it is and a warning says so. Cut the robot's power when you walk
   away, or pass `--robot.release_lift_on_disconnect=true` to let it lower on exit instead.
 - The top is approached no closer than 1 mm (`soft_min_mm`), and homing's brief stall at the hard stop is unchanged.
 
