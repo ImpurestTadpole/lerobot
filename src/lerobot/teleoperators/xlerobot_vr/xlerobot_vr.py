@@ -1144,9 +1144,10 @@ class XLerobotVRTeleop(Teleoperator):
         distinct audio cue. `event` is "start", "stop" or "restart" (the episode is being discarded
         and re-recorded). Sent as its own status ping (not tied
         to the once-a-second recording status cadence) so the sound plays right when it happens.
-        No-op unless config.stream_cameras_to_vr is enabled.
+        Independent of config.stream_cameras_to_vr: the chimes must work with camera streaming off (it is
+        often turned off to save CPU). No-op only when the VR monitor is not running.
         """
-        if not self.config.stream_cameras_to_vr or self.vr_monitor is None:
+        if self.vr_monitor is None:
             return
         # Include recording_active so a partial ping still updates the HUD indicator
         # (the client merges status fields; without this the REC/READY state would
