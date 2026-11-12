@@ -538,6 +538,11 @@ def record_loop(
             last_status_print = timestamp
 
 
+def _episode_end_event(events: dict) -> str:
+    """VR headset cue for the end of an episode attempt: "restart" when it is being discarded, else "stop"."""
+    return "restart" if events.get("rerecord_episode") else "stop"
+
+
 @parser.wrap()
 def record(
     cfg: RecordConfig,
@@ -775,7 +780,7 @@ def record(
                     depth_read_interval=cfg.dataset.depth_read_interval,
                 )
                 if isinstance(teleop, Teleoperator) and hasattr(teleop, "send_episode_event"):
-                    teleop.send_episode_event("stop")
+                    teleop.send_episode_event(_episode_end_event(events))
                 events.pop("_episode_idx", None)
                 events.pop("_episode_total", None)
                 events.pop("_recording_active", None)

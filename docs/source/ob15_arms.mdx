@@ -150,3 +150,17 @@ lerobot-record --robot.type=ob15_arms --teleop.type=xlerobot_vr \
 Each episode keeps its own task (`meta/tasks.parquet`, `task_index`). The dataset's `ob15_hold.json` keeps the pose of
 the session that created it; a later session with a pose beyond the tolerances logs a warning and does not overwrite it
 (`--dataset.overwrite_hold=true` replaces it). Resuming needs the `deepdiff` package (`pip install deepdiff`).
+
+## VR recording buttons and headset chimes
+
+| Button | Action |
+|---|---|
+| LEFT X (tap) | Open the recording gate at the start of each episode (the robot is driven but nothing is recorded until then). After that a quick tap does nothing, so an instinctive re-press cannot discard an episode. |
+| LEFT Y (tap) | Restart (discard and re-record) the current episode. |
+| LEFT X (**hold ~1 s**, after the gate is open) | Restart the episode, same as LEFT Y. A hold that starts the recording does not count. |
+| RIGHT A | Finish the episode early (saved). |
+| LEFT Menu (tap / hold ~0.6 s) | Stop the session / toggle passthrough. |
+
+The headset plays a different chime for each event (`vr_app.js` in XLeVR): **start** a rising three-note chime, **stop** a
+lower falling three-note chime, **restart** a fast falling four-note buzzy "rewind" blip. After a restart you press LEFT X
+again to open the gate for the new attempt, which plays the start chime.

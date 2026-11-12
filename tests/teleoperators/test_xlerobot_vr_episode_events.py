@@ -48,3 +48,19 @@ def test_no_event_is_sent_without_the_vr_stream(kwargs):
     t.send_episode_event("start")  # must not raise
     if t.vr_monitor is not None:
         t.vr_monitor.send_status.assert_not_called()
+
+
+def test_restart_is_its_own_event_and_does_not_mark_recording_active():
+    t = _teleop()
+    t.send_episode_event("restart")
+    assert [c.args[0] for c in t.vr_monitor.send_status.call_args_list] == [
+        {"episode_event": "restart", "recording_active": False}
+    ]
+
+
+def test_the_record_loop_sends_restart_when_the_episode_is_discarded_else_stop():
+    from lerobot.scripts.lerobot_record import _episode_end_event
+
+    assert _episode_end_event({"rerecord_episode": True}) == "restart"
+    assert _episode_end_event({"rerecord_episode": False}) == "stop"
+    assert _episode_end_event({}) == "stop"
