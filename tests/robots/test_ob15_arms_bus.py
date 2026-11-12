@@ -748,3 +748,35 @@ def test_record_resume_appends_a_second_task_to_the_same_dataset(tmp_path, monke
     assert set(task_index[:20]) != set(task_index[20:])  # frames carry their own task
     # the dataset keeps its original hold pose; the differing second session is reported, not silently mixed
     assert read_hold_file(str(root))["head_tilt.pos"] == 65.0
+
+
+def test_rollout_state_includes_gantry_height(make_robot):
+    """The rollout must hand the policy the same 15-value state the OB15 datasets were recorded with.
+
+    ``gantry.height_mm`` has no ``.pos`` suffix; a ``.pos``/``.vel``-only filter used to drop it, so a
+    15-wide checkpoint saw 14 values on the real robot.
+    """
+    from lerobot.rollout.context import _select_state_features
+
+    robot = make_robot()
+    state = [k for k, v in _select_state_features(robot.observation_features).items() if v is float]
+    assert len(state) == 15
+    assert state[:12] == list(ARM_KEYS)
+    assert state[12:] == ["head_pan.pos", "head_tilt.pos", "gantry.height_mm"]
+    # Base velocities stay out for the arms-only robot, and the action side is still the 12 arm keys.
+    assert not any(k.startswith(("x.", "y.", "theta.")) for k in state)
+    assert len(robot.action_features) == 12
+
+
+def test_select_state_features_keeps_cameras_and_filters_other_scalars():
+    from lerobot.rollout.context import _select_state_features
+
+    features = {
+        "a.pos": float,
+        "b.vel": float,
+        "gantry.height_mm": float,
+        "battery_voltage": float,
+        "cam": (480, 640, 3),
+    }
+    assert list(_select_state_features(features)) == ["a.pos", "b.vel", "gantry.height_mm", "cam"]
+    assert list(_select_state_features(features, keep_all=True)) == list(features)
