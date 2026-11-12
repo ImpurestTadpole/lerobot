@@ -60,6 +60,9 @@ BASE_KEYS: tuple[str, ...] = ("x.vel", "y.vel", "theta.vel")
 # (the green bracket data is at 65, the brown at 62.6). The robot keeps defaults HEAD_TILT_MARGIN inside the end of the range.
 DEFAULT_HEAD_TILT_DEG: float = 60.0
 HEAD_TILT_MARGIN_DEG = 2.0  # margin when the tilt is in degrees
+# The lift carries the arms (not the head camera): lowering it sinks the arms in the head view. Measured on the robot,
+# 25 mm keeps the arms clearly in view, 50 mm shows them partly, 75 mm barely. mm below the top hard stop.
+DEFAULT_LIFT_MM: float = 25.0
 HEAD_TILT_MARGIN_UNITS = 5.0  # margin when the tilt is in -100..100 units
 HEAD_TOL_DEG = 2.0
 LIFT_TOL_MM = 5.0

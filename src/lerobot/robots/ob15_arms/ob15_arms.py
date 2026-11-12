@@ -14,6 +14,7 @@ from ..ob15.ob15 import OB15
 from .arms_only import (
     BASE_KEYS,
     DEFAULT_HEAD_TILT_DEG,
+    DEFAULT_LIFT_MM,
     HEAD_TILT_MARGIN_DEG,
     HEAD_TILT_MARGIN_UNITS,
     arms_action_features,
@@ -94,8 +95,8 @@ class OB15Arms(OB15):
             current,
             self._lift_name,
             default_head_tilt=self._default_head_tilt() if cfg.hold_on_connect else None,
-            # homed lift: hold at the top (0 mm) unless told otherwise
-            default_lift_mm=0.0 if (cfg.hold_on_connect and self.lift_axis._homed) else None,
+            # homed lift: hold at DEFAULT_LIFT_MM below the top unless told otherwise
+            default_lift_mm=DEFAULT_LIFT_MM if (cfg.hold_on_connect and self.lift_axis._homed) else None,
         )
 
         self._hold = hold
