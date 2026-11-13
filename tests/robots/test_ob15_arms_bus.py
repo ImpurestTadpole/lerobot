@@ -797,3 +797,94 @@ def test_rollout_position_hold_contract(make_robot):
     wrapper.hold()  # re-sends the last applied targets
     for bus in robot._buses.values():
         assert all(isinstance(v, float) for v in bus.pos.values())
+
+
+# --- lift failsafe: a velocity-mode motor keeps its last command if the host dies -------------------------
+
+
+def _lift_bus(robot):
+    return robot._group_bus["lift"]
+
+
+def test_connect_zeroes_a_leftover_lift_velocity_before_anything_else(tmp_path, monkeypatch):
+    """The lift ran down non-stop after a killed run: a new session must stop it before any other lift write."""
+    monkeypatch.setattr("lerobot.robots.ob15_arms.ob15_arms.HOLD_POLL_S", 0.0)
+    config = OB15ArmsConfig(cameras={}, calibration_dir=tmp_path / "calib")
+    with patch(_FB, side_effect=FakeBus):
+        robot = OB15Arms(config)
+    bus = _lift_bus(robot)
+    bus.vel["gantry"] = 400  # left running by the previous process
+    robot.lift_axis._homed = True
+    robot.lift_axis._z0_deg = 100.0 / robot.lift_axis._mm_per_deg
+    with patch.object(OB15, "calibrate", lambda self: None):
+        robot.connect()
+    try:
+        lift_writes = [(item, v["gantry"]) for item, v in bus.writes if "gantry" in v]
+        assert lift_writes[0] == ("Goal_Velocity", 0), lift_writes[:3]
+    finally:
+        robot.disconnect()
+
+
+def test_shutdown_signal_stops_the_lift_latches_and_chains(make_robot):
+    import signal
+
+    seen = []
+    previous = signal.signal(signal.SIGHUP, lambda s, f: seen.append(s))  # what the rollout installs
+    try:
+        robot = make_robot()
+        bus = _lift_bus(robot)
+        bus.vel["gantry"] = 300
+        signal.raise_signal(signal.SIGHUP)
+        assert bus.vel["gantry"] == 0
+        assert seen == [signal.SIGHUP]  # the previous handler still ran (graceful shutdown)
+        # latched: a policy/teleop command can no longer start the lift again
+        bus.writes.clear()
+        robot.send_action({**_arm_action(1.0)})
+        assert all(v["gantry"] == 0 for item, v in bus.writes if item == "Goal_Velocity" and "gantry" in v)
+        assert bus.vel["gantry"] == 0
+        robot.disconnect()
+        assert signal.getsignal(signal.SIGHUP) is not robot._lift_signal_handler  # handler removed again
+    finally:
+        signal.signal(signal.SIGHUP, previous)
+
+
+def test_failsafe_is_removed_on_disconnect_and_restores_the_previous_handler(make_robot):
+    import signal
+
+    marker = lambda s, f: None  # noqa: E731
+    previous = signal.signal(signal.SIGTERM, marker)
+    try:
+        robot = make_robot()
+        assert signal.getsignal(signal.SIGTERM) == robot._lift_signal_handler
+        robot.disconnect()
+        assert signal.getsignal(signal.SIGTERM) is marker
+    finally:
+        signal.signal(signal.SIGTERM, previous)
+
+
+def test_homing_error_zeroes_the_lift_velocity(make_robot):
+    robot = make_robot()
+    lift = robot.lift_axis
+    bus = _lift_bus(robot)
+    lift._homed = False
+
+    def boom():
+        raise RuntimeError("bus error mid-homing")
+
+    lift._update_extended_ticks = boom
+    with pytest.raises(RuntimeError):
+        lift.home()
+    assert bus.vel["gantry"] == 0
+
+
+def test_lift_stop_does_not_configure_or_home(tmp_path):
+    from lerobot.robots.ob15.lift_axis import LiftAxis, LiftAxisConfig
+
+    bus = FakeBus("p", {})
+    lift = LiftAxis(LiftAxisConfig(enabled=True, home_on_connect=True), bus)
+    lift.attach()
+    bus.vel[lift.cfg.name] = 250
+    lift.stop()
+    assert bus.vel[lift.cfg.name] == 0
+    assert not any(item in ("Operating_Mode", "Torque_Enable") for item, _ in bus.writes)
+    assert not lift._configured and not lift._homed

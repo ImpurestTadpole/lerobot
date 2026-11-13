@@ -14,9 +14,13 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+import atexit
+import contextlib
 import logging
 import os
+import signal
 import sys
+import threading
 import time
 from concurrent.futures import ThreadPoolExecutor
 from functools import cached_property
@@ -169,6 +173,8 @@ class OB15(Robot):
         # if the motor is already present).
         self.lift_axis = LiftAxis(self.config.lift_axis, self._group_bus.get("lift"))
         self.lift_axis.attach()
+        self._lift_failsafe_prev: dict[int, Any] = {}
+        self._lift_failsafe_active = False
 
         self.left_arm_motors = list(group_motors["left_arm"])
         self.right_arm_motors = list(group_motors["right_arm"])
@@ -250,6 +256,10 @@ class OB15(Robot):
         for bus in self._buses.values():
             bus.connect()
 
+        # A velocity-mode motor keeps its last speed command when the program that set it dies (killed,
+        # terminal closed, crash), so the lift may still be running from an earlier session: stop it first.
+        self._zero_leftover_lift_velocity()
+
         # Check if calibration file exists and ask user if they want to restore it
         if self.calibration_fpath.is_file():
             logger.info(f"Calibration file found at {self.calibration_fpath}")
@@ -325,9 +335,75 @@ class OB15(Robot):
                 if self.config.camera_start_delay_s > 0 and idx < len(ordered_camera_names) - 1:
                     time.sleep(self.config.camera_start_delay_s)
 
-        self.configure()
+        # From here (homing included) a shutdown signal or exit stops the lift instead of leaving it running.
+        self._install_lift_failsafe()
+        try:
+            self.configure()
+        except BaseException:
+            self._remove_lift_failsafe()
+            raise
         self._base_vel_smooth = {"x.vel": 0.0, "y.vel": 0.0, "theta.vel": 0.0}
         logger.info(f"{self} connected.")
+
+    # -- lift failsafe -------------------------------------------------------------------------------
+    _LIFT_FAILSAFE_SIGNALS = ("SIGINT", "SIGTERM", "SIGHUP", "SIGQUIT")
+
+    def _zero_leftover_lift_velocity(self) -> None:
+        if not self.lift_axis.enabled:
+            return
+        self.lift_axis.clear_emergency_stop()
+        if self.lift_axis.zero_velocity():
+            logger.info("LiftAxis: zeroed any leftover velocity command from an earlier session")
+
+    def _lift_signal_handler(self, signum, frame) -> None:
+        """Stop the lift first, then hand the signal on to whatever handler was installed before ours."""
+        try:
+            self.lift_axis.emergency_stop()
+        except Exception:
+            pass
+        previous = self._lift_failsafe_prev.get(signum)
+        if callable(previous):
+            previous(signum, frame)
+        elif previous == signal.SIG_IGN:
+            return
+        elif signum == signal.SIGINT:
+            raise KeyboardInterrupt
+        else:  # default action: put it back and re-deliver so the process ends as it would have
+            signal.signal(signum, signal.SIG_DFL)
+            os.kill(os.getpid(), signum)
+
+    def _lift_atexit_stop(self) -> None:
+        with contextlib.suppress(Exception):
+            self.lift_axis.zero_velocity()
+
+    def _install_lift_failsafe(self) -> None:
+        if not self.lift_axis.enabled or self._lift_failsafe_active:
+            return
+        self._lift_failsafe_active = True
+        atexit.register(self._lift_atexit_stop)
+        if threading.current_thread() is not threading.main_thread():
+            return  # signal handlers can only be set from the main thread
+        for name in self._LIFT_FAILSAFE_SIGNALS:
+            sig = getattr(signal, name, None)
+            if sig is None:
+                continue
+            try:
+                previous = signal.getsignal(sig)
+                signal.signal(sig, self._lift_signal_handler)
+            except (ValueError, OSError):
+                continue
+            self._lift_failsafe_prev[sig] = previous
+
+    def _remove_lift_failsafe(self) -> None:
+        if not self._lift_failsafe_active:
+            return
+        self._lift_failsafe_active = False
+        atexit.unregister(self._lift_atexit_stop)
+        for sig, previous in self._lift_failsafe_prev.items():
+            with contextlib.suppress(ValueError, OSError):
+                if signal.getsignal(sig) == self._lift_signal_handler:  # leave a handler installed after ours alone
+                    signal.signal(sig, previous if previous is not None else signal.SIG_DFL)
+        self._lift_failsafe_prev = {}
 
     @property
     def is_calibrated(self) -> bool:
@@ -1038,6 +1114,7 @@ class OB15(Robot):
                 self.lift_axis.stop()
         except Exception:
             pass
+        self._remove_lift_failsafe()
 
         # Shutdown thread pool
         if hasattr(self, '_executor'):
