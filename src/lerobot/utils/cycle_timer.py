@@ -267,6 +267,10 @@ class CycleTimer:
         self._report = report if report is not None else logger.info
         # Pacing anchor — re-anchored by ``new_cycle``.
         self._cycle_start: float | None = None
+        # Ideal start of the next cycle (the previous cycle's last deadline). A cycle that
+        # begins slightly late is anchored here rather than at its actual start, so the
+        # small sleep overshoot of every tick does not accumulate into a slower rate.
+        self._next_cycle_start: float | None = None
         self._tick_start: float | None = None
         self._ticks_done = 0
         # Reporting accumulator — advanced strictly per tick, never re-anchored.
@@ -400,11 +404,40 @@ class CycleTimer:
                 self._window.period_samples.append(gap)
             if gap > self.cycle_interval * self.SLOW_TICK_FACTOR:
                 self._window.slow_ticks += 1
+        boundary = self._drop_next_gap  # an episode boundary or restart: start a fresh schedule
         self._drop_next_gap = False
         self._prev_tick_start = self._tick_start
         if new_cycle or self._cycle_start is None:
-            self._cycle_start = self._tick_start
+            self._cycle_start = self._schedule_anchor(
+                self._tick_start, cycle_finished=self._cycle_start is None and not boundary
+            )
             self._ticks_done = 0
+
+    #: A cycle that starts up to this many tick intervals after its ideal start keeps the
+    #: ideal schedule (the lateness is sleep overshoot or scheduler jitter and is absorbed
+    #: by a slightly shorter sleep). Later than that is a real stall or a pause: the
+    #: schedule re-anchors at the actual start instead of bursting to catch up.
+    SCHEDULE_SLACK_TICKS = 0.5
+
+    def reset_schedule(self) -> None:
+        """Forget the pacing schedule: the next tick anchors at its actual start time.
+
+        Call when a new phase begins (an episode or a reset period), so the phase's first tick is its
+        time zero and a fixed-length phase holds exactly ``duration * fps`` ticks.
+        """
+        self._next_cycle_start = None
+        self._cycle_start = None
+        self._ticks_done = 0
+
+    def _schedule_anchor(self, tick_start: float, *, cycle_finished: bool) -> float:
+        """Anchor for a new cycle: its ideal start if the previous cycle finished on schedule."""
+        ideal, self._next_cycle_start = self._next_cycle_start, None
+        if not cycle_finished or ideal is None:
+            return tick_start  # first tick, or the caller started a new cycle early
+        lateness = tick_start - ideal
+        if 0.0 <= lateness <= self.SCHEDULE_SLACK_TICKS * self.tick_interval:
+            return ideal
+        return tick_start
 
     def wait(self) -> None:
         """Sleep until this tick's deadline.  Call at the bottom of the loop body.
@@ -439,6 +472,7 @@ class CycleTimer:
         deadline = self._cycle_start + self._ticks_done * self.tick_interval
         if self._ticks_done >= self.multiplier:
             self._cycle_start = None
+            self._next_cycle_start = deadline
 
         warned = False
         if self._group_ticks >= self.multiplier:
