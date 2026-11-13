@@ -148,6 +148,18 @@ class ThreadSafeRobot:
                 self._record_hardware_failure("hold", exc)
                 raise
 
+    def settle(self) -> None:
+        """Let the robot stop any motion a finished command sequence left running (no-op when unsupported)."""
+        settle = getattr(self._robot, "settle", None)
+        if settle is None:
+            return
+        with self._lock:
+            try:
+                settle()
+            except Exception as exc:
+                self._record_hardware_failure("settle", exc)
+                raise
+
     # -- Read-only proxies (no lock needed) -----------------------------------
 
     @property

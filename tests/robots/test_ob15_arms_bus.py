@@ -1083,3 +1083,22 @@ def test_record_warns_loudly_when_the_rate_is_below_target(tmp_path, monkeypatch
     assert hz < 20, text
     warnings = [r.getMessage() for r in caplog.records if r.levelname == "WARNING" and "Achieved" in r.getMessage()]
     assert warnings and "against a 30 Hz target" in warnings[0] and "too fast" in warnings[0]
+
+
+def test_settle_zeroes_the_lift_velocity_a_finished_move_left_running(make_robot):
+    """A hold/reset sequence ends mid-creep; the velocity-mode lift must be stopped, not left drifting."""
+    robot = make_robot()
+    lift_bus = robot._group_bus["lift"]
+    robot.lift_axis.apply_action({"gantry.height_mm": 130.0})  # inside the slow near-target zone
+    assert _writes(robot, "Goal_Velocity", ["gantry"])[-1] != 0
+    robot.settle()
+    assert _writes(robot, "Goal_Velocity", ["gantry"])[-1] == 0
+    assert lift_bus is robot._group_bus["lift"]
+
+
+def test_settle_does_not_drive_a_released_lift(make_robot):
+    robot = make_robot()
+    robot._lift_released = True
+    n = len(_writes(robot, "Goal_Velocity", ["gantry"]))
+    robot.settle()
+    assert len(_writes(robot, "Goal_Velocity", ["gantry"])) == n
