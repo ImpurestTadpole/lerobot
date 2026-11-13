@@ -472,3 +472,52 @@ def test_cycle_timer_warns_per_episode_window(caplog, clock):
         timer.log_run_summary()
     messages = _achieved_warnings(caplog)
     assert len(messages) == 1 and "episode 0" not in messages[0]
+
+
+# ---------------------------------------------------------------------------
+# Absolute schedule: sleep overshoot must not accumulate into a slower rate
+# ---------------------------------------------------------------------------
+
+
+def _mean_period(clock, timer, ticks, work, new_cycle):
+    starts = []
+    for i in range(ticks):
+        timer.tick(new_cycle=new_cycle)
+        starts.append(clock.now)
+        clock.advance(work)
+        timer.wait()
+    return (starts[-1] - starts[0]) / (len(starts) - 1)
+
+
+@pytest.mark.parametrize("new_cycle", [False, True])
+def test_sleep_overshoot_does_not_slow_the_loop(clock, new_cycle):
+    """On the Jetson every pacing sleep returned ~0.7 ms late and the loop ran 29.4 Hz instead of 30."""
+    clock.overshoot = 0.0007
+    timer = CycleTimer(30)
+    period = _mean_period(clock, timer, ticks=300, work=0.010, new_cycle=new_cycle)
+    assert period == pytest.approx(1 / 30, abs=2e-5)
+
+
+def test_a_real_stall_re_anchors_instead_of_bursting(clock):
+    """A tick far over budget (a blocking save, a pause) must not be followed by back-to-back catch-up ticks."""
+    timer = CycleTimer(30)
+    _drive(timer, clock, work=0.010, ticks=5, new_cycle=False)
+    timer.tick()
+    clock.advance(0.200)  # stall: six cycles late
+    timer.wait()
+    clock.sleeps.clear()
+    _drive(timer, clock, work=0.010, ticks=5, new_cycle=False)
+    # every following tick sleeps a normal ~23 ms; none is skipped to "catch up"
+    assert len(clock.sleeps) == 5
+    assert all(s == pytest.approx(1 / 30 - 0.010, abs=1e-6) for s in clock.sleeps)
+
+
+def test_small_lateness_is_absorbed_by_a_shorter_next_sleep(clock):
+    timer = CycleTimer(30)
+    _drive(timer, clock, work=0.010, ticks=3, new_cycle=False)
+    clock.overshoot = 0.004  # one late sleep
+    _drive(timer, clock, work=0.010, ticks=1, new_cycle=False)
+    clock.overshoot = 0.0
+    clock.sleeps.clear()
+    _drive(timer, clock, work=0.010, ticks=1, new_cycle=False)
+    assert clock.sleeps[-1] == pytest.approx(1 / 30 - 0.010 - 0.004, abs=1e-6)

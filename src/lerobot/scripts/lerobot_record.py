@@ -307,6 +307,7 @@ def record_loop(
     no_action_count = 0
     timestamp = 0.0
     start_episode_t = time.perf_counter()
+    timer.reset_schedule()  # this phase's first tick is its time zero
     last_status_print = 0  # Track when we last printed status
 
     # Hz rate tracking
