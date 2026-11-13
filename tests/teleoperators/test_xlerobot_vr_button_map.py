@@ -64,7 +64,9 @@ def test_default_left_x_is_unmapped_outside_the_recording_gate():
 
 def test_default_left_menu_stops_session():
     handler = VREventHandler(vr_monitor=None)
+    # A menu tap dispatches its semantic on release (a long hold toggles passthrough instead).
     handler._process_left_controller(_meta({"menu": True}))
+    handler._process_left_controller(_meta({"menu": False}))
     assert handler.events["stop_recording"] is True
 
 

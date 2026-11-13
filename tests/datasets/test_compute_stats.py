@@ -837,7 +837,7 @@ def test_assert_type_and_shape_with_quantiles():
         }
     ]
 
-    with pytest.raises(ValueError, match="Shape of stat 'q01' for image feature must be \\(C,1,1\\)"):
+    with pytest.raises(ValueError, match="Shape of stat 'q01' must be \\(3,1,1\\) or \\(1,1,1\\)"):
         _assert_type_and_shape(invalid_stats)
 
 

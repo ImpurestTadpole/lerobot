@@ -45,13 +45,15 @@ def _build_robot(config: OB15Config) -> OB15:
 
 def test_default_topology_reproduces_original_2bus_wiring():
     config = OB15Config(cameras={})
-    # lift_port must default onto bus2 (right_arm), not bus1 — ID 9 collides with the base.
-    assert config.lift_port == config.right_arm_port == "/dev/serial/by-id/usb-1a86_USB_Single_Serial_5AE6080648-if00"
-    assert config.left_arm_port == config.base_port == "/dev/serial/by-id/usb-1a86_USB_Single_Serial_5AE6086368-if00"
+    # lift_port must default onto the right-arm bus, not the left/base bus -- ID 9 collides with the base.
+    # Compared against the config itself so the test survives an adapter being swapped.
+    assert config.lift_port == config.right_arm_port
+    assert config.left_arm_port == config.base_port
+    assert config.left_arm_port != config.right_arm_port
 
     robot = _build_robot(config)
 
-    assert set(robot._buses.keys()) == {"/dev/serial/by-id/usb-1a86_USB_Single_Serial_5AE6086368-if00", "/dev/serial/by-id/usb-1a86_USB_Single_Serial_5AE6080648-if00"}
+    assert set(robot._buses.keys()) == {config.left_arm_port, config.right_arm_port}
     assert len(robot._buses) == 2
     # left_arm + base share a bus; right_arm + head + lift share the other -- exactly the
     # original hardcoded bus1/bus2 grouping.
@@ -71,7 +73,7 @@ def test_legacy_port1_port2_aliases_expand_onto_limb_ports():
     assert config.right_arm_port == config.head_port == config.lift_port == "/dev/legacy_bus2"
 
     robot = _build_robot(config)
-    assert set(robot._buses.keys()) == {"/dev/legacy_bus1", "/dev/legacy_bus2"}
+    assert set(robot._buses.keys()) == {config.left_arm_port, config.right_arm_port}
     assert robot._group_bus["left_arm"] is robot._group_bus["base"]
     assert robot._group_bus["right_arm"] is robot._group_bus["lift"]
 

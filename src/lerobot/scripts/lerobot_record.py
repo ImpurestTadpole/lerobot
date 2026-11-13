@@ -124,6 +124,7 @@ from lerobot.robots import (  # noqa: F401
     bi_openarm_follower,
     bi_rebot_b601_follower,
     bi_so_follower,
+    bi_yam_follower,
     earthrover_mini_plus,
     gem_follower,
     hope_jr,
@@ -135,9 +136,12 @@ from lerobot.robots import (  # noqa: F401
     openarm_follower,
     reachy2,
     rebot_b601_follower,
+    sim_robot,
     so_follower,
     unitree_g1 as unitree_g1_robot,
+    yam_follower,
 )
+from lerobot.robots.utils import check_control_rate, episode_ended, start_episode
 from lerobot.teleoperators import (  # noqa: F401
     Teleoperator,
     TeleoperatorConfig,
@@ -397,7 +401,7 @@ def record_loop(
             if isinstance(teleop, Teleoperator):
                 if hasattr(teleop, "update_observation_cache"):
                     teleop.update_observation_cache(obs)
-                if getattr(teleop.config, "stream_cameras_to_vr", False) and hasattr(
+                if getattr(getattr(teleop, "config", None), "stream_cameras_to_vr", False) and hasattr(
                     teleop, "send_camera_frames"
                 ):
                     teleop.send_camera_frames(obs)
@@ -465,6 +469,10 @@ def record_loop(
                     action=action_values,
                     compress_images=display_compressed_images,
                 )
+
+        # End the recorded episode when the sim robot's episode ends (success, failure or step limit).
+        if dataset is not None and episode_ended(robot):
+            break
 
         timer.wait()
 
@@ -555,6 +563,7 @@ def record(
     )
 
     robot = make_robot_from_config(cfg.robot)
+    check_control_rate(robot, cfg.dataset.fps, "--dataset.fps")
     teleop = make_teleoperator_from_config(cfg.teleop) if cfg.teleop is not None else None
 
     # Fall back to identity pipelines when the caller doesn't supply processors.
@@ -631,7 +640,7 @@ def record(
                 cfg.dataset.repo_id,
                 cfg.dataset.fps,
                 root=cfg.dataset.root,
-                robot_type=robot.name,
+                robot_type=robot.robot_type,
                 features=dataset_features,
                 use_videos=cfg.dataset.video,
                 image_writer_processes=cfg.dataset.num_image_writer_processes,
@@ -694,6 +703,7 @@ def record(
                     teleop.vr_event_handler.events["rerecord_episode"] = False
                     teleop.vr_event_handler.events["exit_early"] = False
 
+                start_episode(robot)
                 log_say(
                     f"Recording episode {dataset.num_episodes + 1} / {dataset.num_episodes + cfg.dataset.num_episodes - recorded_episodes}",
                     cfg.play_sounds
