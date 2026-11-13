@@ -124,6 +124,8 @@ class LiftAxis:
         self._homed: bool = False
         self._frozen: bool = False
         self._freeze_target_mm: float = 0.0
+        # Latched by emergency_stop(): the lift ignores every command until clear_emergency_stop().
+        self._estopped: bool = False
 
     def attach(self) -> None:
         """Registers the motor name on the selected bus (safe pre-connect)."""
@@ -251,6 +253,9 @@ class LiftAxis:
     def apply_action(self, action: dict[str, float]) -> None:
         if not self.enabled:
             return
+        if self._estopped:  # a shutdown signal arrived: hold still, whatever the policy or teleop asks
+            self.zero_velocity()
+            return
         self.configure()
 
         key_h = f"{self.cfg.name}.height_mm"
@@ -357,6 +362,14 @@ class LiftAxis:
             self._bus.write("Goal_Velocity", self.cfg.name, v * sign * self.cfg.dir_sign)
 
     def home(self, use_current: bool = True) -> None:
+        """Home the lift; if anything goes wrong (an error, Ctrl+C) the velocity command is zeroed before it propagates."""
+        try:
+            self._home_impl(use_current)
+        except BaseException:
+            self.zero_velocity()
+            raise
+
+    def _home_impl(self, use_current: bool = True) -> None:
         """
         ORIGINAL home() method — not modified.
         Only additions: _homed=True flag and optional freeze_after_home at the end.
@@ -468,12 +481,36 @@ class LiftAxis:
         self._frozen = False
         logger.info("LiftAxis: unfrozen — resuming normal control")
 
-    def stop(self) -> None:
-        """Best-effort stop (sets Goal_Velocity=0)."""
+    def zero_velocity(self, *, quiet: bool = False) -> bool:
+        """Write Goal_Velocity=0 straight to the motor. Returns whether the write went through; never raises.
+
+        The lift runs in velocity mode and a Feetech motor keeps its last velocity command if the host program
+        dies, so this is the one write that must always be tried. Unlike ``configure()`` and ``home()`` it never
+        changes the operating mode or moves the axis.
+        """
         if not self.enabled:
-            return
+            return False
         try:
-            self.configure()
             self._bus.write("Goal_Velocity", self.cfg.name, 0)
-        except Exception:
-            pass
+        except Exception as e:
+            log = logger.debug if quiet else logger.warning
+            log(f"LiftAxis: could not zero the lift velocity: {type(e).__name__}: {e}")
+            return False
+        self._cached_velocity = 0.0
+        self._filtered_velocity = 0.0
+        self._drive_since = None
+        return True
+
+    def emergency_stop(self) -> None:
+        """Zero the velocity (retrying once) and refuse every further command until ``clear_emergency_stop()``."""
+        self._estopped = True
+        if not self.zero_velocity():
+            self.zero_velocity()
+
+    def clear_emergency_stop(self) -> None:
+        self._estopped = False
+
+    def stop(self) -> None:
+        """Best-effort stop (sets Goal_Velocity=0). Does not configure or home the lift; teardown calls it
+        after the motor may already be hidden from the bus, so a failed write is only logged at debug level."""
+        self.zero_velocity(quiet=True)
