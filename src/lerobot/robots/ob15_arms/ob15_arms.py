@@ -1,0 +1,228 @@
+"""Arms-only OB15: 12 arm/gripper actions, head + lift held at a hold pose, no base commands."""
+
+from __future__ import annotations
+
+import logging
+import time
+from functools import cached_property
+from typing import Any
+
+from lerobot.utils.constants import HF_LEROBOT_CALIBRATION, ROBOTS
+from lerobot.utils.errors import DeviceNotConnectedError
+
+from ..ob15.ob15 import OB15
+from .arms_only import (
+    BASE_KEYS,
+    DEFAULT_HEAD_TILT_DEG,
+    DEFAULT_LIFT_MM,
+    HEAD_TILT_MARGIN_DEG,
+    HEAD_TILT_MARGIN_UNITS,
+    arms_action_features,
+    arms_only_result,
+    arms_state_features,
+    build_arms_command,
+    build_hold_metadata,
+    hold_reached,
+    hold_source,
+    hold_status,
+    resolve_hold_targets,
+)
+from .config_ob15_arms import OB15ArmsConfig
+
+logger = logging.getLogger(__name__)
+
+HOLD_POLL_S = 0.1
+
+
+class OB15Arms(OB15):
+    """OB15 whose action space is the 12 arm/gripper joints only.
+
+    On connect the head and lift move to the hold pose (overrides, hold_from, or the current
+    pose) and are re-commanded on every ``send_action`` so the lift P-controller keeps holding.
+    Base, head and lift keys in incoming actions are dropped. The wheel motors are not on the bus at all
+    (``uses_base = False``), so nothing reads or writes them and an unplugged wheel cannot block connect. Everything else is inherited from ``OB15``.
+    """
+
+    config_class = OB15ArmsConfig
+    name = "ob15_arms"
+    uses_base = False  # wheel motors are not on the bus: unplugged/unpowered wheels do not block connect
+    # Rollout position hold: all 12 actions are ``.pos`` targets and ``send_action`` returns the applied
+    # 12-key command, so the rollout can retain the last targets by re-sending them. The head and lift are
+    # re-commanded to their hold pose on every ``send_action`` already, and the (absent) wheels are never driven.
+    supports_position_hold = True
+
+    def __init__(self, config: OB15ArmsConfig):
+        # Same hardware as ``ob15``: use its calibration folder (robots/ob15/<id>.json) unless one is given,
+        # otherwise connect() would not find the existing calibration and start a manual one.
+        if not config.calibration_dir:
+            config.calibration_dir = HF_LEROBOT_CALIBRATION / ROBOTS / OB15.name
+        # Homing parks the lift at the top; do not release its torque afterwards (that lets it fall).
+        config.lift_axis.release_torque_after_home = False
+        # 0 mm is the top hard stop itself (not the point homing backs off to), and 0 is reachable.
+        config.lift_axis.zero_at_limit = True
+        config.lift_axis.soft_min_mm = 1.0  # never commands the last millimetre against the stop
+        config.lift_axis.stall_guard_s = config.lift_stall_guard_s
+        super().__init__(config)
+        self._hold: dict[str, float] | None = None
+        self._lift_released = False  # True once the thermal guard has released the lift's torque
+        self._last_health_check = 0.0
+        self._last_temp_warning = 0.0
+
+    @property
+    def _lift_name(self) -> str | None:
+        return self.lift_axis.cfg.name if self.lift_axis.enabled else None
+
+    @cached_property
+    def observation_features(self) -> dict[str, type | tuple]:
+        return {**arms_state_features(self._state_ft), **self._cameras_ft}
+
+    @cached_property
+    def action_features(self) -> dict[str, type]:
+        return arms_action_features()
+
+    def connect(self, calibrate: bool = True) -> None:
+        super().connect(calibrate)
+        self._lift_released = False
+        self._last_health_check = time.monotonic()
+        self._establish_hold()
+
+    def _read_pose(self) -> dict[str, Any]:
+        return OB15.get_observation(self, skip_cameras=True, skip_depth=True)
+
+    def _establish_hold(self) -> None:
+        cfg = self.config
+        current = self._read_pose()
+        # hold_on_connect=False: do not move to hold_from, just freeze head/lift where they are.
+        self._hold = None
+        hold = resolve_hold_targets(
+            cfg if cfg.hold_on_connect else _NoTargets(),
+            current,
+            self._lift_name,
+            default_head_tilt=self._default_head_tilt() if cfg.hold_on_connect else None,
+            # homed lift: hold at DEFAULT_LIFT_MM below the top unless told otherwise
+            default_lift_mm=DEFAULT_LIFT_MM if (cfg.hold_on_connect and self.lift_axis._homed) else None,
+        )
+
+        self._hold = hold
+        logger.info(f"{self}: holding head/lift at {self._hold}")
+
+        deadline = time.monotonic() + cfg.settle_timeout_s
+        while True:
+            OB15.send_action(self, build_arms_command({}, self._hold))
+            status = hold_status(self._read_pose(), self._hold, cfg.head_tol, cfg.lift_tol_mm)
+            if hold_reached(status):
+                return
+            if time.monotonic() >= deadline:
+                bad = {k: v for k, v in status.items() if not v["ok"]}
+                logger.warning(
+                    f"{self}: head/lift did not reach the hold pose within {cfg.settle_timeout_s}s: {bad}"
+                )
+                return
+            time.sleep(HOLD_POLL_S)
+
+    def _default_head_tilt(self) -> float:
+        """DEFAULT_HEAD_TILT_DEG, kept a margin inside the end of this robot's calibrated tilt range."""
+        cal = self.calibration.get("head_tilt")
+        if self.config.use_degrees:
+            if cal is None:
+                return DEFAULT_HEAD_TILT_DEG
+            half_range_deg = (cal.range_max - cal.range_min) / 2 * 360 / 4095
+            return min(DEFAULT_HEAD_TILT_DEG, half_range_deg - HEAD_TILT_MARGIN_DEG)
+        return min(DEFAULT_HEAD_TILT_DEG, 100.0 - HEAD_TILT_MARGIN_UNITS)
+
+    def hold_metadata(self) -> dict[str, Any]:
+        """Document for ``meta/ob15_hold.json``: the resolved hold pose and how it was requested."""
+        if self._hold is None:
+            raise DeviceNotConnectedError(f"{self} is not connected.")
+        return build_hold_metadata(self.name, self._hold, hold_source(self.config))
+
+    def get_observation(self, skip_cameras: bool = False, skip_depth: bool = False) -> dict[str, Any]:
+        obs = super().get_observation(skip_cameras=skip_cameras, skip_depth=skip_depth)
+        for key in BASE_KEYS:
+            obs.pop(key, None)
+        return obs
+
+    def send_action(self, action: dict[str, Any]) -> dict[str, Any]:
+        if self._hold is None:
+            raise DeviceNotConnectedError(f"{self} is not connected.")
+        self._check_lift_health()
+        hold = self._hold
+        if self._lift_released:  # the thermal guard let go of the lift: do not command it again
+            hold = {k: v for k, v in hold.items() if k != f"{self._lift_name}.height_mm"}
+        sent = super().send_action(build_arms_command(action, hold))
+        return arms_only_result(sent)
+
+    def _check_lift_health(self) -> None:
+        """Every lift_health_period_s: warn when the lift motor runs hot, release it before it can burn out."""
+        cfg, name = self.config, self._lift_name
+        now = time.monotonic()
+        if not name or self._lift_released or now - self._last_health_check < cfg.lift_health_period_s:
+            return
+        self._last_health_check = now
+        try:
+            temp = float(self._group_bus["lift"].read("Present_Temperature", name, normalize=False))
+        except Exception as e:  # a failed read is not a reason to stop recording
+            logger.debug(f"lift temperature read failed: {e}")
+            return
+        if cfg.lift_temp_stop_c is not None and temp >= cfg.lift_temp_stop_c:
+            logger.error(
+                f"{self}: lift motor at {temp:.0f} C (limit {cfg.lift_temp_stop_c:.0f} C) -- releasing its torque "
+                "to protect it. The lift will lower; let it cool before continuing."
+            )
+            self.lift_axis.stop()
+            try:
+                self._group_bus["lift"].write("Torque_Enable", name, 0, normalize=False)
+            except Exception as e:
+                logger.error(f"could not release the lift torque: {e}")
+            self._lift_released = True
+        elif temp >= cfg.lift_temp_warn_c and now - self._last_temp_warning > 60.0:
+            self._last_temp_warning = now
+            logger.warning(f"{self}: lift motor is warm: {temp:.0f} C (warning {cfg.lift_temp_warn_c:.0f} C)")
+
+    def check_hold(self) -> dict[str, dict[str, float | bool]]:
+        """Head/lift drift vs the hold pose right now. Call at the end of a task or episode."""
+        if self._hold is None:
+            raise DeviceNotConnectedError(f"{self} is not connected.")
+        status = hold_status(self._read_pose(), self._hold, self.config.head_tol, self.config.lift_tol_mm)
+        for key, entry in status.items():
+            if not entry["ok"]:
+                logger.warning(f"{self}: {key} drifted from hold pose: {entry}")
+        return status
+
+    def disconnect(self) -> None:
+        if self._hold is not None and self.is_connected:
+            try:
+                self.check_hold()
+            except Exception as e:  # never block a disconnect on the diagnostic
+                logger.debug(f"hold check at disconnect failed: {e}")
+        self._hold = None
+        # disable_torque_on_disconnect releases every motor on a bus, which would let the lift fall. Stop the lift,
+        # then hide it from the bus while the others are released, so it stays torqued where it is.
+        lift_bus, lift = self._group_bus.get("lift"), self._lift_name
+        keep_lift = bool(lift and lift_bus is not None and lift in lift_bus.motors and self.is_connected)
+        if (
+            keep_lift
+            and self.config.disable_torque_on_disconnect
+            and not self.config.release_lift_on_disconnect
+        ):
+            logger.warning(
+                f"{self}: the lift motor is left torqued, holding the arms at the top. Cut the robot's power when "
+                "you walk away, or pass --robot.release_lift_on_disconnect=true to let it lower on exit."
+            )
+            self.lift_axis.stop()
+            lift_motor = lift_bus.motors.pop(lift)
+            try:
+                super().disconnect()
+            finally:
+                lift_bus.motors[lift] = lift_motor
+        else:
+            super().disconnect()
+
+
+class _NoTargets:
+    """Config stand-in with no overrides, so the current pose is held."""
+
+    head_pan = None
+    head_tilt = None
+    lift_height_mm = None
+    hold_from = None

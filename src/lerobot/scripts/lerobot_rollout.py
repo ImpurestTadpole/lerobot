@@ -101,7 +101,7 @@ Usage examples
         --dataset.repo_id=user/rollout_hil_data \\
         --dataset.single_task="Fold the T-shirt"
 
-    # DAgger mode — ob15 with VR teleop; RIGHT A toggles intervention
+    # DAgger mode — ob15 with VR teleop; RIGHT B toggles intervention
     lerobot-rollout \\
         --strategy.type=dagger \\
         --strategy.input_device=teleop \\
@@ -198,6 +198,7 @@ from lerobot.robots import (  # noqa: F401
     koch_follower,
     lekiwi,
     ob15,
+    ob15_arms,
     omx_follower,
     openarm_follower,
     reachy2,

@@ -14,7 +14,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-from . import bi_so_follower, koch_follower, ob15, omx_follower, so_follower
+from . import bi_so_follower, koch_follower, ob15, ob15_arms, omx_follower, so_follower
 from .config import RobotConfig
 from .robot import Robot
 from .utils import make_robot_from_config
