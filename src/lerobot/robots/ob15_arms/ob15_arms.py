@@ -111,14 +111,26 @@ class OB15Arms(OB15):
             OB15.send_action(self, build_arms_command({}, self._hold))
             status = hold_status(self._read_pose(), self._hold, cfg.head_tol, cfg.lift_tol_mm)
             if hold_reached(status):
+                self.settle()
                 return
             if time.monotonic() >= deadline:
                 bad = {k: v for k, v in status.items() if not v["ok"]}
                 logger.warning(
                     f"{self}: head/lift did not reach the hold pose within {cfg.settle_timeout_s}s: {bad}"
                 )
+                self.settle()
                 return
             time.sleep(HOLD_POLL_S)
+
+    def settle(self) -> None:
+        """Stop the lift where it is.
+
+        The lift runs in velocity mode, so its last Goal_Velocity stays active when commands stop. The hold
+        loop and the reset move both end while the lift is still inside the slow near-target zone, so without
+        this it keeps creeping in that direction until the next control loop takes over.
+        """
+        if self.lift_axis.enabled and not self._lift_released:
+            self.lift_axis.zero_velocity(quiet=True)
 
     def _default_head_tilt(self) -> float:
         """DEFAULT_HEAD_TILT_DEG, kept a margin inside the end of this robot's calibrated tilt range."""

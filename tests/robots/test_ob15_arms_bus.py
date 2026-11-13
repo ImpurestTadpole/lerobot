@@ -887,3 +887,22 @@ def test_lift_stop_does_not_configure_or_home(tmp_path):
     assert bus.vel[lift.cfg.name] == 0
     assert not any(item in ("Operating_Mode", "Torque_Enable") for item, _ in bus.writes)
     assert not lift._configured and not lift._homed
+
+
+def test_settle_zeroes_the_lift_velocity_a_finished_move_left_running(make_robot):
+    """A hold/reset sequence ends mid-creep; the velocity-mode lift must be stopped, not left drifting."""
+    robot = make_robot()
+    lift_bus = robot._group_bus["lift"]
+    robot.lift_axis.apply_action({"gantry.height_mm": 130.0})  # inside the slow near-target zone
+    assert _writes(robot, "Goal_Velocity", ["gantry"])[-1] != 0
+    robot.settle()
+    assert _writes(robot, "Goal_Velocity", ["gantry"])[-1] == 0
+    assert lift_bus is robot._group_bus["lift"]
+
+
+def test_settle_does_not_drive_a_released_lift(make_robot):
+    robot = make_robot()
+    robot._lift_released = True
+    n = len(_writes(robot, "Goal_Velocity", ["gantry"]))
+    robot.settle()
+    assert len(_writes(robot, "Goal_Velocity", ["gantry"])) == n
