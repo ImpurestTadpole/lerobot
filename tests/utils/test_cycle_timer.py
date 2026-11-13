@@ -29,6 +29,12 @@ from lerobot.utils.cycle_timer import CycleTimer
 _TIMER_LOGGER = "lerobot.utils.cycle_timer"
 
 
+@pytest.fixture(autouse=True)
+def _no_warn_cooldown(monkeypatch):
+    """Per-cycle warning tests count every warning; disable the slow-loop rate limit."""
+    monkeypatch.setattr(CycleTimer, "WARN_COOLDOWN_S", 0.0)
+
+
 def _timer_warnings(caplog):
     return [r for r in caplog.records if r.levelno >= logging.WARNING]
 
