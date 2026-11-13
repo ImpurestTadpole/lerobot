@@ -525,11 +525,15 @@ def encode_video_frames(
 
     # Get input frames
     depth_encoder = video_encoder if isinstance(video_encoder, DepthEncoderConfig) else None
-    suffix = ".tiff" if depth_encoder is not None else ".png"
-    template = "frame-" + ("[0-9]" * 6) + suffix
-    input_list = sorted(
-        glob.glob(str(imgs_dir / template)), key=lambda x: int(x.split("-")[-1].split(".")[0])
-    )
+    # RGB frames are normally PNG; a recording made with ``video_frame_format="tiff"`` has TIFF frames instead.
+    suffixes = (".tiff",) if depth_encoder is not None else (".png", ".tiff")
+    for suffix in suffixes:
+        template = "frame-" + ("[0-9]" * 6) + suffix
+        input_list = sorted(
+            glob.glob(str(imgs_dir / template)), key=lambda x: int(x.split("-")[-1].split(".")[0])
+        )
+        if input_list:
+            break
 
     if len(input_list) == 0:
         raise FileNotFoundError(f"No images with suffix {suffix} found in {imgs_dir}.")

@@ -142,6 +142,9 @@ class DatasetWriter:
         self._encoder_threads = encoder_threads
         self._batch_encoding_size = batch_encoding_size
         self._streaming_encoder = streaming_encoder
+        #: "png" or "tiff": file format of the temporary RGB frames later encoded into videos
+        #: (depth frames are always tiff). Set after construction by callers that want it.
+        self.video_frame_format: str = "png"
 
         # Writer state
         self.image_writer: AsyncImageWriter | None = None
@@ -167,7 +170,14 @@ class DatasetWriter:
         fpath = path_template.format(
             image_key=image_key, episode_index=episode_index, frame_index=frame_index
         )
-        return self._root / fpath
+        path = self._root / fpath
+        if (
+            self.video_frame_format == "tiff"
+            and image_key not in self._meta.depth_keys
+            and self._meta.features[image_key]["dtype"] == "video"
+        ):
+            path = path.with_suffix(".tiff")
+        return path
 
     def _get_image_file_dir(self, episode_index: int, image_key: str) -> Path:
         return self._get_image_file_path(episode_index, image_key, frame_index=0).parent
