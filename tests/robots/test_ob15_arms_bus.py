@@ -779,3 +779,20 @@ def test_select_state_features_keeps_cameras_and_filters_other_scalars():
     }
     assert list(_select_state_features(features)) == ["a.pos", "b.vel", "gantry.height_mm", "cam"]
     assert list(_select_state_features(features, keep_all=True)) == list(features)
+
+
+def test_rollout_position_hold_contract(make_robot):
+    """The remote rollout refuses robots without a position-hold contract (it did on the first real run)."""
+    from lerobot.rollout.robot_wrapper import ThreadSafeRobot
+
+    robot = make_robot()
+    assert robot.supports_position_hold is True
+    wrapper = ThreadSafeRobot(robot)
+    wrapper.configure_hold()  # raised "ob15_arms has no supported local position-hold contract"
+    assert wrapper.supports_hold
+
+    applied = wrapper.send_action(_arm_action(5.0))
+    assert set(applied) == set(ARM_KEYS) and len(applied) == 12
+    wrapper.hold()  # re-sends the last applied targets
+    for bus in robot._buses.values():
+        assert all(isinstance(v, float) for v in bus.pos.values())

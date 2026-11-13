@@ -46,6 +46,10 @@ class OB15Arms(OB15):
     config_class = OB15ArmsConfig
     name = "ob15_arms"
     uses_base = False  # wheel motors are not on the bus: unplugged/unpowered wheels do not block connect
+    # Rollout position hold: all 12 actions are ``.pos`` targets and ``send_action`` returns the applied
+    # 12-key command, so the rollout can retain the last targets by re-sending them. The head and lift are
+    # re-commanded to their hold pose on every ``send_action`` already, and the (absent) wheels are never driven.
+    supports_position_hold = True
 
     def __init__(self, config: OB15ArmsConfig):
         # Same hardware as ``ob15``: use its calibration folder (robots/ob15/<id>.json) unless one is given,
