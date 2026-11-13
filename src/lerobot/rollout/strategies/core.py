@@ -365,6 +365,7 @@ class RolloutStrategy(abc.ABC):
                     interp[k] = current_pos[k] * (1 - t) + target[k] * t
                 robot.send_action(interp)
                 precise_sleep(1 / fps)
+            getattr(robot, "settle", lambda: None)()
         except Exception as e:
             logger.warning("Could not return to initial position: %s", e)
             return False
