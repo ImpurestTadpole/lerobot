@@ -30,6 +30,7 @@ from typing import Any
 import numpy as np
 
 from lerobot.cameras.utils import make_cameras_from_configs
+from .camera_frames import CameraFrameTracker, read_color_latest
 from .camera_tuning import tune_camera
 from lerobot.motors import Motor, MotorCalibration, MotorNormMode
 from lerobot.motors.feetech import (
@@ -181,6 +182,9 @@ class OB15(Robot):
         self.head_motors = list(group_motors["head"])
         self.base_motors = list(group_motors["base"])
         self.cameras = make_cameras_from_configs(config.cameras)
+        if config.camera_read_mode not in ("fresh", "latest"):
+            raise ValueError(f"camera_read_mode must be 'fresh' or 'latest', got {config.camera_read_mode!r}")
+        self._frame_tracker = CameraFrameTracker()
 
         # Create persistent thread pool for parallel bus reads (avoid overhead of creating/destroying)
         self._executor = ThreadPoolExecutor(
@@ -812,6 +816,22 @@ class OB15(Robot):
             )
         return dict(self._base_vel_smooth)
 
+    def _read_color(self, cam_key: str, cam) -> Any:
+        """One camera's colour frame for this tick, per ``config.camera_read_mode`` (see camera_frames.py)."""
+        if self.config.camera_read_mode == "fresh":
+            return cam.async_read()
+        return read_color_latest(
+            cam,
+            cam_key,
+            self._frame_tracker,
+            self.config.camera_max_age_ms,
+            self.config.camera_fresh_wait_ms,
+        )
+
+    def camera_frame_report(self) -> list[str]:
+        """Per-camera repeated-frame / error counts of the ``latest`` read mode (empty in ``fresh`` mode)."""
+        return self._frame_tracker.report_lines() if self.config.camera_read_mode == "latest" else []
+
     def get_observation(self, skip_cameras: bool = False, skip_depth: bool = False) -> dict[str, Any]:
         """
         Get robot observation with parallel bus reads and detailed profiling.
@@ -923,7 +943,7 @@ class OB15(Robot):
             def read_camera(cam_key, cam):
                 try:
                     if cam.is_connected:
-                        color_frame = cam.async_read()
+                        color_frame = self._read_color(cam_key, cam)
                         # For RealSense cameras with depth enabled, also read depth (unless skipped).
                         # Non-blocking peek (read_latest_depth), not async_read_depth: with
                         # depth_frame_interval > 1 the background thread only decodes a fresh

@@ -21,6 +21,10 @@ real ``OB15`` low-level code (base smoothing, arm/head writes, the lift P-contro
 buses that remember what was written. They show what the motors would actually be told.
 """
 
+import random
+import re
+import threading
+import time
 from dataclasses import dataclass
 from functools import cached_property
 from pathlib import Path
@@ -887,3 +891,194 @@ def test_lift_stop_does_not_configure_or_home(tmp_path):
     assert bus.vel[lift.cfg.name] == 0
     assert not any(item in ("Operating_Mode", "Torque_Enable") for item, _ in bus.writes)
     assert not lift._configured and not lift._homed
+
+
+# --- camera read modes and the recording rate ------------------------------------------------------
+
+
+class FakeCamera:
+    """A camera with a read thread like the real ones: a NEW frame object every ``1/fps`` s, with the
+    ``async_read`` (wait for the next new frame) and ``read_latest`` (take the buffer now) contract."""
+
+    use_depth = False
+
+    def __init__(self, fps=29.5, shape=(48, 64, 3)):
+        self.period, self.shape = 1.0 / fps, shape
+        self.is_connected = False
+        self.latest_frame, self.latest_timestamp = None, None
+        self._new = threading.Event()
+        self._stop = threading.Event()
+        self.frames_made = 0
+
+    def connect(self, warmup=True):
+        self.is_connected = True
+        self._thread = threading.Thread(target=self._run, daemon=True)
+        self._thread.start()
+        self._new.wait(1.0)
+
+    def _run(self):
+        nxt = time.perf_counter()
+        while not self._stop.is_set():
+            frame = np.full(self.shape, self.frames_made % 250, dtype=np.uint8)
+            self.frames_made += 1
+            self.latest_frame, self.latest_timestamp = frame, time.perf_counter()
+            self._new.set()
+            nxt += self.period
+            time.sleep(max(0.0, nxt - time.perf_counter()))
+
+    def async_read(self, timeout_ms=200):
+        if not self._new.wait(timeout_ms / 1000):
+            raise TimeoutError("no new frame")
+        self._new.clear()
+        return self.latest_frame
+
+    def read_latest(self, max_age_ms=500):
+        if self.latest_frame is None:
+            raise RuntimeError("has not captured any frames yet")
+        if (time.perf_counter() - self.latest_timestamp) * 1e3 > max_age_ms:
+            raise TimeoutError("latest frame is too old")
+        return self.latest_frame
+
+    def disconnect(self):
+        self._stop.set()
+        self.is_connected = False
+
+
+def _camera_robot(make_robot, mode, fps=29.5, n=2, **cfg):
+    robot = make_robot(camera_read_mode=mode, **cfg)
+    robot.cameras = {f"cam{i}": FakeCamera(fps) for i in range(n)}
+    for cam in robot.cameras.values():
+        cam.connect()
+    return robot
+
+
+def test_invalid_camera_read_mode_is_rejected():
+    with pytest.raises(ValueError, match="camera_read_mode"):
+        with patch(_FB, side_effect=FakeBus):
+            OB15Arms(OB15ArmsConfig(cameras={}, camera_read_mode="newest"))
+
+
+def test_latest_mode_never_waits_for_a_frame_and_counts_repeated_frames(make_robot):
+    robot = _camera_robot(make_robot, "latest", fps=20.0)
+    try:
+        robot.get_observation()  # warm the thread pool
+        t0 = time.perf_counter()
+        n = 200
+        for _ in range(n):  # ~1 ms apart, far faster than the 50 ms camera period
+            robot.get_observation()
+            time.sleep(0.001)
+        elapsed = time.perf_counter() - t0
+        assert elapsed < n * 0.020, "latest mode must not block on the camera"
+        stats = robot._frame_tracker.snapshot()
+        assert set(stats) == {"cam0", "cam1"}
+        for s in stats.values():
+            assert s.reads >= n
+            assert s.repeats > 0.8 * s.reads  # most reads saw the previous frame again
+            assert s.longest_repeat_run >= 10
+        report = "\n".join(robot.camera_frame_report())
+        assert "camera cam0" in report and "repeated frames" in report
+    finally:
+        for cam in robot.cameras.values():
+            cam.disconnect()
+
+
+def test_fresh_mode_returns_new_frames_only_and_reports_nothing(make_robot):
+    robot = _camera_robot(make_robot, "fresh", fps=50.0, n=1)
+    try:
+        seen = []
+        for _ in range(6):
+            seen.append(robot.get_observation()["cam0"])
+        assert all(a is not b for a, b in zip(seen, seen[1:]))
+        assert robot.camera_frame_report() == []
+        assert robot._frame_tracker.snapshot() == {}
+    finally:
+        for cam in robot.cameras.values():
+            cam.disconnect()
+
+
+def test_latest_mode_stalled_camera_is_an_error_not_a_stale_frame(make_robot):
+    robot = _camera_robot(make_robot, "latest", fps=50.0, n=1, camera_max_age_ms=100.0)
+    cam = robot.cameras["cam0"]
+    try:
+        assert "cam0" in robot.get_observation()
+        cam._stop.set()  # the camera thread dies; its buffer ages
+        time.sleep(0.25)
+        obs = robot.get_observation()
+        assert "cam0" not in obs  # not served from the old buffer
+        assert robot._frame_tracker.snapshot()["cam0"].errors == 1
+    finally:
+        cam.disconnect()
+
+
+def _record_rate(tmp_path, monkeypatch, caplog, mode, work_s, fps=30, episode_time_s=4, cam_fps=29.5):
+    """Run the real ``record()`` with fake cameras and a teleop costing ``work_s`` per tick; return the rate."""
+    from lerobot.cameras.opencv.configuration_opencv import OpenCVCameraConfig
+
+    monkeypatch.setattr("lerobot.robots.ob15_arms.ob15_arms.HOLD_POLL_S", 0.0)
+    real_init = OB15Arms.__init__
+
+    def init_homed(self, config):
+        real_init(self, config)
+        self.lift_axis._homed = True
+        self.lift_axis._z0_deg = 100.0 / self.lift_axis._mm_per_deg
+
+    class WorkTeleop(_VRLikeTeleop):
+        def get_action(self):
+            # stands in for VR IK + frame building + writer contention; a (lo, hi) pair is uniform jitter
+            time.sleep(random.uniform(*work_s) if isinstance(work_s, tuple) else work_s)
+            return super().get_action()
+
+    cams_cfg = {f"cam{i}": OpenCVCameraConfig(index_or_path=i, fps=30, width=64, height=48) for i in range(3)}
+    cfg = RecordConfig(
+        robot=OB15ArmsConfig(
+            cameras=cams_cfg, calibration_dir=tmp_path / "cal", head_pan=0.0, head_tilt=-35.0,
+            lift_height_mm=220.0, camera_read_mode=mode,
+        ),
+        teleop=_VRLikeTeleopConfig(),
+        dataset=DatasetRecordConfig(
+            repo_id=f"local/rate_{mode}", single_task="t", root=tmp_path / f"ds_{mode}", fps=fps,
+            episode_time_s=episode_time_s, reset_time_s=0, num_episodes=1, push_to_hub=False,
+            video=False, no_stamp=True, num_image_writer_threads_per_camera=1,
+        ),
+        play_sounds=False,
+    )
+    fakes = {}
+
+    def make_fakes(configs):
+        for k in configs:
+            fakes[k] = FakeCamera(cam_fps)
+        return fakes
+
+    with (
+        patch(_FB, side_effect=lambda **kw: FakeBus(**kw)),
+        patch.object(OB15Arms, "__init__", init_homed),
+        patch.object(OB15, "calibrate", lambda self: None),
+        patch("lerobot.robots.ob15.ob15.make_cameras_from_configs", make_fakes),
+        patch("lerobot.scripts.lerobot_record.make_teleoperator_from_config", WorkTeleop),
+        patch("lerobot.scripts.lerobot_record.init_logging", lambda: None),  # keep pytest's caplog handler
+        caplog.at_level("INFO"),
+    ):
+        dataset = record(cfg)
+    text = caplog.text
+    hz = [float(m) for m in re.findall(r"effective cadence: ([0-9.]+) Hz", text)]
+    return dataset, hz[-1], text
+
+
+@pytest.mark.dataset
+def test_record_with_latest_cameras_holds_the_target_rate_and_reports_it(tmp_path, monkeypatch, caplog):
+    dataset, hz, text = _record_rate(tmp_path, monkeypatch, caplog, "latest", work_s=0.020)
+    assert 29.0 <= hz <= 30.3, text
+    # the loop reports its own statistics: percentiles, slow ticks and the camera repeats
+    assert "tick period (ms" in text and "p99" in text and "slow ticks" in text
+    assert "Camera frame report" in text and "cam0" in text and "repeated frames" in text
+    assert "Achieved" not in text  # no below-target warning at the target rate
+    assert dataset.num_frames >= int(4 * 29)
+
+
+@pytest.mark.dataset
+def test_record_warns_loudly_when_the_rate_is_below_target(tmp_path, monkeypatch, caplog):
+    # 60 ms of work per tick cannot fit a 33 ms budget, whatever the camera mode
+    dataset, hz, text = _record_rate(tmp_path, monkeypatch, caplog, "latest", work_s=0.060, episode_time_s=3)
+    assert hz < 20, text
+    warnings = [r.getMessage() for r in caplog.records if r.levelname == "WARNING" and "Achieved" in r.getMessage()]
+    assert warnings and "against a 30 Hz target" in warnings[0] and "too fast" in warnings[0]

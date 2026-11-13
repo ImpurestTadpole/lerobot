@@ -54,6 +54,12 @@ class DatasetRecordConfig:
     # Too many threads might cause unstable teleoperation fps due to main thread being blocked.
     # Not enough threads might cause low camera fps.
     num_image_writer_threads_per_camera: int = 4
+    # Format of the temporary per-frame files that are encoded into the videos at the end of an episode
+    # (ignored with streaming_encoding or video=False). "png" (default) is compressed: on a Jetson Orin Nano a
+    # 960x540 + 2x 640x360 frame set costs ~115 ms of CPU to write, i.e. ~3.5 of its 6 cores at 30 Hz, which starves
+    # the control loop. "tiff" is uncompressed (~8 ms per frame set, ~3 MB per frame set of temporary disk that is
+    # deleted after each episode's video is encoded): use it when the recording rate is CPU-bound.
+    video_frame_format: str = "png"
     # Number of episodes to record before batch encoding videos
     # Set to 1 for immediate encoding (default behavior), or higher for batched encoding
     video_encoding_batch_size: int = 1
@@ -83,6 +89,10 @@ class DatasetRecordConfig:
     # OB15 arms-only robots write `meta/ob15_hold.json` (head/lift hold pose) when recording. If the
     # dataset already has one with a different pose it is kept unless this is set.
     overwrite_hold: bool = False
+
+    def __post_init__(self):
+        if self.video_frame_format not in ("png", "tiff"):
+            raise ValueError(f"dataset.video_frame_format must be 'png' or 'tiff', got {self.video_frame_format!r}")
 
     def stamp_repo_id(self) -> None:
         """Append a date-time tag to ``repo_id`` so each recording session gets a unique name.
