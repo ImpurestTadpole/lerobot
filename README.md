@@ -1,325 +1,255 @@
+<h1 align="center">OB-15 · a mobile bimanual robot on LeRobot</h1>
+
 <p align="center">
-  <img alt="LeRobot, Hugging Face Robotics Library" src="./media/readme/lerobot-logo-thumbnail.png" width="100%">
+  <img src="./media/ob15/ob15_front.jpg" width="32%" alt="OB-15 front view">
+  <img src="./media/ob15/ob15_three_quarter.jpg" width="32%" alt="OB-15 three-quarter view">
+  <img src="./media/ob15/ob15_side_table.jpg" width="32%" alt="OB-15 next to a table with the block task">
 </p>
 
-<div align="center">
+This is [ImpurestTadpole](https://github.com/ImpurestTadpole)'s fork of [huggingface/lerobot](https://github.com/huggingface/lerobot).
+It adds the **OB-15** robot, a Meta Quest VR teleoperator, a co-training data pipeline, and the tools I use to collect data, train and deploy policies on it.
 
-[![Tests](https://github.com/huggingface/lerobot/actions/workflows/latest_deps_tests.yml/badge.svg?branch=main)](https://github.com/huggingface/lerobot/actions/workflows/latest_deps_tests.yml?query=branch%3Amain)
-[![Tests](https://github.com/huggingface/lerobot/actions/workflows/docker_publish.yml/badge.svg?branch=main)](https://github.com/huggingface/lerobot/actions/workflows/docker_publish.yml?query=branch%3Amain)
-[![Python versions](https://img.shields.io/pypi/pyversions/lerobot)](https://www.python.org/downloads/)
-[![License](https://img.shields.io/badge/License-Apache%202.0-blue.svg)](https://github.com/huggingface/lerobot/blob/main/LICENSE)
-[![Status](https://img.shields.io/pypi/status/lerobot)](https://pypi.org/project/lerobot/)
-[![Version](https://img.shields.io/pypi/v/lerobot)](https://pypi.org/project/lerobot/)
-[![Contributor Covenant](https://img.shields.io/badge/Contributor%20Covenant-v2.1-ff69b4.svg)](https://github.com/huggingface/lerobot/blob/main/CODE_OF_CONDUCT.md)
-[![Discord](https://img.shields.io/badge/Discord-Join_Us-5865F2?style=flat&logo=discord&logoColor=white)](https://discord.gg/s3KuuzsPFb)
-
-</div>
-
-**LeRobot** aims to provide models, datasets, and tools for real-world robotics in PyTorch. The goal is to lower the barrier to entry so that everyone can contribute to and benefit from shared datasets and pretrained models.
-
-🤗 A hardware-agnostic, Python-native interface that standardizes control across diverse platforms, from low-cost arms (SO-100) to humanoids.
-
-🤗 A standardized, scalable LeRobotDataset format (Parquet + MP4 or images) hosted on the Hugging Face Hub, enabling efficient storage, streaming and visualization of massive robotic datasets.
-
-🤗 State-of-the-art policies that have been shown to transfer to the real-world ready for training and deployment.
-
-🤗 Comprehensive support for the open-source ecosystem to democratize physical AI.
-
-## Quick Start
-
-LeRobot can be installed directly from PyPI.
-
-```bash
-pip install lerobot
-lerobot-info
-```
-
-The base install is lightweight. Add the extras you need, for example `pip install 'lerobot[dataset]'` to load datasets, `'lerobot[training]'` to train policies, or `'lerobot[core_scripts,feetech]'` to record with an SO-101 arm.
-
-> [!IMPORTANT]
-> For detailed installation guide, please see the [Installation Documentation](https://huggingface.co/docs/lerobot/installation).
-
-## Robots & Control
-
-<div align="center">
-  <img src="./media/readme/robots_control_video.webp" width="640px" alt="Reachy 2 Demo">
-</div>
-
-LeRobot provides a unified `Robot` class interface that decouples control logic from hardware specifics. It supports a wide range of robots and teleoperation devices.
-
-```python
-from lerobot.robots.myrobot import MyRobot
-
-# Connect to a robot
-robot = MyRobot(config=...)
-robot.connect()
-
-# Read observation and send action
-obs = robot.get_observation()
-action = model.select_action(obs)
-robot.send_action(action)
-```
-
-**Supported Hardware:** SO101, OpenARM, LeKiwi, Unitree G1, reBot B601, Koch, HopeJR, OMX, EarthRover, Reachy2, Gamepads, Keyboards, Phones and more.
-
-While these devices are natively integrated into the LeRobot codebase, the library is designed to be extensible. You can easily implement the Robot interface to utilize LeRobot's data collection, training, and visualization tools for your own custom robot.
-
-For detailed hardware setup guides, see the [Hardware Documentation](https://huggingface.co/docs/lerobot/integrate_hardware).
-
-## XLerobot — Mobile Bimanual Robot
-
-**XLerobot** is a fully mobile, bimanual manipulation platform built on top of LeRobot. It combines an omnidirectional wheeled base with two independent 6-DOF arms, a 2-DOF head, an optional vertical gantry lift axis, and a multi-camera vision system — all driven by Feetech STS3215 servo motors and integrated into the standard `Robot` interface.
-
-### Hardware Overview
-
-| Component | Details |
-|---|---|
-| **Mobile base** | 3-wheel omnidirectional (omni-wheels at 120°), velocity-controlled via Feetech STS3215 |
-| **Left arm** | 6-DOF (shoulder pan/lift, elbow flex, wrist flex/roll, gripper) — STS3215 servos on Bus 1 |
-| **Right arm** | 6-DOF (same joint layout as left) — STS3215 servos on Bus 2 |
-| **Head** | 2-DOF pan + tilt — STS3215 servos on Bus 2 |
-| **Gantry lift** | Optional Z-axis leadscrew (100 mm/rev, 575 mm stroke) — single STS3215 on Bus 2, motor ID 9 |
-| **Head camera** | Intel RealSense D435i (640×360 RGB, 30 fps, serial `342222071125`) |
-| **Wrist cameras** | 2× Innomaker USB cameras (640×360 MJPG, 30 fps) on `/dev/video6` and `/dev/video8` |
-| **Compute** | NVIDIA Jetson (on-robot), with optional ZMQ bridge to a remote GPU workstation |
-
-**Motor bus layout:**
-- **Bus 1** (`/dev/ttyACM1`): Left arm (IDs 1–6) + omni-base wheels (IDs 7–9)
-- **Bus 2** (`/dev/ttyACM0`): Right arm (IDs 1–6) + head pan/tilt (IDs 7–8) + gantry lift (ID 9, optional)
-
-### Installation
-
-Install LeRobot with the XLerobot dependencies (Feetech motors + RealSense camera):
-
-```bash
-pip install lerobot[feetech,realsense,viz]
-```
-
-### Configuration
-
-XLerobot uses the `xlerobot` robot type. The default configuration is defined in `XLerobotConfig`:
-
-```python
-from lerobot.robots.xlerobot import XLerobot
-from lerobot.robots.xlerobot.config_xlerobot import XLerobotConfig
-
-config = XLerobotConfig(
-    port1="/dev/ttyACM1",   # Bus 1: left arm + base
-    port2="/dev/ttyACM0",   # Bus 2: right arm + head + lift
-)
-robot = XLerobot(config)
-robot.connect()
-```
-
-**Enable the gantry lift axis:**
-
-```python
-from lerobot.robots.xlerobot.lift_axis import LiftAxisConfig
-
-config = XLerobotConfig(
-    lift_axis=LiftAxisConfig(
-        enabled=True,
-        soft_max_mm=575.0,      # travel range
-        max_cmd_vel_frac=0.4,   # policy velocity cap (40% of v_max)
-        home_on_connect=True,   # auto-home when robot.connect() is called
-    )
-)
-```
-
-**Remote mode (ZMQ bridge)** — run inference on a GPU workstation while the Jetson controls the hardware:
-
-```python
-# On the Jetson (robot side):
-from lerobot.robots.xlerobot.xlerobot_host import XLerobotHost
-host = XLerobotHost(robot)
-host.run()
-
-# On the GPU workstation (client side):
-from lerobot.robots.xlerobot.config_xlerobot import XLerobotClientConfig
-config = XLerobotClientConfig(remote_ip="JETSON_IP")
-robot = XLerobot(config)  # streams observations + sends actions over ZMQ
-```
-
-### Calibration
-
-Run the interactive calibration routine once per robot (saves to disk for future sessions):
-
-```bash
-lerobot-calibrate --robot.type=xlerobot --robot.port1=/dev/ttyACM1 --robot.port2=/dev/ttyACM0
-```
-
-The calibration wizard walks through each joint group in order:
-
-1. **Left arm** — move to mid-range, then sweep full range of motion
-2. **Right arm** — same procedure
-3. **Head** — pan and tilt through full range
-4. **Base wheels** — set to full-turn mode automatically (no manual sweep needed)
-5. **Gantry lift** (if enabled) — drives downward until stall, then backs off to set home = 0 mm
-
-Calibration is saved to `~/.cache/huggingface/lerobot/calibration/xlerobot.json` and auto-loaded on subsequent `robot.connect()` calls.
-
-### Teleoperation
-
-Keyboard teleop drives the base while a paired leader arm (e.g. SO-100) controls the robot arms:
-
-```bash
-lerobot-teleoperate \
-  --robot.type=xlerobot \
-  --robot.port1=/dev/ttyACM1 \
-  --robot.port2=/dev/ttyACM0 \
-  --teleop.type=so100_leader
-```
-
-**Base keyboard controls** (active during any teleoperation session):
-
-| Key | Action |
-|---|---|
-| `i` / `k` | Forward / Backward |
-| `j` / `l` | Strafe Left / Right |
-| `u` / `o` | Rotate Left / Right |
-| `n` / `m` | Speed Up / Speed Down (3 levels) |
-| `b` | Quit |
-
-### Data Collection
-
-```bash
-lerobot-record \
-  --robot.type=xlerobot \
-  --robot.port1=/dev/ttyACM1 \
-  --robot.port2=/dev/ttyACM0 \
-  --dataset.repo_id=YOUR_HF_USERNAME/xlerobot_task \
-  --dataset.num_episodes=50
-```
-
-### Observation & Action Space
-
-| Key | Type | Description |
-|---|---|---|
-| `left_arm_*.pos` | `float` ×6 | Left arm joint positions (normalized −100 to 100) |
-| `right_arm_*.pos` | `float` ×6 | Right arm joint positions |
-| `head_pan.pos`, `head_tilt.pos` | `float` ×2 | Head joint positions |
-| `x.vel`, `y.vel`, `theta.vel` | `float` ×3 | Base body-frame velocities (m/s, deg/s) |
-| `gantry.height_mm` | `float` | Lift axis height in mm (0 = home/bottom) |
-| `head` | `uint8 (360, 640, 3)` | RealSense head camera (RGB) |
-| `left_wrist` | `uint8 (360, 640, 3)` | Left wrist camera (RGB) |
-| `right_wrist` | `uint8 (360, 640, 3)` | Right wrist camera (RGB) |
-
-The camera names (`head`, `left_wrist`, `right_wrist`) are aligned with **SmolVLA**'s `OBS_IMAGE_1/2/3` convention, making the robot natively compatible with SmolVLA policies without any rename mapping.
-
-### Visualization
-
-Stream live robot data to a [Rerun](https://rerun.io) viewer during teleoperation or recording:
-
-```bash
-lerobot-teleoperate --robot.type=xlerobot ... --display_data=true
-```
-
-Set environment variables to tune streaming performance on Jetson:
-
-```bash
-export RERUN_FLUSH_TICK_SECS=0.008   # flush every 8ms for low latency
-export RERUN_FLUSH_NUM_BYTES=16000   # ~16 KB per flush
-export RERUN_LOG_FREQUENCY=2         # log every other frame to reduce CPU
-export RERUN_DOWNSAMPLE_FACTOR=0.5   # resize images before sending
-```
+- `main` follows upstream. I merge `huggingface/lerobot` `main` into it regularly.
+- All upstream features still work. See [Upstream LeRobot](#upstream-lerobot) at the end.
+- OB-15 started as an [XLeRobot](https://github.com/Vector-Wangel/XLeRobot)-style build. Some names (the `xlerobot_vr` teleoperator, the "xlerobot schema" in the guides) still use that name.
 
 ---
 
-## LeRobot Dataset
+## Contents
 
-To solve the data fragmentation problem in robotics, we utilize the **LeRobotDataset** format.
+1. [Status at a glance](#status-at-a-glance)
+2. [The hardware](#the-hardware)
+3. [Everything this fork adds](#everything-this-fork-adds)
+4. [Branches](#branches)
+5. [How it went: results and lessons](#how-it-went-results-and-lessons)
+6. [Quick start](#quick-start)
+7. [Next steps](#next-steps)
+8. [Upstream LeRobot](#upstream-lerobot)
 
-- **Structure:** Synchronized MP4 videos (or images) for vision and Parquet files for state/action data.
-- **HF Hub Integration:** Explore thousands of robotics datasets on the [Hugging Face Hub](https://huggingface.co/lerobot).
-- **Tools:** Seamlessly delete episodes, split by indices/fractions, add/remove features, and merge multiple datasets.
+---
 
-```python
-from lerobot.datasets.lerobot_dataset import LeRobotDataset
+## Status at a glance
 
-# Load a dataset from the Hub
-dataset = LeRobotDataset("lerobot/aloha_mobile_cabinet")
+| Area | Status | Short result |
+|---|---|---|
+| OB-15 robot class (`ob15`) | ✅ In use | Arms, head, base and lift run from one `Robot` class. |
+| Remote mode (`ob15_client` + host) | ✅ In use | Jetson drives the hardware. A GPU PC runs the policy over ZMQ. |
+| Gantry lift axis | ✅ In use, hardened | Works. Needed stall, temperature and stop-on-exit guards. |
+| Quest VR teleop (`xlerobot_vr`) | ✅ In use | Controls head, lift, base, both arms and grippers at once. |
+| RealSense depth recording | ✅ In use | Depth costs loop rate. Tuned to 424×240 at ~10 Hz. |
+| Whole-body VR datasets → policy | ⚠️ Low success | Head, base and lift drift plus inaccurate grasps. |
+| Arms-only robot (`ob15_arms`) | 🧪 On branches | Fixed head/lift pose per dataset. Policy controls arms only. |
+| Co-training pipeline + workflow UI | 🧪 Built, in testing | Merge, align, retarget, weight and train from one UI. |
+| HVLA (dual-system VLA) | 🧪 Integrated | S2 VLM + S1 action policy. Runs at ~29 Hz on the S1 loop. |
+| DAgger / human-in-the-loop | 🧪 Fixes on branches | Rollout + VR takeover. Several bugs fixed for OB-15. |
+| GEM 7-DOF arm (`gem`, `bi_gem`) | 🧪 Experimental | ODrive + Feetech arm. Unit tests use mocked buses. |
 
-# Access data (automatically handles video decoding)
-episode_index=0
-print(f"{dataset[episode_index]['action'].shape=}\n")
-```
+✅ = used on the robot. ⚠️ = works, but results were poor. 🧪 = built, still being tested.
 
-Learn more about it in the [LeRobotDataset Documentation](https://huggingface.co/docs/lerobot/lerobot-dataset-v3).
+---
 
-## SoTA Models
-
-LeRobot implements state-of-the-art policies in pure PyTorch, covering Imitation Learning, Reinforcement Learning, Vision-Language-Action (VLA) models, World Models, and Reward Models, with more coming soon. It also provides you with the tools to instrument and inspect your training process.
+## The hardware
 
 <p align="center">
-  <img alt="Gr00t Architecture" src="./media/readme/VLA_architecture.jpg" width="640px">
+  <img src="./media/ob15/ob15_arms_top_down.jpg" width="40%" alt="Both arms over the table, seen from the head">
+  <img src="./media/ob15/ob15_wrist_cameras.jpg" width="40%" alt="Wrist cameras and grippers near the blocks">
 </p>
 
-Training a policy is as simple as running a script configuration:
+| Component | Details |
+|---|---|
+| Mobile base | 3 omni-wheels at 120°, velocity control, Feetech STS3215 |
+| Left arm | 6-DOF SO-101-style arm (shoulder pan/lift, elbow, wrist flex/roll, gripper), STS3215 on Bus 1 |
+| Right arm | 6-DOF, same layout, STS3215 on Bus 2 |
+| Head | 2-DOF pan + tilt, STS3215 on Bus 2 |
+| Gantry lift | Optional Z axis. Leadscrew 100 mm/rev, 575 mm stroke. One STS3215, Bus 2, ID 9 |
+| Head camera | Intel RealSense D435i, 640×360 RGB at 30 fps + depth |
+| Wrist cameras | 2× Innomaker USB, 640×360 MJPG at 30 fps |
+| Compute | NVIDIA Jetson on the robot. Optional GPU workstation over ZMQ |
+
+**Motor buses**
+
+- **Bus 1** (`/dev/ttyACM1`): left arm IDs 1–6, base wheels IDs 7–9.
+- **Bus 2** (`/dev/ttyACM0`): right arm IDs 1–6, head IDs 7–8, lift ID 9.
+
+**State and action (18 values):** `left_arm_*.pos` ×6, `right_arm_*.pos` ×6, `head_pan.pos`, `head_tilt.pos`, `x.vel`, `y.vel`, `theta.vel`, `gantry.height_mm`.
+**Cameras:** `head` (+ `head_depth`), `left_wrist`, `right_wrist`. These names match SmolVLA's three image inputs, so no rename map is needed.
+
+---
+
+## Everything this fork adds
+
+Paths are relative to the repo root. "Status" uses the same legend as above.
+
+### Robots and motors
+
+| Path | What it does | Status |
+|---|---|---|
+| `src/lerobot/robots/ob15/ob15.py`, `config_ob15.py` | OB-15 robot (`--robot.type=ob15`). Per-limb ports that collapse onto shared buses, base velocity smoothing, camera start order. | ✅ |
+| `src/lerobot/robots/ob15/lift_axis.py` | Gantry lift: homing to stall, mm ↔ steps, velocity mode with wrap tracking, soft limits. | ✅ |
+| `src/lerobot/robots/ob15/ob15_host.py`, `ob15_client.py` | ZMQ host on the Jetson and `ob15_client` robot on the GPU PC. Watchdog, JPEG streaming. | ✅ |
+| `src/lerobot/robots/ob15/scripts/deadband_calibration.py` | Finds the smallest lift velocity that moves under load, in each direction. | ✅ |
+| `src/lerobot/robots/gem_follower/`, `bi_gem_follower/` | GEM 7-DOF arm and dual-arm version with a neck. Joint 1 on ODrive, the rest on Feetech. | 🧪 |
+| `src/lerobot/motors/odrive/` | `ODriveMotorsBus` for the GEM shoulder (extra: `lerobot[gem]`). | 🧪 |
+| `src/lerobot/model/SO101Robot.py` | SO-101 kinematic model helper used by the EE converters. | ✅ |
+
+### Teleoperation
+
+| Path | What it does | Status |
+|---|---|---|
+| `src/lerobot/teleoperators/xlerobot_vr/` | Meta Quest teleop. Headset drives the head. Controllers drive arms (IK), grippers, lift and base. Streams cameras to the headset. Remappable `button_map`. | ✅ |
+| `.../xlerobot_vr/vr_monitor.py` | HTTPS/WebSocket server and status monitor for the headset page. | ✅ |
+| Recording buttons | Left X opens the recording gate. Left Y re-records. Right A saves. Right B toggles DAgger takeover. Hold left X restarts an episode. Headset chimes on events. | ✅ |
+
+### Cameras and recording
+
+| Path | What it does | Status |
+|---|---|---|
+| `src/lerobot/cameras/realsense/` | Depth capture with its own resolution and `depth_frame_interval`. Background read thread. | ✅ |
+| `src/lerobot/cameras/opencv/camera_opencv.py` | Warm-up, start order and read fixes for the USB wrist cameras. | ✅ |
+| `src/lerobot/scripts/lerobot_record.py` | VR recording gate, depth read interval, gantry keys, upload on request. | ✅ |
+| `src/lerobot/utils/cycle_timer.py` | Loop-rate summary: tick percentiles, slow ticks, below-target warning. | ✅ |
+| `src/lerobot/scripts/lerobot_find_cameras.py` | Better camera discovery for multiple USB + RealSense devices. | ✅ |
+| `src/lerobot/datasets/recover_dataset.py` | Finalizes a dataset that recorded but did not finalize or upload. | ✅ |
+
+### Data and co-training
+
+| Path / CLI | What it does | Status |
+|---|---|---|
+| `lerobot-cotrain-align` (`data_processing/co_training_utils.py`) | Aligns ALOHA / Open-X / other LeRobot sets to the OB-15 schema: fps resample, joint remap by name, camera rename, padding report. | 🧪 |
+| `lerobot-extract-subset` | Derives RGB-only or reduced-DOF views from one "master" RGB-D dataset. | 🧪 |
+| `lerobot-umi-retarget` | Retargets UMI-style end-effector datasets (e.g. FastUMI) to the arms. | 🧪 |
+| `lerobot-joint-to-ee`, `scripts/convert_joint_to_ee.py`, `scripts/convert_droid_ee.py` | Converts joint datasets and DROID to episode-relative EE actions. | 🧪 |
+| `utils/dim_masking.py` | Masks the loss on padded action dims so a single-arm source does not teach a dead arm. | 🧪 |
+| `datasets/sampler.py`, `utils/source_sampling.py`, `config/generalist_source_weights.yaml` | Memory-light episode sampler with per-source-group weights. | 🧪 |
+| `utils/sample_weighting.py`, `rewards/sarm/*`, `data_processing/sarm_annotations/` | SARM subtask annotation and RA-BC sample weights. | 🧪 |
+| `scripts/workflow_ui/` | Local web UI: compose merge/train/extract/SARM stages, compare datasets, run with live logs. | 🧪 |
+
+### Training, policies and deployment
+
+| Path | What it does | Status |
+|---|---|---|
+| `src/lerobot/policies/hvla/` | Hierarchical VLA. S2 = Pi0.5 VLM (latents). S1 = ACT or flow-matching action policy. Shared-memory IPC. RLT (RL token) experiments. | 🧪 |
+| `scripts/extract_s2_latents_hvla.py`, `scripts/sync_hvla_deploy.sh` | Offline S2 latent extraction and deploy sync for HVLA. | 🧪 |
+| `src/lerobot/scripts/lerobot_train.py`, `src/lerobot/configs/*` | Hooks for weighted sampling, dim masking and source groups. | 🧪 |
+| `src/lerobot/upload_checkpoints.py` | Uploads many checkpoints to the Hub, with an LFS fallback. | ✅ |
+| `src/lerobot/async_inference/` | Policy server + robot client (kept in this fork). Pi0.5 server accepts real camera/state shapes. | ✅ |
+| `src/lerobot/rollout/strategies/dagger.py` | DAgger fixes: honours `push_to_hub`, `max_relative_target` on OB-15, empty teleop actions. | 🧪 |
+| `examples/ros2_bridge/` | ROS 2 Humble (Python 3.10) ↔ LeRobot (Python 3.12) bridge over ZMQ. | 🧪 |
+
+### Guides, scripts and tests
+
+| File | Content |
+|---|---|
+| [`GUIDE.md`](./GUIDE.md) | Full co-training pipeline, step by step, with the workflow UI. |
+| [`COTRAINING.md`](./COTRAINING.md) | Concepts and flags: merge, padding bias, generalist → specialists. |
+| [`DATA_CONVERSION.md`](./DATA_CONVERSION.md) | External data → OB-15 schema. |
+| [`DAGGER_HIL.md`](./DAGGER_HIL.md) | DAgger, RA-BC + SARM, HIL-SERL. |
+| [`RGBD_IMPLEMENTATION_GUIDE.md`](./RGBD_IMPLEMENTATION_GUIDE.md) | 4-channel RGB-D training. |
+| `Guide.sh` | My session reference: every hardware, record and train command. |
+| `scripts/test_xlerobot.sh` | Hardware smoke test. |
+| `tests/robots/test_ob15.py`, `test_gem_follower.py`, `test_bi_gem_follower.py`, `tests/teleoperators/test_xlerobot_vr_button_map.py`, `tests/async_inference/*`, `tests/data_processing/test_joint_to_ee.py` | Unit tests. Hardware is mocked. |
+
+---
+
+## Branches
+
+| Branch | Purpose |
+|---|---|
+| `main` | Upstream + all stable OB-15 work. |
+| `ob15-arms-robot` | `ob15_arms` robot: arms-only policy, fixed head tilt and lift height, lift stall/temperature guards, VR restart button. |
+| `ob15-arms-rollout-gantry` | Rollout fixes: gantry height in the policy state, position hold, lift stops on exit. |
+| `ob15-recording-rate` | Non-blocking camera reads, repeated-frame accounting, writer backlog log. |
+| `ob15-arms` | Integration of the three branches above. |
+| `pc1-training` | Training branch for the PC1 workstation (all of the above + dataset decode fixes). |
+
+---
+
+## How it went: results and lessons
+
+**1. Whole-body VR teleop gave low policy success.**
+I recorded datasets with the Quest controlling head, lift, base, both arms and grippers at the same time. The head moved a lot and the base moved during tasks. Trained policies mostly failed. The causes were drift in base, head and lift, and grasps that were not accurate.
+
+**2. Fix: arms-only policies with a fixed pose.**
+The `ob15_arms` robot holds the head and lift at a set pose. That pose is saved with each dataset and used again at inference. The policy controls only the arms and grippers. Base and lift move between tasks, not during them. Defaults: head tilt ≈ 60, lift 25 mm below the top.
+
+**3. Depth costs loop rate.**
+With depth at full colour resolution, the control loop fell from ~30 Hz to 15–29 Hz. Depth at 424×240 and decoded every third frame (~10 Hz) brought it back. The new cadence summary shows slow ticks so this is visible during recording.
+
+**4. The lift needs guards.**
+A velocity-mode lift can keep running if the program stops. I added stop-on-exit, stop after the connect hold, stall and temperature guards, and a deadband calibration script.
+
+**5. The base is the stability limit.**
+The wheel motors are small for the arm mass. Driving with the arms extended is the worst load case. Rule: drive, stop, then manipulate. This is a main input to the OB-20 design.
+
+**6. HVLA runs fast enough.**
+The HVLA docs report an S1 loop of ~34 ms (~29 Hz) with 10 flow-matching steps, compiled, in bf16. S2 adds ~81 ms per latent and runs in parallel.
+
+---
+
+## Quick start
 
 ```bash
-lerobot-train \
-  --policy.type=act \
-  --dataset.repo_id=lerobot/aloha_mobile_cabinet \
-  --policy.push_to_hub=false
+git clone https://github.com/ImpurestTadpole/lerobot && cd lerobot
+uv sync --locked --extra feetech --extra realsense --extra viz   # add --extra training on the GPU PC
 ```
 
-| Category                   | Models                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                  |
-| -------------------------- | ----------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
-| **Imitation Learning**     | [ACT](./docs/source/policy_act_README.md), [Diffusion](./docs/source/policy_diffusion_README.md), [VQ-BeT](./docs/source/policy_vqbet_README.md), [Multitask DiT Policy](./docs/source/policy_multi_task_dit_README.md)                                                                                                                                                                                                                                                                                                                                                                                                 |
-| **Reinforcement Learning** | [HIL-SERL](./docs/source/hilserl.mdx), [TDMPC](./docs/source/policy_tdmpc_README.md) & QC-FQL (coming soon)                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                             |
-| **VLAs Models**            | [Pi0](./docs/source/pi0.mdx), [Pi0Fast](./docs/source/pi0fast.mdx), [Pi0.5](./docs/source/pi05.mdx), [OpenGalaxea G0.5](./docs/source/g05.mdx), [FineART-VLA](./docs/source/fineart_vla.mdx), [GR00T N1.7](./docs/source/policy_groot_README.md), [SmolVLA](./docs/source/policy_smolvla_README.md), [XVLA](./docs/source/xvla.mdx), [EO-1](./docs/source/eo1.mdx), [MolmoAct2](./docs/source/molmoact2.mdx), [LingBot-VLA 2.0](./docs/source/lingbot_vla_v2.mdx), [WALL-OSS](./docs/source/walloss.mdx), [Wall-OSS-0.5](./docs/source/wall_oss_05.mdx), [EVO1](./docs/source/evo1.mdx), [DM05](./docs/source/dm05.mdx) |
-| **World Models**           | [VLA-JEPA](./docs/source/vla_jepa.mdx), [LingBot-VA](./docs/source/lingbot_va.mdx), [FastWAM](./docs/source/fastwam.mdx), [Long-WAM](./docs/source/longwam.mdx), [LaWAM](./docs/source/lawam.mdx), [FLUX 3 Action](./docs/source/flux3.mdx), [Cosmos3](./docs/source/cosmos3.mdx), [Praxis-1](./docs/source/praxis.mdx)                                                                                                                                                                                                                                                                                                 |
-| **Reward Models**          | [SARM](./docs/source/sarm.mdx), [TOPReward](./docs/source/topreward.mdx), [Robometer](./docs/source/robometer.mdx)                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                      |
-
-Similarly to the hardware, you can easily implement your own policy & leverage LeRobot's data collection, training, and visualization tools, and share your model to the HF Hub.
-
-For detailed policy setup guides, see the [Policy Documentation](https://huggingface.co/docs/lerobot/bring_your_own_policies). For GPU/RAM requirements and expected training time per policy, see the [Compute Hardware Guide](https://huggingface.co/docs/lerobot/hardware_guide).
-
-## Inference & Evaluation
-
-Evaluate your policies in simulation with `lerobot-eval`. LeRobot supports standard benchmarks like **LIBERO**, **MetaWorld** and more to come. To run a trained policy on a real robot, use `lerobot-rollout` (see the [Policy Deployment Documentation](https://huggingface.co/docs/lerobot/inference)).
+**Calibrate** (once per robot; homes the lift if enabled):
 
 ```bash
-# Evaluate a policy on the LIBERO benchmark
-lerobot-eval \
-  --policy.path=lerobot/pi0_libero_finetuned \
-  --env.type=libero \
-  --env.task=libero_object \
-  --eval.n_episodes=10
+lerobot-calibrate --robot.type=ob15 --robot.port1=/dev/ttyACM1 --robot.port2=/dev/ttyACM0 \
+  --robot.lift_axis.enabled=true
 ```
 
-Learn how to implement your own simulation environment or benchmark and distribute it from the HF Hub by following the [EnvHub Documentation](https://huggingface.co/docs/lerobot/envhub).
-
-### Third-Party Hardware
-
-Beyond the natively supported hardware, the community maintains a growing ecosystem of plugins for other robots, teleoperators, cameras, and sensors - UFACTORY xArm, Universal Robots UR5e, Franka, AgileX Piper, Trossen WidowX, ARX5, I2RT YAM, GELLO, SpaceMouse, Meta Quest, ROS 2 bridges, tactile and depth cameras, and more.
-
-Plugins are auto-discovered by package name: LeRobot imports any installed package prefixed with `lerobot_robot_`, `lerobot_teleoperator_`, or `lerobot_camera_`. Install one and use the `type` it registers straight from the CLI:
+**Teleoperate with the Quest** (on the Jetson):
 
 ```bash
-pip install lerobot_robot_<name> lerobot_teleoperator_<name>
-
-lerobot-record \
-  --robot.type=<robot_name> \
-  --teleop.type=<teleoperator_name> \
-  --dataset.repo_id=${HF_USER}/my-dataset
+lerobot-teleoperate --robot.type=ob15 --teleop.type=xlerobot_vr --teleop.stream_cameras_to_vr=true
 ```
 
-Browse the full list in the [Third-Party Robots & Teleoperators](https://huggingface.co/docs/lerobot/main/third_party_robots) and [Third-Party Cameras & Sensors](https://huggingface.co/docs/lerobot/main/third_party_sensors) documentation.
+**Record:**
 
-## Resources
+```bash
+lerobot-record --robot.type=ob15 --teleop.type=xlerobot_vr \
+  --dataset.repo_id=<hf_user>/<task> --dataset.single_task="<task text>" \
+  --dataset.num_episodes=20 --dataset.fps=30 --dataset.push_to_hub=true
+```
 
-- **[Documentation](https://huggingface.co/docs/lerobot/index):** The complete guide to tutorials & API.
-- **[Chinese Tutorials: LeRobot+SO-ARM101中文教程-同济子豪兄](https://zihao-ai.feishu.cn/wiki/space/7589642043471924447)** Detailed doc for assembling, teleoperate, dataset, train, deploy. Verified by Seed Studio and 5 global hackathon players.
-- **[Discord](https://discord.gg/s3KuuzsPFb):** Join the `LeRobot` server to discuss with the community.
-- **[X](https://x.com/LeRobotHF):** Follow us on X to stay up-to-date with the latest developments.
-- **[Robot Learning Tutorial](https://huggingface.co/spaces/lerobot/robot-learning-tutorial):** A free, hands-on course to learn robot learning using LeRobot.
-- **[T-Shirt Folding Experiment](https://huggingface.co/spaces/lerobot/robot-folding):** An end-to-end demonstration of folding t-shirts with LeRobot.
-- **[LeLab](https://github.com/huggingface/leLab):** A web interface for LeRobot — teleoperate, calibrate, record datasets, replay, and train your SO arm from the browser, no CLI required.
+**Remote mode** (Jetson runs hardware, GPU PC runs the policy):
 
-## Citation
+```bash
+# Jetson
+python -m lerobot.robots.ob15.ob15_host --robot-config <profile>.json
+# GPU PC: use --robot.type=ob15_client --robot.remote_ip=<jetson_ip>
+```
 
-If you use LeRobot in your project, please cite the GitHub repository to acknowledge the ongoing development and contributors:
+**Co-training pipeline:**
+
+```bash
+uv run python scripts/workflow_ui/app.py   # → http://127.0.0.1:7799
+```
+
+Then follow [`GUIDE.md`](./GUIDE.md).
+
+---
+
+## Next steps
+
+- Finish and merge `ob15_arms` into `main`.
+- Reach 5–10 household tasks at ~90 % success with small datasets.
+- Instant-Policy-style in-context imitation: wrap Instant Policy in LeRobot first, then a native demo- or language-prompted policy from SmolVLA weights.
+- Move the stack to **OB-20** (CAN-native actuators, wider base, powered lift column).
+
+---
+
+## Upstream LeRobot
+
+Everything else in this repo is [Hugging Face LeRobot](https://github.com/huggingface/lerobot): the `Robot` interface, the LeRobotDataset format, policies (ACT, Diffusion, Pi0/Pi0.5, SmolVLA, GR00T and more), `lerobot-train`, `lerobot-eval` and `lerobot-rollout`.
+
+- Docs: <https://huggingface.co/docs/lerobot>
+- Install, hardware and policy guides: [docs/source](./docs/source)
+- Licence: Apache 2.0 ([LICENSE](./LICENSE))
+
+If you use LeRobot, please cite the upstream project:
 
 ```bibtex
 @misc{cadene2024lerobot,
@@ -329,32 +259,3 @@ If you use LeRobot in your project, please cite the GitHub repository to acknowl
     year = {2024}
 }
 ```
-
-If you are referencing our research or the academic paper, please also cite our ICLR publication:
-
-<details>
-<summary><b>ICLR 2026 Paper</b></summary>
-
-```bibtex
-@inproceedings{cadenelerobot,
-  title={LeRobot: An Open-Source Library for End-to-End Robot Learning},
-  author={Cadene, Remi and Alibert, Simon and Capuano, Francesco and Aractingi, Michel and Zouitine, Adil and Kooijmans, Pepijn and Choghari, Jade and Russi, Martino and Pascal, Caroline and Palma, Steven and Shukor, Mustafa and Moss, Jess and Soare, Alexander and Aubakirova, Dana and Lhoest, Quentin and Gallou\'edec, Quentin and Wolf, Thomas},
-  booktitle={The Fourteenth International Conference on Learning Representations},
-  year={2026},
-  url={https://arxiv.org/abs/2602.22818}
-}
-```
-
-</details>
-
-## Contribute
-
-We welcome contributions from everyone in the community! To get started, please read our [CONTRIBUTING.md](https://github.com/huggingface/lerobot/blob/main/CONTRIBUTING.md) guide. Whether you're adding a new feature, improving documentation, or fixing a bug, your help and feedback are invaluable. We're incredibly excited about the future of open-source robotics and can't wait to work with you on what's next—thank you for your support!
-
-<p align="center">
-  <img alt="SO101 Video" src="./media/readme/so100_video.webp" width="640px">
-</p>
-
-<div align="center">
-<sub>Built by the <a href="https://huggingface.co/lerobot">LeRobot</a> team at <a href="https://huggingface.co">Hugging Face</a> with ❤️</sub>
-</div>
