@@ -161,7 +161,9 @@ def test_select_view_repeats_one_view_per_sample() -> None:
 
 @pytest.mark.parametrize("causal", [False, True])
 @pytest.mark.parametrize("reduction", ["mean", "none"])
-def test_mode_none_matches_vla_jepa_exactly(patch_vla_jepa_external_models, causal: bool, reduction: str) -> None:
+def test_mode_none_matches_vla_jepa_exactly(
+    patch_vla_jepa_external_models, causal: bool, reduction: str
+) -> None:
     """Drift guard: the copied `_world_model_loss` must equal VLA-JEPA's when cross-view is off."""
     h.set_seed_all(0)
     gv_config = h.make_goodview_config(NUM_FRAMES, cross_view_mode="none", causal_world_model_context=causal)
@@ -171,7 +173,9 @@ def test_mode_none_matches_vla_jepa_exactly(patch_vla_jepa_external_models, caus
     gv, vla = GoodViewJEPAModel(gv_config), VLAJEPAModel(vla_config)
     vla.load_state_dict(gv.state_dict())
     videos = torch.rand(2, 2, NUM_FRAMES, 3, 16, 16)
-    action_tokens = torch.randn(2, (NUM_FRAMES - 1) * gv_config.num_action_tokens_per_timestep, h.QWEN_HIDDEN_SIZE)
+    action_tokens = torch.randn(
+        2, (NUM_FRAMES - 1) * gv_config.num_action_tokens_per_timestep, h.QWEN_HIDDEN_SIZE
+    )
     a = gv._world_model_loss(videos, action_tokens, reduction=reduction)
     b = vla._world_model_loss(videos, action_tokens, reduction=reduction)
     assert torch.equal(a, b)
@@ -180,7 +184,9 @@ def test_mode_none_matches_vla_jepa_exactly(patch_vla_jepa_external_models, caus
 def test_mode_none_keeps_original_target(patch_vla_jepa_external_models, monkeypatch) -> None:
     seen, hidden = _run_world_model_loss(monkeypatch, "none")
     for s in range(2):
-        assert _tags(seen["input"], hidden)[s] == [[100 * s + 10 * view + f for view in range(2)] for f in range(3)]
+        assert _tags(seen["input"], hidden)[s] == [
+            [100 * s + 10 * view + f for view in range(2)] for f in range(3)
+        ]
         assert _tags(seen["target"], hidden)[s] == [
             [100 * s + 10 * view + f for view in range(2)] for f in range(1, 4)
         ]

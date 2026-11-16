@@ -149,7 +149,10 @@ class GoodViewJEPAPolicy(VLAJEPAPolicy):
         blank = torch.rand(len(images)) < prob
         choice = torch.randint(num_views, (len(images),))
         inputs["images"] = [
-            [torch.zeros_like(img) if blank[s] and view == choice[s] else img for view, img in enumerate(views)]
+            [
+                torch.zeros_like(img) if blank[s] and view == choice[s] else img
+                for view, img in enumerate(views)
+            ]
             for s, views in enumerate(images)
         ]
         return inputs

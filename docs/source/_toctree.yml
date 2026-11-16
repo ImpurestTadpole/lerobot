@@ -71,6 +71,8 @@
     title: MolmoAct2
   - local: vla_jepa
     title: VLA-JEPA
+  - local: goodview_jepa
+    title: Good-View JEPA
   - local: lawam
     title: LaWAM
   - local: praxis

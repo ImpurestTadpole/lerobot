@@ -54,7 +54,9 @@ class GoodViewJEPAConfig(VLAJEPAConfig):
     def __post_init__(self) -> None:
         super().__post_init__()
         if self.cross_view_mode not in CROSS_VIEW_MODES:
-            raise ValueError(f"`cross_view_mode` must be one of {CROSS_VIEW_MODES}, got {self.cross_view_mode!r}.")
+            raise ValueError(
+                f"`cross_view_mode` must be one of {CROSS_VIEW_MODES}, got {self.cross_view_mode!r}."
+            )
         if self.cross_view_mode != "none":
             if not self.enable_world_model:
                 # VLAJEPAConfig turns the world model off under freeze_qwen; the target would be ignored.

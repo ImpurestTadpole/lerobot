@@ -1,5 +1,19 @@
 #!/usr/bin/env python
-"""Phase 1 (E1/E2): train a small ViT-S JEPA on robot frames with good or bad views.
+
+# Copyright 2026 The HuggingFace Inc. team. All rights reserved.
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#     http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+"""Train a small ViT-S JEPA on robot camera frames with good or bad views.
 
 good: the two positives are two cameras at the same timestep (wrist + external).
 bad:  the two positives are two crops of one camera frame. The camera is picked at random per
@@ -14,8 +28,8 @@ a [B, C, H, W] tensor would share one crop and one jitter across the whole batch
 
 Example:
     for s in 0 1 2; do
-      python examples/goodview_jepa/goodview_jepa.py --repo_id ORG/DATA --mode good --seed $s --out good_$s.pt
-      python examples/goodview_jepa/goodview_jepa.py --repo_id ORG/DATA --mode bad  --seed $s --out bad_$s.pt
+      python examples/goodview_jepa/train_encoder.py --repo_id ORG/DATA --mode good --seed $s --out good_$s.pt
+      python examples/goodview_jepa/train_encoder.py --repo_id ORG/DATA --mode bad  --seed $s --out bad_$s.pt
     done
 Hold out episodes for align_eval.py with --episodes (train) and its own --episodes (eval).
 """
@@ -37,9 +51,10 @@ class GoodViewEncoder(nn.Module):
     """ViT-S/16 backbone (384-d CLS features) + LeJEPA-style MLP projector with BatchNorm.
 
     The loss uses `forward` (projector output, `dim` wide); evaluation uses `features` (backbone),
-    as in LeJEPA. Without the BN projector, SIGReg at lambda = 0.02 did not stop collapse on OB15
-    frames (embedding std 0.24 -> 0.008 in 30 steps at batch 16; it held at ~0.1-0.2 with it). The
-    Epps-Pulley statistic has zero gradient at z = 0, so a run that collapses does not recover.
+    as in LeJEPA. Without the BN projector, SIGReg at lambda = 0.02 did not stop collapse on real
+    robot frames (embedding std 0.24 -> 0.008 in 30 steps at batch 16; it held at ~0.1-0.2 with
+    it). The Epps-Pulley statistic has zero gradient at z = 0, so a run that collapses does not
+    recover.
     """
 
     def __init__(self, dim: int = 128, hidden: int = 2048) -> None:
@@ -116,7 +131,9 @@ def main() -> None:
     ap.add_argument("--repo_id", required=True)
     ap.add_argument("--root", default=None)
     ap.add_argument("--cams", nargs=2, default=["observation.images.wrist", "observation.images.top"])
-    ap.add_argument("--episodes", type=int, nargs="*", default=None, help="training episodes (hold out the rest)")
+    ap.add_argument(
+        "--episodes", type=int, nargs="*", default=None, help="training episodes (hold out the rest)"
+    )
     ap.add_argument("--mode", choices=["good", "bad"], default="good")
     ap.add_argument("--dim", type=int, default=128)
     ap.add_argument("--lam", type=float, default=0.02)
@@ -137,7 +154,9 @@ def main() -> None:
     for cam in args.cams:
         if cam not in ds.meta.features:
             raise SystemExit(f"{cam!r} not in dataset features: {list(ds.meta.camera_keys)}")
-    dl = DataLoader(ds, batch_size=args.batch_size, shuffle=True, num_workers=args.num_workers, drop_last=True)
+    dl = DataLoader(
+        ds, batch_size=args.batch_size, shuffle=True, num_workers=args.num_workers, drop_last=True
+    )
     enc = GoodViewEncoder(args.dim).to(args.device)
     opt = torch.optim.AdamW(enc.parameters(), lr=args.lr, weight_decay=0.05)
     step = 0
@@ -159,9 +178,13 @@ def main() -> None:
             torch.nn.utils.clip_grad_norm_(enc.parameters(), 1.0)  # prevents collapse
             opt.step()
             if args.max_steps is not None and step % 10 == 0:
-                print(f"step {step} loss {loss.item():.4f} inv {inv.item():.4f} z_std {z1.std(0).mean().item():.3f}")
+                print(
+                    f"step {step} loss {loss.item():.4f} inv {inv.item():.4f} z_std {z1.std(0).mean().item():.3f}"
+                )
         print(f"epoch {ep} loss {loss.item():.4f} inv {inv.item():.4f} z_std {z1.std(0).mean().item():.3f}")
-    torch.save({"state_dict": enc.state_dict(), "dim": args.dim, "mode": args.mode, "seed": args.seed}, args.out)
+    torch.save(
+        {"state_dict": enc.state_dict(), "dim": args.dim, "mode": args.mode, "seed": args.seed}, args.out
+    )
 
 
 if __name__ == "__main__":

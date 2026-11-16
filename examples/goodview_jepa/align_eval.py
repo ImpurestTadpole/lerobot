@@ -1,18 +1,32 @@
 #!/usr/bin/env python
-"""Phase 1 evaluation (E1 alignment, E2 state probe) for encoders from goodview_jepa.py.
+
+# Copyright 2026 The HuggingFace Inc. team. All rights reserved.
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#     http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+"""Evaluate encoders from train_encoder.py: cross-camera and cross-seed alignment, and a state probe.
 
 What each number means:
 - cross_camera (within one encoder): cam1 vs cam2 frames through the same encoder. The good-view
   encoder is trained to make these match, so this favours it by design. Report it, but don't use it
-  alone for Gate 1.
+  alone to compare good and bad views.
 - cross_seed (between two encoders of the same mode, different seeds): does independent training
   converge to the same space (the Platonic-representation question)? Run on the same camera and on
   different cameras (encoder A on cam1 vs encoder B on cam2).
-- state_probe (E2): ridge probe from frozen features to observation.state, fit on the fit episodes,
+- state_probe: ridge probe from frozen features to observation.state, fit on the fit episodes,
   scored on the test episodes (R^2, higher is better). Neither mode trains for this.
 
 Whitening and the Procrustes rotation are fitted on the fit split and applied unchanged to the test
-split. Use episodes held out from training (goodview_jepa.py --episodes).
+split. Use episodes held out from training (train_encoder.py --episodes).
 
 Example:
     python examples/goodview_jepa/align_eval.py --repo_id ORG/DATA --episodes 40 41 42 43 44 45 46 47 \\
@@ -134,7 +148,7 @@ def ridge_probe_r2(x_fit, y_fit, x_test, y_test, groups=None, alphas=ALPHAS) -> 
 
 @torch.no_grad()
 def embed(enc, frames: torch.Tensor, device: str, batch: int = 256) -> torch.Tensor:
-    from goodview_jepa import eval_tf
+    from train_encoder import eval_tf
 
     out = []
     for i in range(0, len(frames), batch):
@@ -158,7 +172,7 @@ def load_frames(repo_id, root, episodes, cams, max_frames):
 
 def main() -> None:
     sys.path.insert(0, str(Path(__file__).parent))
-    from goodview_jepa import GoodViewEncoder
+    from train_encoder import GoodViewEncoder
 
     ap = argparse.ArgumentParser()
     ap.add_argument("--repo_id", required=True)
@@ -179,7 +193,10 @@ def main() -> None:
     test = ~fit
     if test.sum() < 2 * args.k:
         raise SystemExit("Too few test frames; pass more held-out episodes.")
-    print(f"fit: {int(fit.sum())} frames from {len(eps) // 2} episodes | test: {int(test.sum())} frames", file=sys.stderr)
+    print(
+        f"fit: {int(fit.sum())} frames from {len(eps) // 2} episodes | test: {int(test.sum())} frames",
+        file=sys.stderr,
+    )
 
     feats = {}
     # Untrained encoder as a floor: trained encoders should beat it on every metric.
@@ -204,9 +221,12 @@ def main() -> None:
     for name, f in feats.items():
         results["per_encoder"][name] = {
             "mode": f["mode"],
-            "cross_camera (favours good views by design)": alignment(f[c1][fit], f[c2][fit], f[c1][test], f[c2][test], args.k),
+            "cross_camera (favours good views by design)": alignment(
+                f[c1][fit], f[c2][fit], f[c1][test], f[c2][test], args.k
+            ),
             "state_probe_R2 (alpha)": {
-                c: ridge_probe_r2(f[c][fit], state[fit], f[c][test], state[test], groups=ep[fit]) for c in args.cams
+                c: ridge_probe_r2(f[c][fit], state[fit], f[c][test], state[test], groups=ep[fit])
+                for c in args.cams
             },
         }
     for a, b in itertools.combinations(feats, 2):
