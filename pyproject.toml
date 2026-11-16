@@ -276,6 +276,7 @@ fineart_vla_kernels = [
 ]
 hilserl = ["lerobot[transformers-dep]", "lerobot[dataset]", "gym-hil>=0.1.14,<0.2.0", "lerobot[grpcio-dep]", "lerobot[placo-dep]"]
 vla_jepa = ["lerobot[transformers-dep]", "lerobot[diffusers-dep]", "lerobot[qwen-vl-utils-dep]"]
+goodview_jepa = ["lerobot[vla_jepa]"]
 lingbot_va = ["lerobot[transformers-dep]", "lerobot[diffusers-dep]", "lerobot[accelerate-dep]"]
 lingbot_vla_v2 = ["lerobot[transformers-dep]", "lerobot[scipy-dep]"]
 wall_oss_05 = ["lerobot[transformers-dep]"]
@@ -379,6 +380,7 @@ all = [
     "lerobot[evo1]",
     "lerobot[hilserl]",
     "lerobot[vla_jepa]",
+    "lerobot[goodview_jepa]",
     "lerobot[lingbot_va]",
     "lerobot[lingbot_vla_v2]",
     "lerobot[g05]",
