@@ -1,0 +1,168 @@
+# OB15 arms-only control (`ob15_arms`)
+
+OB15 has two robot types. They share the same low-level code (`OB15Arms` subclasses `OB15`); the arms-only
+type just leaves the base, head and lift out of what a policy or teleop can command.
+
+| | `ob15` | `ob15_arms` |
+|---|---|---|
+| Use for | VR setup, navigation, recovery | Recording tasks and running policies |
+| Actions | 18: arms, grippers, head, base velocity, lift | 12: arms and grippers |
+| Head and lift | Commanded by teleop/policy | Moved to a hold pose at connect, then re-commanded every tick |
+| Base | Commanded | No base command is sent, so the wheels stay at zero velocity |
+| Hold-pose code (`hold_from`, head/lift flags, `ob15_hold.json`) | No | Yes (`robots/ob15_arms/`) |
+
+In the usual setup both run on the robot computer (the Jetson) and the policy runs through remote inference, so
+ZMQ is not involved. The ZMQ types (`ob15_client`, `ob15_arms_client`) still exist for a PC-side client talking
+to an `ob15` host, and use the same hold options.
+
+- **Action space:** 12 values (both arms and grippers).
+- **Observation state:** arms, grippers, head pan/tilt and lift height. No base velocity.
+- Base, head and lift keys sent by VR teleop or a policy are dropped.
+- Recording runs on the Jetson. Inference runs on the Jetson with the policy on a GPU PC through
+  [remote inference](./remote_inference) (`lerobot-policy-server` + `--inference.type=remote`).
+
+## Hold pose
+
+Hold target precedence: explicit `--robot.head_pan / head_tilt / lift_height_mm` > `--robot.hold_from` > the
+default head tilt of **+60** (head tilt is in -100..+100 units across the calibrated range, positive = down;
+kept 5 units inside the end of the range) (camera angled down at the table; positive tilt is down, negative is up) > the
+current pose at connect (the lift and head pan have no default and keep their current position). A key missing from a higher source falls back to the next one (the log line
+"Hold targets ..." shows which sources were used). `--robot.hold_on_connect=false` freezes the current pose (no default tilt) and
+ignores `hold_from`.
+
+The lift is homed to the top at connect and **stays torqued there**. (Plain `ob15` releases the lift's torque after
+homing so gravity lowers it; `ob15_arms` sets `lift_axis.release_torque_after_home=False`.) With no
+`--robot.lift_height_mm` it holds **25 mm below the top** (`DEFAULT_LIFT_MM`; 0 mm = the top hard stop itself,
+`lift_axis.zero_at_limit=True`; plain `ob15` zeroes 10 mm lower, at the point homing backs off to). The lift carries the
+arms, not the head camera: lowering it sinks the arms in the head view (measured: 25 mm keeps them clearly in view,
+50 mm partly, 75 mm barely). `--robot.lift_height_mm=0` is the top. A height you pass is measured down from the top.
+Datasets recorded before this change have lift heights measured from the old zero, 10 mm lower.
+
+## The dataset remembers the hold pose (`hold_from`)
+
+- **Recording** with `ob15_arms` writes the resolved head/lift pose to
+  `<dataset_root>/meta/ob15_hold.json` (also on resume). It is uploaded with `push_to_hub`. If the file already
+  exists with a different pose (beyond the tolerances) it is kept and a warning is logged; pass
+  `--dataset.overwrite_hold=true` to replace it.
+- **Training** (`lerobot-train`) copies it to `<checkpoint>/pretrained_model/ob15_hold.json` when the training
+  dataset has one (nothing happens for other datasets). A merged dataset only carries it if you copy
+  `meta/ob15_hold.json` into it.
+- **Inference**: `--robot.hold_from=<dataset or policy>` moves the head/lift to the saved pose. It accepts a
+  local dataset root, a checkpoint directory (or its `pretrained_model/`), the JSON file itself, a Hub dataset
+  id or a Hub model id. A local path that does not exist is tried as a Hub repo id.
+
+```json
+{"version": 1, "robot_type": "ob15_arms",
+ "hold": {"gantry.height_mm": 220.0, "head_pan.pos": 0.0, "head_tilt.pos": 40.0},
+ "source": {"hold_from": null,
+            "overrides": {"head_pan": null, "head_tilt": 40.0, "lift_height_mm": 220.0},
+            "hold_on_connect": true},
+ "recorded_at": "2026-11-09T12:00:00+00:00"}
+```
+
+## Tolerances
+
+`--robot.settle_timeout_s` (default 15), `--robot.lift_tol_mm` (5) and `--robot.head_tol` (2 deg) decide when the
+hold pose counts as reached at connect and when `check_hold()` reports drift.
+
+## Commands
+
+```bash
+# Record on the Jetson (VR teleop still works; base/head/lift inputs are ignored)
+lerobot-record --robot.type=ob15_arms --robot.head_tilt=40 ...
+
+# Run a policy served from the PC (on the PC: lerobot-policy-server --config_path=server.yaml)
+lerobot-rollout --robot.type=ob15_arms --robot.head_tilt=40 \
+  --inference.type=remote --inference.endpoint=tcp/<pc-ip>:7447 --inference.deployment=<name> ...
+
+# Restore the head/lift pose the policy's data was recorded with (dataset id, policy id or local path)
+lerobot-rollout --robot.type=ob15_arms --robot.hold_from=<user>/<dataset> \
+  --inference.type=remote --inference.endpoint=tcp/<pc-ip>:7447 --inference.deployment=<name> ...
+```
+
+## Checking head and lift
+
+- `robot.check_hold()` returns, per hold key, the target, the actual value, the error and whether it is within
+  tolerance (2 deg for the head, 5 mm for the lift), and logs a warning for any drift. It also runs when the
+  robot disconnects. Call it at the end of a task or episode to confirm the head and lift stayed put.
+- For recorded data, `python -m lerobot.data_processing.convert_to_arms_only --src-repo-id <repo> --report`
+  lists, per episode, the start and end values and range of head pan/tilt and lift, plus any base motion.
+
+## Converting an existing full-body dataset
+
+```bash
+python -m lerobot.data_processing.convert_to_arms_only --src-repo-id me/ob15_full --dst-repo-id me/ob15_arms
+```
+
+This writes a new dataset (the source is untouched) whose `action` has the 12 arm keys and whose
+`observation.state` has no base velocity, and recomputes the stats. Check the `--report` output first and consider
+dropping episodes where the head or lift moved a lot.
+
+## Looking at the depth camera
+
+Depth is stored as lossless 12-bit HEVC (`gray12le`, mm on a log scale). Browsers cannot decode that, so the
+Hugging Face dataset visualizer shows an empty `head_depth` panel even though the data is fine. Export a
+colour-mapped preview (near = red, far = blue, no reading = black) that plays anywhere:
+
+```bash
+python -m lerobot.data_processing.depth_preview --repo-id <user/dataset> --episode 0 --with-rgb --out depth_preview.mp4
+```
+
+## Control rate on the Jetson
+
+Measured on the Orin Nano with `ob15_arms` (2 short episodes, 3 cameras + depth, 30 Hz target):
+
+| head RGB | frame saving | control rate |
+|---|---|---|
+| 640x360 | PNG (default) | 29.6 Hz |
+| 960x540 | PNG (default) | 29.6 Hz |
+| 1280x720 | PNG (default) | 25.3 Hz |
+| 1280x720 | `--dataset.streaming_encoding=true` | 20.7 Hz |
+| 640x360 | `--dataset.streaming_encoding=true` | 24.4 Hz |
+
+Keep the default PNG saving: the Orin Nano has no hardware video encoder, so streaming encoding runs inside
+the control loop and makes it slower. 960x540 is the largest head image that still holds 30 Hz.
+
+## Lift motor protection
+
+The lift motor holds the arms' weight, so it is protected against overheating:
+
+- **Stall guard** (`--robot.lift_stall_guard_s`, default 3): if the lift is being driven but has not moved 0.3 mm for
+  that long (a command pushing against the top stop or a jam), it stops driving for 10 s.
+- **Temperature guard** (checked every `--robot.lift_health_period_s`, default 5 s): a warning at
+  `--robot.lift_temp_warn_c` (55 C); at `--robot.lift_temp_stop_c` (65 C, `None` disables) the lift's torque is released
+  so it cannot burn out. The lift then lowers, and `ob15_arms` does not command it again until the next connect.
+- **End of session**: the lift stays torqued where it is and a warning says so. Cut the robot's power when you walk
+  away, or pass `--robot.release_lift_on_disconnect=true` to let it lower on exit instead.
+- The top is approached no closer than 1 mm (`soft_min_mm`), and homing's brief stall at the hard stop is unchanged.
+
+## One dataset, several tasks
+
+Keep recording into the same dataset and change only the task string. `lerobot-record` appends a timestamp to
+`--dataset.repo_id` unless you pass `--dataset.no_stamp=true`, so a plain re-run starts a *new* dataset. To append:
+
+```bash
+lerobot-record --robot.type=ob15_arms --teleop.type=xlerobot_vr \
+    --dataset.repo_id=<user>/cleaning_up_brackets --dataset.no_stamp=true --resume=true \
+    --dataset.single_task="cleaning up brown brackets with the left arm" ...
+```
+
+Each episode keeps its own task (`meta/tasks.parquet`, `task_index`). The dataset's `ob15_hold.json` keeps the pose of
+the session that created it; a later session with a pose beyond the tolerances logs a warning and does not overwrite it
+(`--dataset.overwrite_hold=true` replaces it). Resuming needs the `deepdiff` package (`pip install deepdiff`).
+
+## VR recording buttons and headset chimes
+
+| Button | Action |
+|---|---|
+| LEFT X (tap) | Open the recording gate at the start of each episode (the robot is driven but nothing is recorded until then). After that a quick tap does nothing, so an instinctive re-press cannot discard an episode. |
+| LEFT Y (tap) | Restart (discard and re-record) the current episode. |
+| LEFT X (**hold ~1 s**, after the gate is open) | Restart the episode, same as LEFT Y. A hold that starts the recording does not count. |
+| RIGHT A | Finish the episode early (saved). |
+| LEFT Menu (tap / hold ~0.6 s) | Stop the session / toggle passthrough. |
+
+The headset plays a different chime for each event (`vr_app.js` in XLeVR): **start** a rising three-note chime, **stop** a
+lower falling three-note chime, **restart** a fast falling four-note buzzy "rewind" blip. After a restart you press LEFT X
+again to open the gate for the new attempt, which plays the start chime.
+The chimes do not depend on `--teleop.stream_cameras_to_vr`: they play with camera streaming on or off (turning streaming
+off saves CPU). The headset page must have been reloaded after `vr_app.js` changes.

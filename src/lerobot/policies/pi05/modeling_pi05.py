@@ -27,6 +27,7 @@ import torch.nn.functional as F  # noqa: N812
 from torch import Tensor, nn
 from torch.nn.attention import SDPBackend, sdpa_kernel
 
+from lerobot.utils.feature_spec import FeatureSpec
 from lerobot.utils.import_utils import _transformers_available, require_package
 
 # Conditional import for type checking and lazy loading
@@ -50,6 +51,7 @@ else:
     sdpa_attention_forward = None
     PaliGemmaForConditionalGenerationWithPiGemma = None
 from lerobot.configs import PreTrainedConfig
+from lerobot.configs.types import FeatureType
 from lerobot.utils.constants import (
     ACTION,
     ACTION_DIM_MASK,
@@ -1069,6 +1071,35 @@ class PI05Policy(PreTrainedPolicy):
     model_class = PI05Pytorch
     # Subclasses whose checkpoints are native LeRobot state dicts use the base loader.
     use_native_pretrained_loader = False
+
+    def validate_chunk_input_features(self, features: tuple[FeatureSpec, ...]) -> None:
+        """Accept the inputs PI05 resizes and pads itself, instead of exact checkpoint shapes.
+
+        ``_preprocess_images`` resizes every camera to ``config.image_resolution`` with padding, and
+        ``prepare_state`` zero-pads the state to ``config.max_state_dim``. A deployment therefore serves
+        real camera resolutions and a robot state narrower than the padded checkpoint state. The
+        canonical feature names still have to match the checkpoint exactly, and the shapes the server
+        negotiates stay fixed for the whole session.
+        """
+        expected = self.config.input_features or {}
+        supplied = {feature.name: feature for feature in features}
+        if supplied.keys() != expected.keys():
+            raise ValueError("Canonical feature names must exactly match policy input_features.")
+        for name, policy_feature in expected.items():
+            feature = supplied[name]
+            if policy_feature.type == FeatureType.VISUAL:
+                if feature.kind != "rgb" or len(feature.shape) != 3 or feature.shape[2] != 3:
+                    raise ValueError(f"PI05 requires an HxWx3 RGB image for {name}.")
+            elif name == OBS_STATE:
+                if feature.kind != "tensor" or len(feature.shape) != 1:
+                    raise ValueError(f"PI05 requires a 1-D state vector for {name}.")
+                if not 0 < feature.shape[0] <= self.config.max_state_dim:
+                    raise ValueError(
+                        f"PI05 state for {name} has {feature.shape[0]} values; it is zero-padded to at "
+                        f"most max_state_dim={self.config.max_state_dim}."
+                    )
+            elif feature.kind != "tensor" or feature.shape != tuple(policy_feature.shape):
+                raise ValueError(f"Tensor feature shape differs from checkpoint: {name}.")
 
     def supports_rtc(self) -> bool:
         return True

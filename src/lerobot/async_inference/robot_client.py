@@ -73,6 +73,7 @@ from lerobot.robots import (  # noqa: F401
     unitree_g1,
 )
 from lerobot.robots.ob15.config_ob15 import OB15Config  # noqa: F401
+from lerobot.robots.ob15_arms.config_ob15_arms import OB15ArmsConfig  # noqa: F401
 from lerobot.transport import (
     services_pb2,  # type: ignore
     services_pb2_grpc,  # type: ignore

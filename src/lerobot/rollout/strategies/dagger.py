@@ -27,7 +27,7 @@ selected by the ``input_device`` config field.  Keyboard/pedal expose:
     ESC (keyboard only) — Stop session.
 
 ``input_device="teleop"`` instead polls ``teleop.get_teleop_events()`` every
-control tick and mirrors its ``is_intervention`` toggle (e.g. RIGHT A on the
+control tick and mirrors its ``is_intervention`` toggle (e.g. RIGHT B on the
 xlerobot VR teleop, configurable via that teleop's ``button_map``) by walking
 the state machine one transition per tick: ON drives
 AUTONOMOUS → PAUSED → CORRECTING, OFF drives the reverse.  If the teleop's
@@ -516,6 +516,13 @@ class DAggerStrategy(RolloutStrategy):
                             robot_action_to_send = ctx.processors.robot_action_processor(
                                 (processed_teleop, obs)
                             )
+                        if any(k not in processed_teleop for k in ctx.data.ordered_action_keys):
+                            # e.g. XLerobotVRTeleop.get_action() returns {} when its observation read fails
+                            logger.warning("Teleop returned an incomplete action; holding last command this tick")
+                            if last_action:
+                                robot.send_action(last_action)
+                            timer.wait()
+                            continue
                         with timer.section("send"):
                             robot.send_action(robot_action_to_send)
                         last_action = robot_action_to_send
@@ -740,6 +747,13 @@ class DAggerStrategy(RolloutStrategy):
                             robot_action_to_send = ctx.processors.robot_action_processor(
                                 (processed_teleop, obs)
                             )
+                        if any(k not in processed_teleop for k in ctx.data.ordered_action_keys):
+                            # e.g. XLerobotVRTeleop.get_action() returns {} when its observation read fails
+                            logger.warning("Teleop returned an incomplete action; holding last command this tick")
+                            if last_action:
+                                robot.send_action(last_action)
+                            timer.wait()
+                            continue
                         with timer.section("send"):
                             robot.send_action(robot_action_to_send)
                         last_action = robot_action_to_send
@@ -911,6 +925,10 @@ class DAggerStrategy(RolloutStrategy):
         uploading a partially-recorded episode.
         """
         if self._push_executor is None:
+            return
+
+        if cfg.dataset is None or not cfg.dataset.push_to_hub:
+            logger.info("Skipping push: --dataset.push_to_hub=false")
             return
 
         if self._events.phase == DAggerPhase.CORRECTING:

@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import contextlib
 import logging
 import time
 from dataclasses import dataclass
@@ -78,6 +79,21 @@ class LiftAxisConfig:
     # Leave False for tasks where the policy needs to move the lift.
     freeze_after_home: bool = False
 
+    # After homing, cut the lift motor's torque so gravity pulls the lift down to a safe resting
+    # position (the original ob15 behaviour). Set False to keep the lift torqued and held at the top.
+    release_torque_after_home: bool = True
+
+    # Where 0 mm is after homing. False (original ob15): at the point the lift backed off to, which is
+    # home_backoff_mm below the hard stop. True: at the hard stop itself, so 0 mm is the top.
+    zero_at_limit: bool = False
+
+    # Stall guard (0 = off, the original ob15 behaviour). If the lift has been driven for stall_guard_s seconds
+    # without moving stall_move_mm, stop driving it for stall_halt_s seconds: a motor pushing against a hard stop or
+    # a jam with a command that is never satisfied overheats.
+    stall_guard_s: float = 0.0
+    stall_move_mm: float = 0.3
+    stall_halt_s: float = 10.0
+
 
 class LiftAxis:
     """Gantry/Z-axis controller that plugs into an existing Feetech bus."""
@@ -98,6 +114,9 @@ class LiftAxis:
 
         self._cached_height_mm: float = 0.0
         self._cached_velocity: float = 0.0
+        self._drive_since: float | None = None  # stall guard: when the current drive command began
+        self._drive_ref_mm: float = 0.0
+        self._stall_halt_until: float = 0.0
         self._velocity_alpha: float = 0.3
         self._filtered_velocity: float = 0.0
 
@@ -105,6 +124,8 @@ class LiftAxis:
         self._homed: bool = False
         self._frozen: bool = False
         self._freeze_target_mm: float = 0.0
+        # Latched by emergency_stop(): the lift ignores every command until clear_emergency_stop().
+        self._estopped: bool = False
 
     def attach(self) -> None:
         """Registers the motor name on the selected bus (safe pre-connect)."""
@@ -232,6 +253,9 @@ class LiftAxis:
     def apply_action(self, action: dict[str, float]) -> None:
         if not self.enabled:
             return
+        if self._estopped:  # a shutdown signal arrived: hold still, whatever the policy or teleop asks
+            self.zero_velocity()
+            return
         self.configure()
 
         key_h = f"{self.cfg.name}.height_mm"
@@ -268,13 +292,20 @@ class LiftAxis:
             err = target_mm - cur_mm
             abs_err = abs(err)
 
+            now = time.monotonic()
+            if now < self._stall_halt_until:  # the stall guard stopped the lift; let it rest
+                self._bus.write("Goal_Velocity", self.cfg.name, 0)
+                return
+
             # Soft limits — clamp at range boundaries regardless of zone
             at_ceiling = cur_mm <= self.cfg.soft_min_mm and err < 0
             at_floor = cur_mm >= self.cfg.soft_max_mm and err > 0
             if at_ceiling or at_floor:
+                self._drive_since = None
                 self._bus.write("Goal_Velocity", self.cfg.name, 0)
             elif abs_err <= self.cfg.on_target_mm:
                 # Zone A
+                self._drive_since = None
                 self._bus.write("Goal_Velocity", self.cfg.name, 0)
             else:
                 if abs_err < self.cfg.near_target_threshold_mm:
@@ -290,6 +321,20 @@ class LiftAxis:
                     v_limit = int(self.cfg.v_max * self.cfg.max_cmd_vel_frac)
                     v_cmd = self.cfg.kp_vel * err
                     v_cmd = max(-float(v_limit), min(float(v_limit), v_cmd))
+
+                if self.cfg.stall_guard_s > 0:
+                    if self._drive_since is None or abs(cur_mm - self._drive_ref_mm) >= self.cfg.stall_move_mm:
+                        self._drive_since, self._drive_ref_mm = now, cur_mm  # moving (or just started)
+                    elif now - self._drive_since >= self.cfg.stall_guard_s:
+                        self._bus.write("Goal_Velocity", self.cfg.name, 0)
+                        self._stall_halt_until = now + self.cfg.stall_halt_s
+                        self._drive_since = None
+                        logger.error(
+                            f"LiftAxis: driven for {self.cfg.stall_guard_s:.0f}s without moving "
+                            f"(at {cur_mm:.1f} mm, target {target_mm:.1f} mm) -- stopping for "
+                            f"{self.cfg.stall_halt_s:.0f}s to protect the motor"
+                        )
+                        return
 
                 sign = -1 if self.cfg.home_at_top else 1
                 self._bus.write(
@@ -317,6 +362,14 @@ class LiftAxis:
             self._bus.write("Goal_Velocity", self.cfg.name, v * sign * self.cfg.dir_sign)
 
     def home(self, use_current: bool = True) -> None:
+        """Home the lift; if anything goes wrong (an error, Ctrl+C) the velocity command is zeroed before it propagates."""
+        try:
+            self._home_impl(use_current)
+        except BaseException:
+            self.zero_velocity()
+            raise
+
+    def _home_impl(self, use_current: bool = True) -> None:
         """
         ORIGINAL home() method — not modified.
         Only additions: _homed=True flag and optional freeze_after_home at the end.
@@ -366,6 +419,9 @@ class LiftAxis:
             if stuck >= stuck_required:
                 break
 
+        self._update_extended_ticks()
+        stall_deg = self._extended_deg()  # position of the hard stop
+
         # Backoff: move opposite direction to unjam motor from limit
         if self.cfg.home_backoff_mm > 0:
             backoff_vel = -home_vel
@@ -380,20 +436,20 @@ class LiftAxis:
                     break
             logger.info(f"LiftAxis: backoff {moved_mm:.1f} mm from limit")
 
-        # Stop, then disable torque so gravity pulls lift down to safe position (home is at top)
+        # Stop, then (unless release_torque_after_home is False) disable torque so gravity pulls the
+        # lift down to a safe position (home is at top)
         self._bus.write("Goal_Velocity", name, 0)
         time.sleep(0.5)
-        try:
-            self._bus.write("Torque_Enable", name, 0)
-        except Exception:
-            pass
+        if self.cfg.release_torque_after_home:
+            with contextlib.suppress(Exception):
+                self._bus.write("Torque_Enable", name, 0)
 
         self._update_extended_ticks()
-        self._z0_deg = self._extended_deg()
+        self._z0_deg = stall_deg if self.cfg.zero_at_limit else self._extended_deg()
 
         # ADDED: two lines only
         self._homed = True
-        self._cached_height_mm = 0.0
+        self._cached_height_mm = self.get_height_mm() if self.cfg.zero_at_limit else 0.0
         if self.cfg.home_at_top:
             logger.info(f"LiftAxis: homed — 0 mm = top, {self.cfg.soft_max_mm:.0f} mm = bottom")
         else:
@@ -425,12 +481,36 @@ class LiftAxis:
         self._frozen = False
         logger.info("LiftAxis: unfrozen — resuming normal control")
 
-    def stop(self) -> None:
-        """Best-effort stop (sets Goal_Velocity=0)."""
+    def zero_velocity(self, *, quiet: bool = False) -> bool:
+        """Write Goal_Velocity=0 straight to the motor. Returns whether the write went through; never raises.
+
+        The lift runs in velocity mode and a Feetech motor keeps its last velocity command if the host program
+        dies, so this is the one write that must always be tried. Unlike ``configure()`` and ``home()`` it never
+        changes the operating mode or moves the axis.
+        """
         if not self.enabled:
-            return
+            return False
         try:
-            self.configure()
             self._bus.write("Goal_Velocity", self.cfg.name, 0)
-        except Exception:
-            pass
+        except Exception as e:
+            log = logger.debug if quiet else logger.warning
+            log(f"LiftAxis: could not zero the lift velocity: {type(e).__name__}: {e}")
+            return False
+        self._cached_velocity = 0.0
+        self._filtered_velocity = 0.0
+        self._drive_since = None
+        return True
+
+    def emergency_stop(self) -> None:
+        """Zero the velocity (retrying once) and refuse every further command until ``clear_emergency_stop()``."""
+        self._estopped = True
+        if not self.zero_velocity():
+            self.zero_velocity()
+
+    def clear_emergency_stop(self) -> None:
+        self._estopped = False
+
+    def stop(self) -> None:
+        """Best-effort stop (sets Goal_Velocity=0). Does not configure or home the lift; teardown calls it
+        after the motor may already be hidden from the bus, so a failed write is only logged at debug level."""
+        self.zero_velocity(quiet=True)

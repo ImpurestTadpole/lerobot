@@ -163,6 +163,21 @@ class OB15Config(RobotConfig):
     port2: str | None = None
 
     camera_start_order: tuple[str, ...] | None = ("head", "left_wrist", "right_wrist")
+    # Anti-flicker for the cameras (see camera_tuning.py). None leaves the camera defaults alone.
+    camera_power_line_hz: int | None = None  # 50 or 60: the mains frequency of the lights
+    wrist_exposure_ms: float | None = None  # lock the wrist (OpenCV) cameras to this exposure; 8.33 = one 120 Hz flicker period
+    # How a control tick takes camera frames (see camera_frames.py):
+    #   "fresh"  - wait for the next new frame of every camera (the original behaviour; the loop is slaved to the
+    #              slowest camera and a tick that just missed a frame waits a whole frame period)
+    #   "latest" - take the newest buffered frame immediately; the loop's own clock sets the rate. A camera that
+    #              produced no new frame since the last tick yields the same frame again; that is counted and
+    #              logged per camera, never silent.
+    camera_read_mode: str = "fresh"
+    camera_max_age_ms: float = 150.0  # "latest" mode: a buffered frame older than this counts as a camera stall
+    # "latest" mode: when a camera has no new frame since the last tick, wait at most this long (ms) for one before
+    # reusing the old frame. 0 = never wait (every miss is a repeated frame). A few ms removes almost all repeats
+    # from a camera whose true rate is a hair below the loop rate, and the wait is bounded, so it cannot stall a tick.
+    camera_fresh_wait_ms: float = 0.0
     camera_start_delay_s: float = 2.0  # Increased delay to allow cameras to initialize properly (especially right_wrist)
     disable_torque_on_disconnect: bool = True
 
@@ -260,3 +275,8 @@ class OB15ClientConfig(RobotConfig):
     lift_axis: LiftAxisConfig = field(default_factory=LiftAxisConfig)
     polling_timeout_ms: int = 15
     connect_timeout_s: int = 5
+    # Fields read by OB15Client but previously missing here, which made the client crash on
+    # construction (AttributeError). Speed levels mirror the LeKiwi client defaults.
+    use_head: bool = True
+    base_speed_xy: tuple[float, ...] = (0.1, 0.2, 0.3)
+    base_speed_theta_deg: tuple[float, ...] = (30.0, 60.0, 90.0)

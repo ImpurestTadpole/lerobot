@@ -131,6 +131,7 @@ from lerobot.robots import (  # noqa: F401
     koch_follower,
     make_robot_from_config,
     ob15,
+    ob15_arms,
     omx_follower,
     openarm_follower,
     reachy2,
@@ -340,6 +341,8 @@ def record_loop(
         f"{k}_depth" for k, cam in getattr(robot, "cameras", {}).items() if getattr(cam, "use_depth", False)
     ]
     last_camera_obs = {}
+    backfilled: dict[str, int] = {}
+    read_depth_this_frame = True
 
     while timestamp < control_time_s:
         start_loop_t = time.perf_counter()
@@ -387,6 +390,15 @@ def record_loop(
                 elif cam_key in last_camera_obs:
                     obs[cam_key] = last_camera_obs[cam_key]
                     logging.debug(f"Camera key '{cam_key}' missing this tick, reusing last known-good frame")
+                    # A colour frame (or a depth frame that was meant to be read) that fell back to the previous
+                    # tick's frame is a repeated frame in the dataset: count it and say so, do not hide it.
+                    if not (cam_key.endswith("_depth") and not read_depth_this_frame):
+                        backfilled[cam_key] = backfilled.get(cam_key, 0) + 1
+                        if backfilled[cam_key] in (1, 10, 100) or backfilled[cam_key] % 1000 == 0:
+                            logging.warning(
+                                f"Camera '{cam_key}' gave no frame this tick; the previous frame was recorded again "
+                                f"({backfilled[cam_key]} time(s) this phase)."
+                            )
 
         with timer.section("process_obs"):
             # Applies a pipeline to the raw robot observation, default is IdentityProcessor
@@ -537,6 +549,45 @@ def record_loop(
             last_status_print = timestamp
 
 
+def _log_camera_frame_report(robot: Robot) -> None:
+    """Log how many camera frames were reused (robots with a non-blocking camera mode only)."""
+    report = getattr(robot, "camera_frame_report", None)
+    if report is None:
+        return
+    try:
+        lines = report()
+    except Exception as e:  # a report must never break the shutdown path
+        logging.debug(f"camera frame report failed: {e}")
+        return
+    if lines:
+        logging.info("Camera frame report (repeated = no new frame since the previous tick):\n" + "\n".join(lines))
+
+
+def _log_image_writer_backlog(dataset: LeRobotDataset | None, fps: int) -> None:
+    """Log how many image files the async writer still had queued when the episode's control loop ended.
+
+    A backlog that keeps growing means the writer cannot keep up with the camera rate and is eating the CPU the
+    control loop needs; ``save_episode`` then has to wait for it. Must never raise.
+    """
+    try:
+        writer = dataset.writer.image_writer if dataset is not None and dataset.writer is not None else None
+        if writer is None:
+            return
+        queued = writer.queue.qsize()
+        n_images = max(1, len(dataset.meta.camera_keys))
+        logging.info(
+            f"Image writer backlog at the end of the episode: {queued} files queued "
+            f"(~{queued / n_images / fps:.1f} s of frames behind)"
+        )
+    except Exception as e:
+        logging.debug(f"image writer backlog unavailable: {e}")
+
+
+def _episode_end_event(events: dict) -> str:
+    """VR headset cue for the end of an episode attempt: "restart" when it is being discarded, else "stop"."""
+    return "restart" if events.get("rerecord_episode") else "stop"
+
+
 @parser.wrap()
 def record(
     cfg: RecordConfig,
@@ -647,6 +698,9 @@ def record(
                 encoder_queue_maxsize=cfg.dataset.encoder_queue_maxsize,
             )
 
+        if cfg.dataset.video_frame_format != "png" and dataset.writer is not None:
+            dataset.writer.video_frame_format = cfg.dataset.video_frame_format
+
         # Connect the teleoperator before the robot so the robot isn't left idle (and possibly
         # tripping a firmware watchdog) during teleop init. Matches lerobot_teleoperate.py.
         if teleop is not None:
@@ -656,6 +710,19 @@ def record(
             else:
                 teleop.connect()
         robot.connect()
+
+        if dataset is not None and hasattr(robot, "hold_metadata"):
+            # OB15 arms-only: remember the head/lift hold pose with the dataset (see robots/ob15_arms/arms_only.py).
+            from lerobot.robots.ob15_arms.arms_only import write_hold_file
+
+            robot_cfg = robot.config
+            write_hold_file(
+                dataset.root,
+                robot.hold_metadata(),
+                overwrite=cfg.dataset.overwrite_hold,
+                head_tol=robot_cfg.head_tol,
+                lift_tol=robot_cfg.lift_tol_mm,
+            )
 
         # Use VR listener if VR teleop, otherwise use keyboard listener
         if isinstance(teleop, XLerobotVRTeleop):
@@ -760,8 +827,9 @@ def record(
                     timer=timer,
                     depth_read_interval=cfg.dataset.depth_read_interval,
                 )
+                _log_image_writer_backlog(dataset, cfg.dataset.fps)
                 if isinstance(teleop, Teleoperator) and hasattr(teleop, "send_episode_event"):
-                    teleop.send_episode_event("stop")
+                    teleop.send_episode_event(_episode_end_event(events))
                 events.pop("_episode_idx", None)
                 events.pop("_episode_total", None)
                 events.pop("_recording_active", None)
@@ -828,6 +896,7 @@ def record(
             # First, and inside this guard: the summary is most useful before the video encoding
             # and the hub upload scroll it away.
             timer.log_run_summary()
+            _log_camera_frame_report(robot)
 
             log_say("Stop recording", cfg.play_sounds, blocking=True)
 

@@ -134,6 +134,23 @@ def _validate_trained_rtc_rollout_config(policy_config, inference_config: RTCInf
         )
 
 
+# Scalar state channels a rollout feeds the policy: joint positions, base velocities and the gantry/lift
+# height (``gantry.height_mm``). Datasets recorded from the OB15 robots include the lift height in
+# ``observation.state``, so dropping it here would hand a trained policy one value too few.
+_ROLLOUT_STATE_SUFFIXES = (".pos", ".vel", ".height_mm")
+
+
+def _select_state_features(
+    all_obs_features: dict[str, type | tuple], *, keep_all: bool = False
+) -> dict[str, type | tuple]:
+    """Camera shapes plus the scalar state channels a rollout passes to the policy."""
+    return {
+        k: v
+        for k, v in all_obs_features.items()
+        if isinstance(v, tuple) or (v is float and (keep_all or k.endswith(_ROLLOUT_STATE_SUFFIXES)))
+    }
+
+
 def _align_to_checkpoint_order(
     features: dict[str, type | tuple], policy_action_names: list[str] | None, *, what: str
 ) -> dict[str, type | tuple]:
@@ -569,12 +586,7 @@ def build_rollout_context(
         # Retain position and base-velocity channels for mobile manipulators, plus cameras.
         # Keep every state and action component of a sim robot, whatever its name.
         keep_all = isinstance(robot, SimRobot)
-        all_obs_features = robot.observation_features
-        observation_features_hw: dict[str, type | tuple] = {
-            k: v
-            for k, v in all_obs_features.items()
-            if isinstance(v, tuple) or (v is float and (keep_all or k.endswith((".pos", ".vel"))))
-        }
+        observation_features_hw = _select_state_features(robot.observation_features, keep_all=keep_all)
         policy_action_names = getattr(policy_config, "action_feature_names", None)
         checkpoint_order = list(policy_action_names) if policy_action_names else None
         observation_features_hw = _align_to_checkpoint_order(

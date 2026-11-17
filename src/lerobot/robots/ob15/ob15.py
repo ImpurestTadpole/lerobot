@@ -14,9 +14,13 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+import atexit
+import contextlib
 import logging
 import os
+import signal
 import sys
+import threading
 import time
 from concurrent.futures import ThreadPoolExecutor
 from functools import cached_property
@@ -26,6 +30,8 @@ from typing import Any
 import numpy as np
 
 from lerobot.cameras.utils import make_cameras_from_configs
+from .camera_frames import CameraFrameTracker, read_color_latest
+from .camera_tuning import tune_camera
 from lerobot.motors import Motor, MotorCalibration, MotorNormMode
 from lerobot.motors.feetech import (
     FeetechMotorsBus,
@@ -51,6 +57,8 @@ class OB15(Robot):
 
     config_class = OB15Config
     name = "ob15"
+    # False for variants that never drive the base (ob15_arms): wheel motors are left off the bus.
+    uses_base = True
 
     def __init__(self, config: OB15Config):
         super().__init__(config)
@@ -107,6 +115,11 @@ class OB15(Robot):
             "head": self.config.head_port,
         }
 
+        if not self.uses_base:
+            # Variants without a base (ob15_arms): the wheel motors are not part of the bus, so a
+            # missing/unpowered wheel cannot fail the connect handshake and nothing writes to them.
+            group_motors["base"] = {}
+
         # Optional gantry / Z lift axis: attaches to whichever group's bus `lift_axis.bus`
         # names, or its own dedicated port when `lift_axis.bus == "lift"`.
         if self.config.lift_axis.enabled:
@@ -161,12 +174,17 @@ class OB15(Robot):
         # if the motor is already present).
         self.lift_axis = LiftAxis(self.config.lift_axis, self._group_bus.get("lift"))
         self.lift_axis.attach()
+        self._lift_failsafe_prev: dict[int, Any] = {}
+        self._lift_failsafe_active = False
 
         self.left_arm_motors = list(group_motors["left_arm"])
         self.right_arm_motors = list(group_motors["right_arm"])
         self.head_motors = list(group_motors["head"])
         self.base_motors = list(group_motors["base"])
         self.cameras = make_cameras_from_configs(config.cameras)
+        if config.camera_read_mode not in ("fresh", "latest"):
+            raise ValueError(f"camera_read_mode must be 'fresh' or 'latest', got {config.camera_read_mode!r}")
+        self._frame_tracker = CameraFrameTracker()
 
         # Create persistent thread pool for parallel bus reads (avoid overhead of creating/destroying)
         self._executor = ThreadPoolExecutor(
@@ -242,6 +260,10 @@ class OB15(Robot):
         for bus in self._buses.values():
             bus.connect()
 
+        # A velocity-mode motor keeps its last speed command when the program that set it dies (killed,
+        # terminal closed, crash), so the lift may still be running from an earlier session: stop it first.
+        self._zero_leftover_lift_velocity()
+
         # Check if calibration file exists and ask user if they want to restore it
         if self.calibration_fpath.is_file():
             logger.info(f"Calibration file found at {self.calibration_fpath}")
@@ -305,6 +327,11 @@ class OB15(Robot):
             try:
                 cam.connect()
                 logger.info(f"✅ Camera '{cam_name}' connected successfully")
+                tune_camera(
+                    cam,
+                    self.config.camera_power_line_hz,
+                    self.config.wrist_exposure_ms if "wrist" in cam_name else None,
+                )
             except Exception as e:
                 logger.warning(f"⚠️  Camera '{cam_name}' failed to connect: {e}")
                 logger.warning(f"   Continuing without camera '{cam_name}' - robot will still function")
@@ -312,9 +339,75 @@ class OB15(Robot):
                 if self.config.camera_start_delay_s > 0 and idx < len(ordered_camera_names) - 1:
                     time.sleep(self.config.camera_start_delay_s)
 
-        self.configure()
+        # From here (homing included) a shutdown signal or exit stops the lift instead of leaving it running.
+        self._install_lift_failsafe()
+        try:
+            self.configure()
+        except BaseException:
+            self._remove_lift_failsafe()
+            raise
         self._base_vel_smooth = {"x.vel": 0.0, "y.vel": 0.0, "theta.vel": 0.0}
         logger.info(f"{self} connected.")
+
+    # -- lift failsafe -------------------------------------------------------------------------------
+    _LIFT_FAILSAFE_SIGNALS = ("SIGINT", "SIGTERM", "SIGHUP", "SIGQUIT")
+
+    def _zero_leftover_lift_velocity(self) -> None:
+        if not self.lift_axis.enabled:
+            return
+        self.lift_axis.clear_emergency_stop()
+        if self.lift_axis.zero_velocity():
+            logger.info("LiftAxis: zeroed any leftover velocity command from an earlier session")
+
+    def _lift_signal_handler(self, signum, frame) -> None:
+        """Stop the lift first, then hand the signal on to whatever handler was installed before ours."""
+        try:
+            self.lift_axis.emergency_stop()
+        except Exception:
+            pass
+        previous = self._lift_failsafe_prev.get(signum)
+        if callable(previous):
+            previous(signum, frame)
+        elif previous == signal.SIG_IGN:
+            return
+        elif signum == signal.SIGINT:
+            raise KeyboardInterrupt
+        else:  # default action: put it back and re-deliver so the process ends as it would have
+            signal.signal(signum, signal.SIG_DFL)
+            os.kill(os.getpid(), signum)
+
+    def _lift_atexit_stop(self) -> None:
+        with contextlib.suppress(Exception):
+            self.lift_axis.zero_velocity()
+
+    def _install_lift_failsafe(self) -> None:
+        if not self.lift_axis.enabled or self._lift_failsafe_active:
+            return
+        self._lift_failsafe_active = True
+        atexit.register(self._lift_atexit_stop)
+        if threading.current_thread() is not threading.main_thread():
+            return  # signal handlers can only be set from the main thread
+        for name in self._LIFT_FAILSAFE_SIGNALS:
+            sig = getattr(signal, name, None)
+            if sig is None:
+                continue
+            try:
+                previous = signal.getsignal(sig)
+                signal.signal(sig, self._lift_signal_handler)
+            except (ValueError, OSError):
+                continue
+            self._lift_failsafe_prev[sig] = previous
+
+    def _remove_lift_failsafe(self) -> None:
+        if not self._lift_failsafe_active:
+            return
+        self._lift_failsafe_active = False
+        atexit.unregister(self._lift_atexit_stop)
+        for sig, previous in self._lift_failsafe_prev.items():
+            with contextlib.suppress(ValueError, OSError):
+                if signal.getsignal(sig) == self._lift_signal_handler:  # leave a handler installed after ours alone
+                    signal.signal(sig, previous if previous is not None else signal.SIG_DFL)
+        self._lift_failsafe_prev = {}
 
     @property
     def is_calibrated(self) -> bool:
@@ -723,6 +816,22 @@ class OB15(Robot):
             )
         return dict(self._base_vel_smooth)
 
+    def _read_color(self, cam_key: str, cam) -> Any:
+        """One camera's colour frame for this tick, per ``config.camera_read_mode`` (see camera_frames.py)."""
+        if self.config.camera_read_mode == "fresh":
+            return cam.async_read()
+        return read_color_latest(
+            cam,
+            cam_key,
+            self._frame_tracker,
+            self.config.camera_max_age_ms,
+            self.config.camera_fresh_wait_ms,
+        )
+
+    def camera_frame_report(self) -> list[str]:
+        """Per-camera repeated-frame / error counts of the ``latest`` read mode (empty in ``fresh`` mode)."""
+        return self._frame_tracker.report_lines() if self.config.camera_read_mode == "latest" else []
+
     def get_observation(self, skip_cameras: bool = False, skip_depth: bool = False) -> dict[str, Any]:
         """
         Get robot observation with parallel bus reads and detailed profiling.
@@ -762,7 +871,8 @@ class OB15(Robot):
                 elif group == "head":
                     result["head_pos"] = bus.sync_read("Present_Position", self.head_motors)
                 elif group == "base":
-                    result["base_vel"] = bus.sync_read("Present_Velocity", self.base_motors)
+                    if self.base_motors:
+                        result["base_vel"] = bus.sync_read("Present_Velocity", self.base_motors)
                 elif group == "lift":
                     try:
                         result["lift_pos"] = bus.read(
@@ -801,10 +911,14 @@ class OB15(Robot):
 
         # Process base velocity
         proc_start = time.perf_counter()
-        base_vel = self._wheel_raw_to_body(
-            base_wheel_vel["base_left_wheel"],
-            base_wheel_vel["base_back_wheel"],
-            base_wheel_vel["base_right_wheel"],
+        base_vel = (
+            self._wheel_raw_to_body(
+                base_wheel_vel["base_left_wheel"],
+                base_wheel_vel["base_back_wheel"],
+                base_wheel_vel["base_right_wheel"],
+            )
+            if self.base_motors
+            else {}
         )
 
         left_arm_state = {f"{k}.pos": v for k, v in left_arm_pos.items()}
@@ -829,7 +943,7 @@ class OB15(Robot):
             def read_camera(cam_key, cam):
                 try:
                     if cam.is_connected:
-                        color_frame = cam.async_read()
+                        color_frame = self._read_color(cam_key, cam)
                         # For RealSense cameras with depth enabled, also read depth (unless skipped).
                         # Non-blocking peek (read_latest_depth), not async_read_depth: with
                         # depth_frame_interval > 1 the background thread only decodes a fresh
@@ -919,7 +1033,7 @@ class OB15(Robot):
             present_pos_right = self._group_bus["right_arm"].sync_read("Present_Position", self.right_arm_motors)
 
             # Combine all present positions
-            present_pos = {**present_pos_left, **present_pos_right}
+            present_pos = {f"{k}.pos": v for k, v in {**present_pos_left, **present_pos_right}.items()}
 
             # Ensure safe goal position for each arm
             goal_present_pos = {
@@ -947,7 +1061,7 @@ class OB15(Robot):
         ):
             if raw:
                 pos_by_port.setdefault(self._group_port[group], {}).update(raw)
-        if base_wheel_goal_vel:
+        if base_wheel_goal_vel and self.base_motors:
             vel_by_port.setdefault(self._group_port["base"], {}).update(base_wheel_goal_vel)
 
         for port, values in pos_by_port.items():
@@ -991,6 +1105,8 @@ class OB15(Robot):
         }
 
     def stop_base(self):
+        if not self.base_motors:
+            return
         try:
             base_bus = self._group_bus["base"]
             if base_bus.is_connected:
@@ -1018,6 +1134,7 @@ class OB15(Robot):
                 self.lift_axis.stop()
         except Exception:
             pass
+        self._remove_lift_failsafe()
 
         # Shutdown thread pool
         if hasattr(self, '_executor'):
@@ -1026,6 +1143,8 @@ class OB15(Robot):
         for bus in self._buses.values():
             bus.disconnect(self.config.disable_torque_on_disconnect)
         for cam in self.cameras.values():
-            cam.disconnect()
+            # A camera that failed to connect (connect() continues without it) is not connected here.
+            if cam.is_connected:
+                cam.disconnect()
 
         logger.info(f"{self} disconnected.")

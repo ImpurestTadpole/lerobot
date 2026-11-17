@@ -411,3 +411,58 @@ def test_snapshots_survive_episode_boundaries_without_consuming_summaries(clock,
     assert timer.snapshot() == total
     assert "starved ticks: 1" in cadence_log[0]
     assert "8 ticks" in cadence_log[-1]
+
+
+# ---------------------------------------------------------------------------
+# Rate statistics and the below-target warning
+# ---------------------------------------------------------------------------
+
+
+def _achieved_warnings(caplog):
+    return [r.getMessage() for r in caplog.records if r.levelno >= logging.WARNING and "Achieved" in r.getMessage()]
+
+
+def test_cycle_timer_run_summary_reports_percentiles_and_slow_ticks(caplog, clock):
+    timer = CycleTimer(30.0, 1)
+    with caplog.at_level(logging.INFO, logger=_TIMER_LOGGER):
+        _drive(timer, clock, work=0.010, ticks=90)
+        _drive(timer, clock, work=0.060, ticks=1)  # one tick that costs two frame periods
+        _drive(timer, clock, work=0.010, ticks=9)
+        timer.log_run_summary()
+    summary = _info_messages(caplog)[-1]
+    assert "tick work (ms): mean" in summary and "p99" in summary
+    assert "1/100 ticks (1.0%) over the 33.3 ms budget" in summary
+    assert "tick period (ms, start to start; target 33.3)" in summary
+    assert "slow ticks (>1.5 budgets): 1" in summary
+
+
+def test_cycle_timer_warns_when_the_achieved_rate_is_below_target(caplog, clock):
+    timer = CycleTimer(30.0, 1, records_data=True)
+    with caplog.at_level(logging.WARNING, logger=_TIMER_LOGGER):
+        _drive(timer, clock, work=0.043, ticks=100)  # ~23 Hz: the symptom that motivated this
+        timer.log_run_summary()
+    (message,) = _achieved_warnings(caplog)
+    assert "Achieved 23." in message and "against a 30 Hz target" in message
+    assert "1.29x too fast" in message
+
+
+def test_cycle_timer_stays_quiet_at_the_target_rate_and_on_short_windows(caplog, clock):
+    timer = CycleTimer(30.0, 1)
+    with caplog.at_level(logging.WARNING, logger=_TIMER_LOGGER):
+        _drive(timer, clock, work=0.020, ticks=150)
+        timer.log_run_summary()
+        short = CycleTimer(30.0, 1)
+        _drive(short, clock, work=0.080, ticks=10)  # too short (<2 s measured) to judge
+        short.log_run_summary()
+    assert not _achieved_warnings(caplog)
+
+
+def test_cycle_timer_warns_per_episode_window(caplog, clock):
+    timer = CycleTimer(30.0, 1)
+    with caplog.at_level(logging.WARNING, logger=_TIMER_LOGGER):
+        _drive(timer, clock, work=0.020, ticks=100)  # healthy
+        timer.log_episode_summary("episode 0")
+        _drive(timer, clock, work=0.050, ticks=100)  # slow: its own window
+        timer.log_run_summary()
+    messages = _achieved_warnings(caplog)
+    assert len(messages) == 1 and "episode 0" not in messages[0]

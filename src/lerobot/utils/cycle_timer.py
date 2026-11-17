@@ -26,12 +26,20 @@ from __future__ import annotations
 import contextlib
 import dataclasses
 import logging
+import math
 import time
 from collections.abc import Callable, Iterator
+from typing import ClassVar
 
 from lerobot.utils.robot_utils import precise_sleep
 
 logger = logging.getLogger(__name__)
+
+
+def _pct(sorted_values: list[float], q: float) -> float:
+    """Nearest-rank percentile of an already-sorted, non-empty list."""
+    idx = min(len(sorted_values) - 1, max(0, math.ceil(q / 100 * len(sorted_values)) - 1))
+    return sorted_values[idx]
 
 
 @dataclasses.dataclass
@@ -71,6 +79,17 @@ class CadenceStats:
     sleep: float = 0.0
     sleep_worst: float = 0.0
     sections: dict[str, _SectionStat] = dataclasses.field(default_factory=dict)
+    #: Per-tick loop-body work and tick-start to tick-start period, in seconds, kept for percentiles.
+    #: Capped (see ``SAMPLE_CAP``) so an hours-long run cannot grow without bound.
+    work_samples: list[float] = dataclasses.field(default_factory=list)
+    period_samples: list[float] = dataclasses.field(default_factory=list)
+    #: Ticks whose work alone exceeded the ``1/fps`` budget (not the per-slot overrun, which at
+    #: ``multiplier == 1`` is the same thing but is only reported for interpolating loops).
+    ticks_over_budget: int = 0
+    #: Ticks that started more than ``SLOW_TICK_FACTOR`` budgets after the previous one.
+    slow_ticks: int = 0
+
+    SAMPLE_CAP: ClassVar[int] = 200_000
 
     def record_section(self, name: str, elapsed: float) -> None:
         """Accumulate one timed run of the *name* step."""
@@ -94,6 +113,14 @@ class CadenceStats:
         self.span_misses += other.span_misses
         self.sleep += other.sleep
         self.sleep_worst = max(self.sleep_worst, other.sleep_worst)
+        self.ticks_over_budget += other.ticks_over_budget
+        self.slow_ticks += other.slow_ticks
+        room = self.SAMPLE_CAP - len(self.work_samples)
+        if room > 0:
+            self.work_samples.extend(other.work_samples[:room])
+        room = self.SAMPLE_CAP - len(self.period_samples)
+        if room > 0:
+            self.period_samples.extend(other.period_samples[:room])
         for name, stat in other.sections.items():
             mine = self.sections.setdefault(name, _SectionStat())
             mine.calls += stat.calls
@@ -211,6 +238,15 @@ class CycleTimer:
     #: normal scheduler jitter, not a problem — this keeps that case out of default logs
     #: while still surfacing a genuinely struggling loop (e.g. dropping to 20 Hz).
     SLOW_LOOP_TOLERANCE = 0.10
+
+    #: A tick that starts this many budgets after the previous one is a "slow tick" (a whole
+    #: frame period lost), reported separately from the mean rate: a loop can average 29.5 Hz
+    #: and still stutter.
+    SLOW_TICK_FACTOR = 1.5
+
+    #: The achieved rate may fall this fraction short of the target before the end-of-episode
+    #: / end-of-run summary logs a WARNING (0.983 of 30 Hz is 29.5 Hz).
+    BELOW_TARGET_TOLERANCE = 0.017
 
     def __init__(
         self,
@@ -357,8 +393,13 @@ class CycleTimer:
         # Elapsed time is measured tick-start to tick-start, summed per gap rather
         # than taken from a first/last pair so that dropping one is possible at all.
         if self._prev_tick_start is not None and not self._drop_next_gap:
-            self._window.span += self._tick_start - self._prev_tick_start
+            gap = self._tick_start - self._prev_tick_start
+            self._window.span += gap
             self._window.span_ticks += 1
+            if len(self._window.period_samples) < CadenceStats.SAMPLE_CAP:
+                self._window.period_samples.append(gap)
+            if gap > self.cycle_interval * self.SLOW_TICK_FACTOR:
+                self._window.slow_ticks += 1
         self._drop_next_gap = False
         self._prev_tick_start = self._tick_start
         if new_cycle or self._cycle_start is None:
@@ -390,6 +431,10 @@ class CycleTimer:
         stats.work += tick_dt
         if tick_dt > self.tick_interval:
             stats.slot_overruns += 1
+        if tick_dt > self.cycle_interval:
+            stats.ticks_over_budget += 1
+        if len(stats.work_samples) < CadenceStats.SAMPLE_CAP:
+            stats.work_samples.append(tick_dt)
 
         deadline = self._cycle_start + self._ticks_done * self.tick_interval
         if self._ticks_done >= self.multiplier:
@@ -551,6 +596,22 @@ class CycleTimer:
                 f"{stats.group_work / stats.groups_judged * ms:.1f} ms, worst "
                 f"{stats.group_work_worst * ms:.1f} ms"
             )
+        if stats.work_samples:
+            work = sorted(stats.work_samples)
+            lines.append(
+                f"  tick work (ms): mean {stats.work / stats.ticks * ms:.1f} · p50 {_pct(work, 50) * ms:.1f} · "
+                f"p99 {_pct(work, 99) * ms:.1f} · max {work[-1] * ms:.1f} — "
+                f"{stats.ticks_over_budget}/{stats.ticks} ticks "
+                f"({100 * stats.ticks_over_budget / stats.ticks:.1f}%) over the {self.cycle_interval * ms:.1f} ms budget"
+            )
+        if stats.period_samples:
+            period = sorted(stats.period_samples)
+            lines.append(
+                f"  tick period (ms, start to start; target {self.cycle_interval * ms:.1f}): "
+                f"mean {sum(period) / len(period) * ms:.1f} · p50 {_pct(period, 50) * ms:.1f} · "
+                f"p99 {_pct(period, 99) * ms:.1f} · max {period[-1] * ms:.1f} — "
+                f"slow ticks (>{self.SLOW_TICK_FACTOR:g} budgets): {stats.slow_ticks}"
+            )
         if self.multiplier > 1:
             lines.append(
                 f"  ticks over their {self.tick_interval * ms:.1f} ms slot: "
@@ -584,6 +645,33 @@ class CycleTimer:
             )
         return lines
 
+    def _warn_if_below_target(self, stats: CadenceStats, label: str) -> None:
+        """WARNING when the achieved rate is below the target (see ``BELOW_TARGET_TOLERANCE``).
+
+        Always on the logger, not the ``report`` sink: this is the line a user must not miss.
+        Needs a measured rate and a few seconds of ticks, so a half-second gate-wait phase or a
+        one-tick window never warns.
+        """
+        hz = self._effective_hz(stats)
+        if hz is None or stats.span < 2.0:
+            return
+        policy_hz = hz / self.multiplier
+        if policy_hz >= self.fps * (1.0 - self.BELOW_TARGET_TOLERANCE):
+            return
+        consequence = (
+            f"The dataset is labelled {self.fps:g} fps, so it will play back "
+            f"{self.fps / policy_hz:.2f}x too fast relative to real time."
+            if self.records_data
+            else "Control ran slower than requested."
+        )
+        logger.warning(
+            "Achieved %.2f Hz against a %g Hz target (%s). %s",
+            policy_hz,
+            self.fps,
+            label,
+            consequence,
+        )
+
     def _close_window(self, label: str) -> None:
         """Report the finished window's digest and fold it into the run total."""
         stats = self._window
@@ -591,6 +679,7 @@ class CycleTimer:
             return
         self._windows_closed += 1
         self._report(f"Cadence ({label}): {self._summary_line(stats)}")
+        self._warn_if_below_target(stats, label)
         self._run.fold(stats)
         self._window = CadenceStats()
 
@@ -638,3 +727,5 @@ class CycleTimer:
         closed = self._windows_closed
         heading = f"whole run, {closed} episode{'s' if closed != 1 else ''}" if closed else "whole run"
         self._report("\n".join(self._summary_lines(self._run, heading)))
+        if not closed:  # with episode boundaries every window already had its own check
+            self._warn_if_below_target(self._run, "whole run")
