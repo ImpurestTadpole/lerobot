@@ -23,6 +23,8 @@
 [MolmoAct2](https://allenai.org/blog/molmoact2) is an open robotics foundation model from the Allen Institute for AI (Ai2) that maps camera images and language instructions to robot action chunks. The LeRobot implementation supports training and evaluation of the regular MolmoAct2 model.
 {% elif model_name == "vla_jepa" %}
 [VLA-JEPA](https://arxiv.org/abs/2602.10098) is a Vision-Language-Action model that combines a Qwen3-VL language backbone with a self-supervised video world model (V-JEPA2) and a flow-matching DiT action head.
+{% elif model_name == "goodview_jepa" %}
+Good-View JEPA is [VLA-JEPA](https://arxiv.org/abs/2602.10098) with a cross-view world-model target: instead of predicting the next V-JEPA2 embeddings of the same camera, the world model predicts what another camera sees, at the same step or one step ahead.
 {% elif model_name == "gaussian_actor" %}
 This is a Gaussian Actor policy (Gaussian policy with a tanh squash) — the policy-side component used by [Soft Actor-Critic (SAC)](https://huggingface.co/papers/1801.01290) and related maximum-entropy continuous-control algorithms.
 {% elif model_name == "pi0_fast" %}
@@ -103,6 +105,7 @@ This policy has been trained and pushed to the Hub using [LeRobot](https://githu
   "pi05": "pi05",
   "molmoact2": "molmoact2",
   "vla_jepa": "vla_jepa",
+  "goodview_jepa": "goodview_jepa",
   "eo1": "eo1",
   "groot": "groot",
   "xvla": "xvla",

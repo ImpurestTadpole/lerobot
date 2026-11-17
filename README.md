@@ -135,6 +135,7 @@ Paths are relative to the repo root. "Status" uses the same legend as above.
 | `src/lerobot/async_inference/` | Policy server + robot client (kept in this fork). Pi0.5 server accepts real camera/state shapes. | ✅ |
 | `src/lerobot/rollout/strategies/dagger.py` | DAgger fixes: honours `push_to_hub`, `max_relative_target` on OB-15, empty teleop actions. | 🧪 |
 | `examples/ros2_bridge/` | ROS 2 Humble (Python 3.10) ↔ LeRobot (Python 3.12) bridge over ZMQ. | 🧪 |
+| `src/lerobot/policies/goodview_jepa/`, `examples/goodview_jepa/` | Good-View JEPA: VLA-JEPA with a cross-view world-model target (predict another camera's view), frame stride and training-time camera blanking. Encoder study scripts. See [docs](./docs/source/goodview_jepa.mdx). | 🧪 |
 
 ### Guides, scripts and tests
 

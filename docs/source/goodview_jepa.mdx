@@ -1,0 +1,170 @@
+# Good-View JEPA
+
+**Good-View JEPA** (`goodview_jepa`) is [VLA-JEPA](./vla_jepa) with a different world-model target.
+VLA-JEPA trains its world model to predict the next V-JEPA2 embeddings of the _same_ camera
+views. Good-View JEPA instead predicts what _another_ camera sees, at the same step or one step
+ahead. The idea comes from work on JEPAs and the Platonic representation hypothesis: two
+observations of the same world state (here, two cameras at the same time) make better positive
+pairs than two views of one observation (one camera at two nearby times).
+
+The architecture, weights and processors are VLA-JEPA's. Only three things are added:
+
+| Option               | What it changes                                                               |
+| -------------------- | ----------------------------------------------------------------------------- |
+| `cross_view_mode`    | Which camera the world-model predictor sees and which one it must predict     |
+| `video_frame_stride` | Spacing of the world-model clip frames, i.e. how far ahead each prediction is |
+| `camera_blank_prob`  | Training-time blackout of one random camera in the Qwen3-VL input             |
+
+With `cross_view_mode="none"` the world-model loss is identical to VLA-JEPA's, so the two can
+be compared on the same code path.
+
+<Tip warning={true}>
+
+The V-JEPA2 encoder is frozen in both policies. Changing the target changes what the predictor
+and Qwen's action tokens learn, not the encoder's representation. Treat Good-View JEPA as an
+experiment on the training target: whether it helps depends on your cameras and task.
+
+</Tip>
+
+---
+
+## World-model targets
+
+The world model encodes a clip of `num_video_frames` frames per camera. The encoder groups frames
+in pairs (`tubelet_size = 2`), so an 8-frame clip gives 4 encoded steps: the predictor sees steps
+0-2 and predicts a target for each.
+
+| `cross_view_mode`  | Predictor input                  | Target                                     |
+| ------------------ | -------------------------------- | ------------------------------------------ |
+| `none`             | every view, steps 0..T-2         | the same views, steps 1..T-1 (VLA-JEPA)    |
+| `same_time`        | view `cross_view_source`, 0..T-2 | view `cross_view_dest`, the **same** steps |
+| `future` (default) | view `cross_view_source`, 0..T-2 | view `cross_view_dest`, steps 1..T-1       |
+
+View indices follow the order of the policy's `image_features`. The world model uses the first
+`world_model_num_views` cameras (2 for the published checkpoints), so check the order first:
+
+```python
+from lerobot.datasets.lerobot_dataset import LeRobotDatasetMetadata
+
+print(LeRobotDatasetMetadata("your_org/your_dataset").camera_keys)
+```
+
+`same_time` gives the predictor no reason to use the action tokens (nothing moves between input
+and target), which weakens the latent-action signal VLA-JEPA relies on. `future` keeps it, and is
+the default.
+
+### Prediction horizon
+
+Each prediction looks one encoded step ahead, which is 2 raw frames with the default consecutive
+frames (about 0.07 s at 30 fps). To look further ahead, set `video_frame_stride=k`: the clip uses
+frames `0, k, 2k, ...` and each prediction looks `2k` raw frames ahead. Keep `num_video_frames`
+at the checkpoint's value (8): changing it lengthens the clip and changes the number of action
+tokens, rather than the horizon.
+
+---
+
+## Configuration
+
+`GoodViewJEPAConfig` extends `VLAJEPAConfig` (see [VLA-JEPA](./vla_jepa#configuration) for the
+shared parameters) with:
+
+| Parameter            | Default    | Description                                                                                                                     |
+| -------------------- | ---------- | ------------------------------------------------------------------------------------------------------------------------------- |
+| `cross_view_mode`    | `"future"` | `"none"`, `"same_time"` or `"future"`; see the table above                                                                      |
+| `cross_view_source`  | 0          | World-model view the predictor sees                                                                                             |
+| `cross_view_dest`    | 1          | World-model view it must predict. Both must be real cameras: a padded (duplicated) view raises an error                         |
+| `video_frame_stride` | `None`     | Clip frame spacing. `None` keeps VLA-JEPA's frames; `k` samples `0, k, 2k, ...`                                                 |
+| `camera_blank_prob`  | 0.0        | Per sample, the probability of zeroing one random camera in the Qwen3-VL input during training. World-model clips are untouched |
+
+`freeze_qwen=True` turns VLA-JEPA's world model off, so a cross-view target would do nothing.
+Good-View JEPA raises an error for that combination; use `cross_view_mode="none"` or the
+`vla_jepa` policy if you want a frozen backbone.
+
+---
+
+## Training
+
+### From the pretrained VLA-JEPA checkpoint
+
+The published checkpoints are labelled `vla_jepa`. Convert one once; the weights are copied
+unchanged and only `config.json` is relabelled:
+
+```bash
+python -m lerobot.policies.goodview_jepa.convert_from_vla_jepa \
+  --src lerobot/VLA-JEPA-Pretrain \
+  --dst outputs/goodview_jepa_pretrain
+```
+
+Then fine-tune as you would VLA-JEPA. Any option can be overridden on the command line:
+
+```bash
+lerobot-train \
+  --policy.path=outputs/goodview_jepa_pretrain \
+  --policy.cross_view_mode=future \
+  --policy.cross_view_source=0 \
+  --policy.cross_view_dest=1 \
+  --policy.repo_id=your_org/your_repo \
+  --dataset.repo_id=your_org/your_dataset
+```
+
+The cross-embodiment options (`reinit_modules`) work as described in
+[Fine-tuning on a different embodiment](./vla_jepa#fine-tuning-on-a-different-embodiment).
+
+### Comparing targets
+
+To measure the effect of the target alone, keep the data, seed and steps fixed and vary only
+`cross_view_mode`:
+
+```bash
+for MODE in none same_time future; do
+  lerobot-train \
+    --policy.path=outputs/goodview_jepa_pretrain \
+    --policy.cross_view_mode=$MODE \
+    --policy.repo_id=your_org/goodview_jepa_$MODE \
+    --dataset.repo_id=HuggingFaceVLA/libero \
+    --steps=30000 --seed=0
+done
+```
+
+Differences of about one point on LIBERO are within run-to-run noise at 10 episodes per task;
+use `--eval.n_episodes=50` (per task) and several seeds before drawing conclusions.
+
+### Robustness to a missing camera
+
+Train with `--policy.camera_blank_prob=0.1` to make the policy tolerate a blacked-out camera at
+test time. Compare policies trained with the same value: a policy that never saw a black frame in
+training is being tested off-distribution.
+
+---
+
+## Examples
+
+[`examples/goodview_jepa`](https://github.com/huggingface/lerobot/tree/main/examples/goodview_jepa)
+has a small encoder study that runs on one GPU: a ViT-S JEPA trained with good views (two cameras
+at the same step) or bad views (two crops of one frame), and an evaluation of cross-seed
+alignment and a linear probe to the robot state.
+
+---
+
+## Citation
+
+Good-View JEPA builds on VLA-JEPA; please cite it:
+
+```bibtex
+@misc{sun2026vlajepaenhancingvisionlanguageactionmodel,
+  title         = {VLA-JEPA: Enhancing Vision-Language-Action Model with Latent World Model},
+  author        = {Jingwen Sun and Wenyao Zhang and Zekun Qi and Shaojie Ren and Zezhi Liu and Hanxin Zhu and Guangzhong Sun and Xin Jin and Zhibo Chen},
+  year          = {2026},
+  eprint        = {2602.10098},
+  archivePrefix = {arXiv},
+  primaryClass  = {cs.RO},
+  url           = {https://arxiv.org/abs/2602.10098},
+}
+```
+
+---
+
+## License
+
+The LeRobot integration code follows the **Apache 2.0 License**. Pretrained weights follow the
+license of the VLA-JEPA checkpoint they were converted from.

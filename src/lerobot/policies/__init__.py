@@ -31,6 +31,7 @@ from .fineart_vla.configuration_fineart_vla import FineARTVLAConfig as FineARTVL
 from .flux3.configuration_flux3 import Flux3Config as Flux3Config
 from .g05.configuration_g05 import G05Config as G05Config
 from .gaussian_actor.configuration_gaussian_actor import GaussianActorConfig as GaussianActorConfig
+from .goodview_jepa.configuration_goodview_jepa import GoodViewJEPAConfig as GoodViewJEPAConfig
 from .groot.configuration_groot import GrootConfig as GrootConfig
 from .lawam.configuration_lawam import LaWAMConfig as LaWAMConfig
 from .lingbot_va.configuration_lingbot_va import LingBotVAConfig as LingBotVAConfig
@@ -77,6 +78,7 @@ __all__ = [
     "GaussianActorConfig",
     "G05Config",
     "Evo1Config",
+    "GoodViewJEPAConfig",
     "GrootConfig",
     "LaWAMConfig",
     "LingBotVAConfig",
