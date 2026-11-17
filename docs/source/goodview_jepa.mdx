@@ -3,9 +3,10 @@
 **Good-View JEPA** (`goodview_jepa`) is [VLA-JEPA](./vla_jepa) with a different world-model target.
 VLA-JEPA trains its world model to predict the next V-JEPA2 embeddings of the _same_ camera
 views. Good-View JEPA instead predicts what _another_ camera sees, at the same step or one step
-ahead. The idea comes from work on JEPAs and the Platonic representation hypothesis: two
-observations of the same world state (here, two cameras at the same time) make better positive
-pairs than two views of one observation (one camera at two nearby times).
+ahead. The idea comes from Balestriero and LeCun,
+[_Proving and Improving the Platonic Representation Hypothesis with JEPAs_](https://arxiv.org/abs/2610.39302):
+two observations of the same world state (here, two cameras at the same time) make better positive
+pairs than two views of one observation (see [Fundamentals](#fundamentals)).
 
 The architecture, weights and processors are VLA-JEPA's. Only three things are added:
 
@@ -25,6 +26,36 @@ and Qwen's action tokens learn, not the encoder's representation. Treat Good-Vie
 experiment on the training target: whether it helps depends on your cameras and task.
 
 </Tip>
+
+---
+
+## Fundamentals
+
+A JEPA (Joint-Embedding Predictive Architecture) learns an encoder by making the embeddings of a
+_positive pair_ of inputs predictable from each other, with a regulariser against collapse. The
+paper's LeJEPA recipe uses an invariance term plus SIGReg (which pushes embeddings towards an
+isotropic Gaussian) at weight λ = 0.02, with gradient clipping.
+
+The paper separates two kinds of positive pairs:
+
+- **Good views**: two observations of world states the world itself relates, such as two
+  photographs of one scene. On a robot: two cameras at the same moment.
+- **Bad views**: corruptions of one observation, such as two crops of one photograph. Both views
+  share that observation's nuisance (lighting, sensor noise), which the encoder can then learn.
+
+Under idealised assumptions it proves that JEPAs trained separately with shared good views learn
+the same representation up to one rotation (the Platonic Representation Theorem), that one rotation
+is identified from a few paired examples, and that embedding directions spent on a view's own
+nuisance are lost for alignment. It also shows next-token prediction is a bad-view JEPA. In its
+experiments, good views reached the same cross-modal alignment as next-token prediction with 42x
+fewer samples.
+
+Two limits matter here. The theory does not cover JEPAs with a learned, action-conditioned
+predictor, which is what VLA-JEPA's world model is. And it assumes each view fully determines the
+state and that nuisance is independent per view, while a wrist camera sees only part of the scene
+and lighting changes hit every camera at once. Synchronised cameras and per-camera exposure help.
+The policy's [README](https://github.com/huggingface/lerobot/blob/main/src/lerobot/policies/goodview_jepa/README.md)
+lists the theorems and these limits in more detail.
 
 ---
 
@@ -148,7 +179,19 @@ alignment and a linear probe to the robot state.
 
 ## Citation
 
-Good-View JEPA builds on VLA-JEPA; please cite it:
+Good-View JEPA applies the good-view idea from Balestriero and LeCun to VLA-JEPA; please cite both:
+
+```bibtex
+@misc{balestriero2026platonic,
+  title         = {Proving and Improving the Platonic Representation Hypothesis with JEPAs},
+  author        = {Randall Balestriero and Yann LeCun},
+  year          = {2026},
+  eprint        = {2610.39302},
+  archivePrefix = {arXiv},
+  primaryClass  = {cs.AI},
+  url           = {https://arxiv.org/abs/2610.39302},
+}
+```
 
 ```bibtex
 @misc{sun2026vlajepaenhancingvisionlanguageactionmodel,
