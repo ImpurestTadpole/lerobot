@@ -132,6 +132,12 @@ def estimate_delay(
     delay = math.ceil(turnaround / interval) if turnaround else 0
     if mode is ExecutionMode.RTC_TRAINED:
         delay = min(delay or training_max_delay, training_max_delay, available)
+    else:
+        # A turnaround longer than the remaining continuation cannot overlap more steps than exist.
+        # Uncapped, one slow round trip with short chunks (e.g. 7 steps at 30 Hz over Wi-Fi) sends a
+        # delay above the chunk length, which the server rejects as malformed and ends the session,
+        # instead of the client briefly running out of actions.
+        delay = min(delay, available)
     return delay if available else 0
 
 

@@ -136,6 +136,21 @@ def test_trained_rtc_discards_chunk_measured_above_checkpoint_support():
     assert not trained_overlap_valid(conditioned=3, measured=5, maximum=4, has_previous=True)
 
 
+def test_chunk_and_guided_delay_never_exceed_the_remaining_continuation():
+    """A slow round trip with short chunks must not send a delay longer than the chunk.
+
+    On OB15, VLA-JEPA plays 7-step chunks at 30 Hz; a 0.31 s Wi-Fi turnaround measured 10 steps, the
+    server rejected the request as malformed ("Invalid RTC delay") and the remote session ended.
+    """
+    from lerobot.inference import ExecutionMode, estimate_delay
+
+    for mode in (ExecutionMode.CHUNK, ExecutionMode.RTC_GUIDED):
+        assert estimate_delay(0.31, 1 / 30, mode, 0, available=7) == 7
+        assert estimate_delay(0.31, 1 / 30, mode, 0, available=3) == 3
+        assert estimate_delay(0.09, 1 / 30, mode, 0, available=7) == 3  # unchanged when it fits
+        assert estimate_delay(0.31, 1 / 30, mode, 0, available=0) == 0
+
+
 def test_trained_rtc_clamps_prefix_to_checkpoint_and_queue():
     """Conditioning past the queue tail would hard-inpaint zero padding, so clamp instead."""
     from lerobot.inference import ExecutionMode, estimate_delay
