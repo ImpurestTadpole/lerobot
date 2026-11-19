@@ -327,3 +327,32 @@ def make_vla_jepa_pre_post_processors(
         )
     output_steps.append(steps.to_cpu)
     return make_policy_processor_pipelines(input_steps=input_steps, output_steps=output_steps)
+
+
+def sync_gripper_steps_with_config(config: VLAJEPAConfig, postprocessor: PolicyProcessorPipeline) -> None:
+    """Make a postprocessor loaded from a pretrained checkpoint follow the *active* gripper settings.
+
+    Fine-tuning loads the processors saved with the pretrained checkpoint, so its gripper snap and
+    binarize steps used to survive even when the new run set `pre_snap_gripper_action=False` and
+    `binarize_gripper_action=False`, or when its action layout differs (a 12-D bimanual arm where the
+    inherited index 6 is a shoulder joint). This removes both steps and re-adds them only as the
+    active config asks, at the same positions `make_vla_jepa_pre_post_processors` uses.
+    """
+    steps = [
+        step
+        for step in postprocessor.steps
+        if not isinstance(step, (PreSnapGripperProcessorStep, BinarizeGripperProcessorStep))
+    ]
+    if config.pre_snap_gripper_action or config.binarize_gripper_action:
+        indices = config.resolved_gripper_indices
+        threshold = config.gripper_threshold
+        if config.pre_snap_gripper_action:
+            at = next(
+                (i for i, step in enumerate(steps) if isinstance(step, UnnormalizerProcessorStep)), len(steps)
+            )
+            steps.insert(at, PreSnapGripperProcessorStep(gripper_indices=indices, threshold=threshold))
+        if config.binarize_gripper_action:
+            # Last before the device step, i.e. after unnormalization and the absolute-action step.
+            at = len(steps) - 1 if steps and type(steps[-1]).__name__ == "DeviceProcessorStep" else len(steps)
+            steps.insert(at, BinarizeGripperProcessorStep(gripper_indices=indices, threshold=threshold))
+    postprocessor.steps = steps

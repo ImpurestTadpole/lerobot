@@ -383,7 +383,9 @@ def make_dataloaders(
 
             sc = cfg.source_sampling
             group_weights, repo_to_group = load_source_sampling_config(sc.group_config_path)
-            sources_path = sc.sources_path or str(Path(cfg.dataset.root or "") / "meta" / "cotrain_sources.json")
+            sources_path = sc.sources_path or str(
+                Path(cfg.dataset.root or "") / "meta" / "cotrain_sources.json"
+            )
             episode_groups = build_episode_source_groups(
                 sources_path, repo_to_group, total_episodes=len(dataset.meta.episodes["dataset_from_index"])
             )
@@ -762,6 +764,17 @@ def train(cfg: TrainPipelineConfig) -> None:
             pretrained_revision=active_cfg.pretrained_revision,
             **processor_kwargs,
         )
+
+    if (
+        processor_pretrained_path is not None
+        and not cfg.resume
+        and getattr(active_cfg, "type", None) in ("vla_jepa", "goodview_jepa")
+    ):
+        # The saved postprocessor came from the pretrained checkpoint; its gripper steps must follow
+        # this run's config, not the one the checkpoint was trained with.
+        from lerobot.policies.vla_jepa.processor_vla_jepa import sync_gripper_steps_with_config
+
+        sync_gripper_steps_with_config(active_cfg, postprocessor)
 
     image_augmentation = _make_image_augmentation(cfg, dataset, device, accelerator.process_index)
     if image_augmentation is not None and is_main_process():

@@ -356,3 +356,42 @@ def test_observation_delta_indices_collapse_without_world_model():
     cfg = make_config(num_video_frames=8)
     cfg.enable_world_model = False
     assert cfg.observation_delta_indices == [0]
+
+
+def test_sync_drops_inherited_gripper_steps_when_the_active_config_turns_them_off():
+    """Fine-tuning reloads the pretrained postprocessor; its snap steps must not outlive the flags."""
+    from lerobot.policies.vla_jepa.processor_vla_jepa import sync_gripper_steps_with_config
+
+    cfg = make_config(action_dim=7)
+    cfg.pre_snap_gripper_action = True
+    cfg.binarize_gripper_action = True
+    _, post = make_vla_jepa_pre_post_processors(cfg, _stats_for(cfg))
+    assert _find(post, "PreSnapGripperProcessorStep") is not None
+
+    cfg.pre_snap_gripper_action = False
+    cfg.binarize_gripper_action = False
+    sync_gripper_steps_with_config(cfg, post)
+    assert _find(post, "PreSnapGripperProcessorStep") is None
+    assert _find(post, "BinarizeGripperProcessorStep") is None
+    assert _find(post, "UnnormalizerProcessorStep") is not None
+
+
+def test_sync_rebuilds_gripper_steps_for_the_active_layout():
+    from lerobot.policies.vla_jepa.processor_vla_jepa import sync_gripper_steps_with_config
+
+    joints = ["shoulder_pan", "shoulder_lift", "elbow_flex", "wrist_flex", "wrist_roll", "gripper"]
+    old = make_config(action_dim=7)
+    old.pre_snap_gripper_action = True
+    old.binarize_gripper_action = True
+    _, post = make_vla_jepa_pre_post_processors(old, _stats_for(old))
+
+    cfg = make_config(action_dim=12)
+    cfg.action_feature_names = [f"{arm}_arm_{j}.pos" for arm in ("left", "right") for j in joints]
+    cfg.pre_snap_gripper_action = True
+    cfg.binarize_gripper_action = True
+    sync_gripper_steps_with_config(cfg, post)
+    names = [type(step).__name__ for step in post.steps]
+    assert _find(post, "PreSnapGripperProcessorStep").gripper_indices == [5, 11]
+    assert _find(post, "BinarizeGripperProcessorStep").gripper_indices == [5, 11]
+    assert names.index("PreSnapGripperProcessorStep") < names.index("UnnormalizerProcessorStep")
+    assert names.index("BinarizeGripperProcessorStep") > names.index("UnnormalizerProcessorStep")
