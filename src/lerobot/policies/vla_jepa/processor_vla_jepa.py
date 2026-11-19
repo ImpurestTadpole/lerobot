@@ -134,23 +134,34 @@ class PreSnapGripperProcessorStep(ProcessorStep):
     space where 0=open and 1=close.
     """
 
-    def __init__(self, gripper_dim: int = 6, threshold: float = 0.5):
-        self.gripper_dim = gripper_dim
+    def __init__(
+        self,
+        gripper_indices: list[int] | None = None,
+        threshold: float = 0.5,
+        gripper_dim: int | None = None,
+    ):
+        # `gripper_dim` is what pipelines saved before `gripper_indices` existed carry.
+        if gripper_indices is None:
+            gripper_indices = [6 if gripper_dim is None else gripper_dim]
+        self.gripper_indices = [int(index) for index in gripper_indices]
         self.threshold = threshold
 
     def __call__(self, transition: EnvTransition) -> EnvTransition:
         action = _tensor_action(transition)
-        if action is not None and action.shape[-1] > self.gripper_dim:
+        indices = [
+            index for index in self.gripper_indices if index < (0 if action is None else action.shape[-1])
+        ]
+        if action is not None and indices:
             transition = transition.copy()
             a = action.clone()
-            a[..., self.gripper_dim] = (a[..., self.gripper_dim] >= self.threshold).float()
+            a[..., indices] = (a[..., indices] >= self.threshold).float()
             transition[TransitionKey.ACTION] = a
         return transition
 
     def get_config(self) -> dict[str, Any]:
         # Without this the base class serializes `{}` and a reloaded pipeline silently reverts
         # to the class defaults, discarding whatever the training config set.
-        return {"gripper_dim": self.gripper_dim, "threshold": self.threshold}
+        return {"gripper_indices": list(self.gripper_indices), "threshold": self.threshold}
 
     def transform_features(self, features):
         return features
@@ -169,22 +180,33 @@ class BinarizeGripperProcessorStep(ProcessorStep):
     `make_vla_jepa_pre_post_processors` warns when the dataset stats say that is the case.
     """
 
-    def __init__(self, gripper_dim: int = 6, threshold: float = 0.5):
-        self.gripper_dim = gripper_dim
+    def __init__(
+        self,
+        gripper_indices: list[int] | None = None,
+        threshold: float = 0.5,
+        gripper_dim: int | None = None,
+    ):
+        # `gripper_dim` is what pipelines saved before `gripper_indices` existed carry.
+        if gripper_indices is None:
+            gripper_indices = [6 if gripper_dim is None else gripper_dim]
+        self.gripper_indices = [int(index) for index in gripper_indices]
         self.threshold = threshold
 
     def __call__(self, transition: EnvTransition) -> EnvTransition:
         action = _tensor_action(transition)
-        if action is not None and action.shape[-1] > self.gripper_dim:
+        indices = [
+            index for index in self.gripper_indices if index < (0 if action is None else action.shape[-1])
+        ]
+        if action is not None and indices:
             transition = transition.copy()
             a = action.clone()
-            a[..., self.gripper_dim] = 1.0 - 2.0 * (a[..., self.gripper_dim] > self.threshold).float()
+            a[..., indices] = 1.0 - 2.0 * (a[..., indices] > self.threshold).float()
             transition[TransitionKey.ACTION] = a
         return transition
 
     def get_config(self) -> dict[str, Any]:
         # See PreSnapGripperProcessorStep.get_config: `{}` would reload as the class defaults.
-        return {"gripper_dim": self.gripper_dim, "threshold": self.threshold}
+        return {"gripper_indices": list(self.gripper_indices), "threshold": self.threshold}
 
     def transform_features(self, features):
         return features
@@ -262,8 +284,9 @@ def make_vla_jepa_pre_post_processors(
         relative_step,
         steps.normalize,
     ]
-    gripper_dim = config.resolved_gripper_dim
-    _warn_if_gripper_steps_are_misconfigured(config, gripper_dim, dataset_stats)
+    gripper_indices = config.resolved_gripper_indices
+    for gripper_dim in gripper_indices:
+        _warn_if_gripper_steps_are_misconfigured(config, gripper_dim, dataset_stats)
 
     output_steps: list[ProcessorStep] = []
     if config.clip_normalized_actions:
@@ -282,7 +305,7 @@ def make_vla_jepa_pre_post_processors(
             )
     if config.pre_snap_gripper_action:
         output_steps.append(
-            PreSnapGripperProcessorStep(gripper_dim=gripper_dim, threshold=config.gripper_threshold)
+            PreSnapGripperProcessorStep(gripper_indices=gripper_indices, threshold=config.gripper_threshold)
         )
     # NOTE: unlike the default policy unnormalizer (output features only), VLA-JEPA
     # unnormalizes over BOTH input and output features.
@@ -300,7 +323,7 @@ def make_vla_jepa_pre_post_processors(
     )
     if config.binarize_gripper_action:
         output_steps.append(
-            BinarizeGripperProcessorStep(gripper_dim=gripper_dim, threshold=config.gripper_threshold)
+            BinarizeGripperProcessorStep(gripper_indices=gripper_indices, threshold=config.gripper_threshold)
         )
     output_steps.append(steps.to_cpu)
     return make_policy_processor_pipelines(input_steps=input_steps, output_steps=output_steps)

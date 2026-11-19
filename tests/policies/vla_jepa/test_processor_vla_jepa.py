@@ -51,10 +51,12 @@ from lerobot.configs.types import (  # noqa: E402
 )
 from lerobot.policies.vla_jepa.modeling_vla_jepa import VLAJEPAPolicy  # noqa: E402
 from lerobot.policies.vla_jepa.processor_vla_jepa import (  # noqa: E402
+    BinarizeGripperProcessorStep,
     ImagePrepProcessorStep,
+    PreSnapGripperProcessorStep,
     make_vla_jepa_pre_post_processors,
 )
-from lerobot.processor import PolicyProcessorPipeline, ProcessorStepRegistry  # noqa: E402
+from lerobot.processor import PolicyProcessorPipeline, ProcessorStepRegistry, TransitionKey  # noqa: E402
 from lerobot.utils.constants import ACTION, OBS_IMAGES, OBS_STATE  # noqa: E402
 
 RESIZE = (IMAGE_SIZE // 2, IMAGE_SIZE // 2)  # (4, 4)
@@ -243,7 +245,7 @@ def test_gripper_steps_survive_a_save_load_round_trip(tmp_path):
     for class_name in ("PreSnapGripperProcessorStep", "BinarizeGripperProcessorStep"):
         step = _find(reloaded, class_name)
         assert step is not None, class_name
-        assert (step.gripper_dim, step.threshold) == (5, 0.25), class_name
+        assert (step.gripper_indices, step.threshold) == ([5], 0.25), class_name
 
 
 def test_gripper_steps_default_off():
@@ -270,6 +272,47 @@ def test_gripper_dim_resolved_from_action_names():
     cfg.gripper_dim = 6
     cfg.action_feature_names = ["shoulder.pos", "elbow.pos", "gripper.pos", "wrist.pos"]
     assert cfg.resolved_gripper_dim == 2
+
+
+def test_bimanual_grippers_resolve_by_name_never_index_6():
+    """OB15-style 12-D bimanual action: index 6 is right_arm_shoulder_pan, not a gripper.
+
+    The checkpoints converted from LIBERO carried `gripper_dim=6`, so the snap step threw the
+    right shoulder to one end of its range on every action (38 deg open-loop error on that joint).
+    """
+    joints = ["shoulder_pan", "shoulder_lift", "elbow_flex", "wrist_flex", "wrist_roll", "gripper"]
+    cfg = make_config(action_dim=12)
+    cfg.action_feature_names = [f"{arm}_arm_{j}.pos" for arm in ("left", "right") for j in joints]
+    assert cfg.resolved_gripper_indices == [5, 11]
+    cfg.pre_snap_gripper_action = True
+    cfg.validate_features()
+
+    step = PreSnapGripperProcessorStep(gripper_indices=cfg.resolved_gripper_indices, threshold=0.5)
+    action = torch.full((1, 12), 0.3)
+    out = step({TransitionKey.ACTION: action})[TransitionKey.ACTION]
+    assert out[0, 6] == pytest.approx(0.3)  # the shoulder is untouched
+    assert out[0, 5] == 0 and out[0, 11] == 0
+
+
+def test_snap_refuses_to_guess_an_index_for_an_unnamed_non_7d_action():
+    cfg = make_config(action_dim=12)
+    cfg.action_feature_names = []
+    assert cfg.resolved_gripper_indices == []
+    cfg.binarize_gripper_action = True
+    with pytest.raises(ValueError, match="no gripper index"):
+        cfg.validate_features()
+
+
+def test_explicit_gripper_indices_win():
+    cfg = make_config(action_dim=12)
+    cfg.gripper_indices = [11]
+    assert cfg.resolved_gripper_indices == [11]
+
+
+def test_pipelines_saved_with_gripper_dim_still_load():
+    """Older saved postprocessors carry `gripper_dim`; they keep loading as a one-index list."""
+    assert PreSnapGripperProcessorStep(gripper_dim=3).gripper_indices == [3]
+    assert BinarizeGripperProcessorStep(gripper_dim=3).gripper_indices == [3]
 
 
 def test_physical_range_mismatch_warns(caplog):

@@ -130,6 +130,9 @@ class VLAJEPAConfig(PreTrainedConfig):
     # Action-dimension names identifying the gripper. When these match `action_feature_names`,
     # the resolved index wins over `gripper_dim`.
     gripper_joint_names: list[str] = field(default_factory=lambda: ["gripper"])
+    # Explicit gripper indices for the snap/binarize steps. Empty means: resolve them from
+    # `action_feature_names` (every dimension whose name matches `gripper_joint_names`).
+    gripper_indices: list[int] = field(default_factory=list)
     dtype: torch.dtype | None = torch.bfloat16
 
     # Deprecated and ignored: superseded by `dtype`. Declared only so configs written before the
@@ -184,20 +187,32 @@ class VLAJEPAConfig(PreTrainedConfig):
         return self.world_model_num_views or self.jepa_tubelet_size
 
     @property
-    def resolved_gripper_dim(self) -> int:
-        """Gripper index, resolved from `action_feature_names` when possible.
+    def resolved_gripper_indices(self) -> list[int]:
+        """Action indices the gripper snap/binarize steps apply to.
 
-        Falls back to the raw `gripper_dim` when dataset metadata is unavailable (for example
-        when a saved processor pipeline is rebuilt without a dataset attached).
+        Order of precedence: explicit `gripper_indices`; every dimension of `action_feature_names`
+        whose name matches `gripper_joint_names` (a bimanual robot has two); and only when the
+        names are unknown, `gripper_dim` for the 7-D single-arm layout it was written for
+        (LIBERO/DROID). Any other action size gets no index rather than a guess: on a 12-D
+        bimanual arm index 6 is a shoulder joint, and snapping it to 0/1 throws the arm across its
+        range on every step.
         """
-        if not self.action_feature_names or not self.gripper_joint_names:
-            return self.gripper_dim
-        wanted = [name.lower() for name in self.gripper_joint_names if name]
-        for index, name in enumerate(self.action_feature_names):
-            lowered = str(name).lower()
-            if any(token == lowered or token in lowered for token in wanted):
-                return index
-        return self.gripper_dim
+        if self.gripper_indices:
+            return list(self.gripper_indices)
+        if self.action_feature_names:
+            wanted = [name.lower() for name in self.gripper_joint_names if name]
+            return [
+                index
+                for index, name in enumerate(self.action_feature_names)
+                if any(token == str(name).lower() or token in str(name).lower() for token in wanted)
+            ]
+        return [self.gripper_dim] if self.action_dim == 7 else []
+
+    @property
+    def resolved_gripper_dim(self) -> int:
+        """First resolved gripper index (kept for callers that expect a single gripper)."""
+        indices = self.resolved_gripper_indices
+        return indices[0] if indices else self.gripper_dim
 
     def validate_features(self) -> None:
         if not self.image_features:
@@ -210,11 +225,18 @@ class VLAJEPAConfig(PreTrainedConfig):
         # The gripper steps silently no-op when the index is out of range, which reads as
         # "binarization ran" while nothing happened. Fail loudly at construction instead.
         if self.pre_snap_gripper_action or self.binarize_gripper_action:
-            gripper_dim = self.resolved_gripper_dim
-            if gripper_dim >= self.action_dim:
+            indices = self.resolved_gripper_indices
+            if not indices:
                 raise ValueError(
-                    f"`gripper_dim` ({gripper_dim}) is out of range for a {self.action_dim}-dim "
-                    f"action. Set `gripper_dim`/`gripper_joint_names` to the real gripper index, "
+                    f"`pre_snap_gripper_action`/`binarize_gripper_action` is on but no gripper index "
+                    f"could be resolved for this {self.action_dim}-dim action. Set `gripper_indices`, or "
+                    f"name the gripper joints via `gripper_joint_names`, or disable both steps."
+                )
+            bad = [index for index in indices if not 0 <= index < self.action_dim]
+            if bad:
+                raise ValueError(
+                    f"`gripper_dim`/`gripper_indices` {bad} out of range for a {self.action_dim}-dim "
+                    f"action. Set `gripper_indices`/`gripper_joint_names` to the real gripper index, "
                     f"or disable `pre_snap_gripper_action`/`binarize_gripper_action`."
                 )
 
