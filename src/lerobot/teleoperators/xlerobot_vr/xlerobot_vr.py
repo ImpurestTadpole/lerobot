@@ -168,6 +168,40 @@ JOINT_CALIBRATION = [
     ['gripper', 0.0, 1.0],           
 ]
 
+def _cartesian_from_joints(kinematics, shoulder_lift: float, elbow_flex: float) -> tuple[float, float]:
+    """End-effector (x, y) whose ``kinematics.inverse_kinematics`` returns these two joints.
+
+    ``SO101Kinematics.forward_kinematics`` is not the exact inverse of its ``inverse_kinematics``
+    (the elbow comes back ~34 deg off), and the teleop steers by IK, so invert IK itself: start from
+    the forward-kinematics guess and refine with a few Newton steps on IK's output.
+    """
+    try:
+        x, y = kinematics.forward_kinematics(shoulder_lift, elbow_flex)
+    except Exception:
+        x, y = 0.1629, 0.1131
+    target = (float(shoulder_lift), float(elbow_flex))
+    h = 1e-5
+    for _ in range(30):
+        j2, j3 = kinematics.inverse_kinematics(x, y)
+        e2, e3 = j2 - target[0], j3 - target[1]
+        if abs(e2) < 1e-4 and abs(e3) < 1e-4:
+            break
+        a2, a3 = kinematics.inverse_kinematics(x + h, y)
+        b2, b3 = kinematics.inverse_kinematics(x, y + h)
+        j11, j12 = (a2 - j2) / h, (b2 - j2) / h
+        j21, j22 = (a3 - j3) / h, (b3 - j3) / h
+        det = j11 * j22 - j12 * j21
+        if abs(det) < 1e-9:
+            break  # singular/clamped pose: keep the closest estimate
+        dx = (j22 * e2 - j12 * e3) / det
+        dy = (-j21 * e2 + j11 * e3) / det
+        step = math.hypot(dx, dy)
+        if step > 0.02:  # stay inside the region where the linearisation holds
+            dx, dy = dx * 0.02 / step, dy * 0.02 / step
+        x, y = x - dx, y - dy
+    return x, y
+
+
 class SimpleTeleopArm:
     """
     A class for controlling a robot arm using VR input with delta action control.
@@ -204,10 +238,21 @@ class SimpleTeleopArm:
             "gripper": initial_obs[f"{prefix}_arm_gripper.pos"],
         }
         
-        # Set initial x/y to fixed values
-        self.current_x = 0.1629
-        self.current_y = 0.1131
-        self.pitch = 0.0
+        # Anchor the IK state at the arm's *current* pose. These used to start at a fixed home
+        # (x=0.1629, y=0.1131, pitch=0), so the first VR delta after a (re)calibration solved IK from
+        # that home and pulled shoulder_lift/elbow_flex/wrist_flex toward it: on a DAgger takeover the
+        # arm visibly jumped to the home pose and that motion was recorded as a correction.
+        self.current_x, self.current_y = _cartesian_from_joints(
+            kinematics, self.joint_positions["shoulder_lift"], self.joint_positions["elbow_flex"]
+        )
+        # wrist_flex is commanded as -shoulder_lift - elbow_flex + pitch; keep it where it is.
+        self.pitch = (
+            self.joint_positions["wrist_flex"]
+            + self.joint_positions["shoulder_lift"]
+            + self.joint_positions["elbow_flex"]
+        )
+        # +-90 deg, widened to the anchored pitch so the clamp cannot itself snap the wrist.
+        self.pitch_limit = max(90.0, abs(self.pitch))
         
         # Delta control state variables for VR input
         self.last_vr_time = 0.0
@@ -363,7 +408,7 @@ class SimpleTeleopArm:
                 delta_pitch = 0.0
             delta_pitch = max(-angle_limit, min(angle_limit, delta_pitch))
             self.pitch += delta_pitch
-            self.pitch = max(-90, min(90, self.pitch))  # Limit pitch range
+            self.pitch = max(-self.pitch_limit, min(self.pitch_limit, self.pitch))  # Limit pitch range
             
             # Update previous value for next frame
             self.prev_wrist_flex = vr_goal.wrist_flex_deg
