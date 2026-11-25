@@ -49,6 +49,21 @@ else:
     Florence2Model = None
 
 
+def drop_padded_steps(pred: Tensor, target: Tensor, action_is_pad: Tensor) -> tuple[Tensor, Tensor]:
+    """Keep only the real action steps, as ``(1, N, D)``: every action space averages over (B, T).
+
+    A batch without a single real step is returned unchanged (its loss has nothing to average over).
+    """
+    valid = ~action_is_pad.to(device=target.device, dtype=torch.bool)
+    if valid.shape != target.shape[:2]:
+        raise ValueError(
+            f"`action_is_pad` shape {tuple(valid.shape)} does not match actions {tuple(target.shape[:2])}."
+        )
+    if not valid.any():
+        return pred, target
+    return pred[valid].unsqueeze(0), target[valid].unsqueeze(0)
+
+
 class XVLAModel(nn.Module):
     """
     XVLA backbone that stitches Florence-2 embeddings with the temporal/action transformer head.
@@ -198,9 +213,13 @@ class XVLAModel(nn.Module):
         domain_id: torch.LongTensor,
         proprio: torch.Tensor,
         action: torch.Tensor,
+        action_is_pad: torch.Tensor | None = None,
     ) -> dict[str, torch.Tensor]:
         """
         Forward pass for the XVLA model.
+
+        Steps flagged by ``action_is_pad`` (B, T) are left out of the loss. They repeat the episode's
+        last action, so training on them teaches the policy to hold still near the episode's end pose.
         """
         target_dtype = self.config.dtype
         image_input = image_input.to(dtype=target_dtype)
@@ -225,6 +244,8 @@ class XVLAModel(nn.Module):
             proprio=proprio_m,
             **enc,
         )
+        if action_is_pad is not None:
+            pred_action, action = drop_padded_steps(pred_action, action, action_is_pad)
         return self.action_space.compute_loss(pred_action, action)
 
     @torch.no_grad()
@@ -431,7 +452,13 @@ class XVLAPolicy(PreTrainedPolicy):
     def forward(self, batch: dict[str, Tensor]) -> tuple[Tensor, dict]:
         inputs = self._build_model_inputs(batch)
         targets = self._prepare_action_targets(batch)
-        losses = self.model(action=targets, **inputs)
+        action_is_pad = batch.get(f"{ACTION}_is_pad")
+        if action_is_pad is not None and action_is_pad.shape[1] != targets.shape[1]:
+            # `_prepare_action_targets` zero-pads or trims to the chunk size: steps it adds are padding too.
+            action_is_pad = action_is_pad[:, : targets.shape[1]]
+            missing = targets.shape[1] - action_is_pad.shape[1]
+            action_is_pad = torch.nn.functional.pad(action_is_pad, (0, missing), value=True)
+        losses = self.model(action=targets, action_is_pad=action_is_pad, **inputs)
         total_loss = sum(losses.values())
 
         log_dict = {k: v.detach().item() for k, v in losses.items()}
