@@ -25,6 +25,7 @@ from lerobot.configs.policies import PreTrainedConfig
 from lerobot.configs.types import FeatureType, NormalizationMode, PolicyFeature
 from lerobot.optim.optimizers import AdamWConfig
 from lerobot.optim.schedulers import CosineDecayWithWarmupSchedulerConfig
+from lerobot.policies.rtc.configuration_rtc import RTCConfig
 from lerobot.utils.constants import ACTION, OBS_STATE
 
 logger = logging.getLogger(__name__)
@@ -134,6 +135,9 @@ class VLAJEPAConfig(PreTrainedConfig):
     # `action_feature_names` (every dimension whose name matches `gripper_joint_names`).
     gripper_indices: list[int] = field(default_factory=list)
     dtype: torch.dtype | None = torch.bfloat16
+    # Real-Time Chunking (guided): steer each new chunk toward the unexecuted part of the previous one.
+    # None = off. The policy server fills this from its `execution.rtc` settings.
+    rtc_config: RTCConfig | None = None
 
     # Deprecated and ignored: superseded by `dtype`. Declared only so configs written before the
     # rename still parse — draccus rejects config.json keys the dataclass no longer declares.

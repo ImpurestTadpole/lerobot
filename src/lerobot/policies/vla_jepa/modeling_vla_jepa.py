@@ -365,8 +365,13 @@ class VLAJEPAModel(nn.Module):
         state: Tensor | None = None,
         *,
         noise: Tensor | None = None,
+        **rtc_kwargs: Any,
     ) -> Tensor:
-        """Predict an action chunk. `images` is per-sample, per-view float [0,1] [C, H, W] tensors."""
+        """Predict an action chunk. `images` is per-sample, per-view float [0,1] [C, H, W] tensors.
+
+        `rtc_kwargs` (rtc_processor, prev_chunk_left_over, inference_delay, execution_horizon) are
+        passed to the action head; without them this is plain flow sampling.
+        """
         if self.config.resize_images_to is not None:
             height, width = self.config.resize_images_to
             images = [
@@ -376,7 +381,10 @@ class VLAJEPAModel(nn.Module):
 
         embodied_action_tokens, _ = self._encode_qwen(images, instructions, need_action_tokens=False)
         return self.action_model.predict_action(
-            embodied_action_tokens.float(), state.float() if state is not None else None, noise=noise
+            embodied_action_tokens.float(),
+            state.float() if state is not None else None,
+            noise=noise,
+            **rtc_kwargs,
         )
 
 
@@ -405,6 +413,17 @@ class VLAJEPAPolicy(PreTrainedPolicy):
         # makes the derived dims visible to the processor factory too.
         self.model = VLAJEPAModel(config)
         self.reset()
+        self.init_rtc_processor()
+
+    def init_rtc_processor(self) -> None:
+        """Guided RTC is available whenever `config.rtc_config` is set (the server sets it per deployment)."""
+        from lerobot.policies.rtc.modeling_rtc import RTCProcessor
+
+        rtc_config = getattr(self.config, "rtc_config", None)
+        self.rtc_processor = RTCProcessor(rtc_config) if rtc_config is not None else None
+
+    def supports_rtc(self) -> bool:
+        return True
 
     def reset(self) -> None:
         self._queues: dict[str, deque[Tensor]] = {ACTION: deque(maxlen=self.config.n_action_steps)}
@@ -544,7 +563,9 @@ class VLAJEPAPolicy(PreTrainedPolicy):
         return self.model.parameters()
 
     @torch.no_grad()
-    def predict_action_chunk(self, batch: dict[str, Tensor], *, noise: Tensor | None = None) -> Tensor:
+    def predict_action_chunk(
+        self, batch: dict[str, Tensor], *, noise: Tensor | None = None, **kwargs: Any
+    ) -> Tensor:
         """LeRobot inference: convert → native predict → return as Tensor.
 
         `noise` is the starting sample of the flow, shaped `(batch_size, chunk_size, action_dim)`.
@@ -554,8 +575,19 @@ class VLAJEPAPolicy(PreTrainedPolicy):
         self._queues = populate_queues(self._queues, batch, exclude_keys=[ACTION])
 
         inputs = self._prepare_model_inputs(batch, training=False)
+        rtc_kwargs: dict[str, Any] = {}
+        rtc_config = getattr(self.config, "rtc_config", None)
+        if rtc_config is not None and rtc_config.enabled and kwargs.get("prev_chunk_left_over") is not None:
+            if getattr(self, "rtc_processor", None) is None:
+                self.init_rtc_processor()
+            rtc_kwargs = {
+                "rtc_processor": self.rtc_processor,
+                "prev_chunk_left_over": kwargs["prev_chunk_left_over"],
+                "inference_delay": kwargs.get("inference_delay") or 0,
+                "execution_horizon": kwargs.get("execution_horizon"),
+            }
         actions = self.model.predict_action(
-            inputs["images"], inputs["instructions"], inputs.get("state"), noise=noise
+            inputs["images"], inputs["instructions"], inputs.get("state"), noise=noise, **rtc_kwargs
         )
         return actions.to(device=self.config.device, dtype=torch.float32)
 

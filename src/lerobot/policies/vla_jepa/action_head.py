@@ -16,7 +16,7 @@ from __future__ import annotations
 
 from collections import OrderedDict
 from dataclasses import dataclass
-from typing import TYPE_CHECKING
+from typing import TYPE_CHECKING, Any
 
 import torch
 import torch.nn.functional as F  # noqa: N812
@@ -329,7 +329,16 @@ class VLAJEPAActionHead(nn.Module):
         state: torch.Tensor | None = None,
         *,
         noise: torch.Tensor | None = None,
+        rtc_processor: Any | None = None,
+        prev_chunk_left_over: torch.Tensor | None = None,
+        inference_delay: int = 0,
+        execution_horizon: int | None = None,
     ) -> torch.Tensor:
+        """Integrate the flow from noise (t=0) to actions (t=1).
+
+        With an `rtc_processor` and a `prev_chunk_left_over` prefix (model coordinates), every step's
+        velocity is guided toward that prefix (Real-Time Chunking); without them this is plain sampling.
+        """
         batch_size = conditioning_tokens.shape[0]
         if noise is None:
             noise = torch.randn(
@@ -347,12 +356,28 @@ class VLAJEPAActionHead(nn.Module):
             timesteps = torch.full(
                 (batch_size,), t_value, device=conditioning_tokens.device, dtype=torch.long
             )
-            hidden_states = self._build_inputs(actions, state, timesteps)
-            pred = self.model(
-                hidden_states=hidden_states,
-                encoder_hidden_states=conditioning_tokens,
-                timestep=timesteps,
-            )
-            pred_velocity = self.action_decoder(pred[:, -self.action_horizon :])
+
+            def velocity(x: torch.Tensor, timesteps: torch.Tensor = timesteps) -> torch.Tensor:
+                pred = self.model(
+                    hidden_states=self._build_inputs(x, state, timesteps),
+                    encoder_hidden_states=conditioning_tokens,
+                    timestep=timesteps,
+                )
+                return self.action_decoder(pred[:, -self.action_horizon :])
+
+            if rtc_processor is not None and prev_chunk_left_over is not None:
+                # Same convention as MolmoAct2: RTC integrates from t=1 (noise) to t=0, this head
+                # from t=0 to t=1, so time and velocity are mirrored around the RTC call.
+                prefix = prev_chunk_left_over.to(device=actions.device, dtype=actions.dtype)
+                pred_velocity = -rtc_processor.denoise_step(
+                    x_t=actions,
+                    prev_chunk_left_over=prefix,
+                    inference_delay=int(inference_delay or 0),
+                    time=1.0 - t_cont,
+                    original_denoise_step_partial=lambda x: -velocity(x),
+                    execution_horizon=execution_horizon,
+                )
+            else:
+                pred_velocity = velocity(actions)
             actions = actions + dt * pred_velocity
         return actions

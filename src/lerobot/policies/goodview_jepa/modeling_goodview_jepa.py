@@ -202,6 +202,7 @@ class GoodViewJEPAPolicy(VLAJEPAPolicy):
         config.validate_features()
         self.model = GoodViewJEPAModel(config)
         self.reset()
+        self.init_rtc_processor()
         self._train_forwards = 0
         self._warmup_hooks: list = []
 
