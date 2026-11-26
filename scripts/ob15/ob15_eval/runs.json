@@ -1,0 +1,105 @@
+[
+ {
+  "id": "rw_none_base",
+  "change": "baseline",
+  "args": [
+   "--policy.cross_view_mode=none"
+  ],
+  "hyp": "Reference: JEPA none, 30-step, 45-demo split. Every other run is compared with this.",
+  "pred": "-"
+ },
+ {
+  "id": "rw_gv_randpair",
+  "change": "1",
+  "args": [
+   "--policy.cross_view_mode=random_pair"
+  ],
+  "hyp": "The narrow head-to-right-wrist target is why Good-View ties. All camera pairs, including the left wrist, give a richer cross-view signal.",
+  "pred": "Same clean held-out error as none; smaller drop under camera freeze and head shift."
+ },
+ {
+  "id": "rw_gv_mixed",
+  "change": "2",
+  "args": [
+   "--policy.cross_view_mode=mixed"
+  ],
+  "hyp": "Good-View replaces the future signal instead of adding to it. Mixing keeps motion learning and adds cross-view alignment.",
+  "pred": "At least as good as none on clean, better under freeze and shift."
+ },
+ {
+  "id": "rw_none_blank15",
+  "change": "4",
+  "args": [
+   "--policy.cross_view_mode=none",
+   "--policy.camera_blank_prob=0.15"
+  ],
+  "hyp": "The model never saw a missing camera, so a dropout confuses it.",
+  "pred": "Smaller drop under camera freeze; small or no loss on clean."
+ },
+ {
+  "id": "rw_none_jitter",
+  "change": "5",
+  "args": [
+   "--policy.cross_view_mode=none",
+   "--policy.per_camera_jitter=true"
+  ],
+  "hyp": "With no augmentation the model is fragile to lighting.",
+  "pred": "Smaller drop under dim / warm / bright; little clean change."
+ },
+ {
+  "id": "rw_gv_mixed_jitter",
+  "change": "2+5",
+  "args": [
+   "--policy.cross_view_mode=mixed",
+   "--policy.per_camera_jitter=true"
+  ],
+  "hyp": "Per-camera jitter makes nuisance differ between views, which is what a cross-view target can remove.",
+  "pred": "Gains more under lighting than rw_none_jitter does."
+ },
+ {
+  "id": "rw_none_wm03",
+  "change": "3",
+  "args": [
+   "--policy.cross_view_mode=none",
+   "--policy.world_model_loss_weight=0.3"
+  ],
+  "hyp": "At weight 0.1 the world-model term barely shapes the features.",
+  "pred": "Differs from 0.1; a middle weight is most robust."
+ },
+ {
+  "id": "rw_none_wm10",
+  "change": "3",
+  "args": [
+   "--policy.cross_view_mode=none",
+   "--policy.world_model_loss_weight=1.0"
+  ],
+  "hyp": "As rw_none_wm03, at a high weight.",
+  "pred": "Too high a weight hurts action accuracy."
+ },
+ {
+  "id": "rw_none_warmup",
+  "change": "6",
+  "args": [
+   "--policy.cross_view_mode=none",
+   "--policy.warmup_new_layers_steps=1000"
+  ],
+  "hyp": "The 4 random layers push bad gradients into the pretrained head while they are poor.",
+  "pred": "Lower error at the same step count; the action head drifts less than 34% from pretrain."
+ },
+ {
+  "id": "rw_pi05_full",
+  "change": "11",
+  "kind": "pi05",
+  "args": [],
+  "hyp": "pi0.5 lost because it was undertrained, not because it is worse.",
+  "pred": "Held-out error falls toward JEPA's."
+ },
+ {
+  "id": "rw_best_seed2",
+  "change": "repeat",
+  "kind": "decide",
+  "args": [],
+  "hyp": "Seed check of the best run (or, if a higher world-model weight beat the base, the best Good-View setting at that weight).",
+  "pred": "Within seed noise of the original."
+ }
+]
