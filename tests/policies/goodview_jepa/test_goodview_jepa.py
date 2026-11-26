@@ -305,3 +305,128 @@ def test_camera_blanking_off_in_eval_and_inference(patch_vla_jepa_external_model
         inputs = policy._prepare_model_inputs(_two_camera_batch(), training=training)
         for views in inputs["images"]:
             assert not any(bool((img == 0).all()) for img in views)
+
+
+# ---------------------------------------------------------------------------
+# Remote-week options: random_pair / mixed targets, per-camera jitter, new-layer warm-up
+# ---------------------------------------------------------------------------
+
+
+def _pair_tags(tensor: torch.Tensor, hidden: int, slots: int = 2) -> list:
+    """Per sample, the (slot-0) tag of each encoded step, plus whether every slot holds the same camera."""
+    b, n, _ = tensor.shape
+    per_slot = tensor.reshape(b, n, slots, hidden)[..., 0]
+    assert torch.equal(per_slot, per_slot[:, :, :1].expand_as(per_slot))
+    return per_slot[:, :, 0].round().tolist()
+
+
+def test_random_pair_uses_every_camera_and_future_target(patch_vla_jepa_external_models, monkeypatch) -> None:
+    h.set_seed_all(0)
+    config = h.make_goodview_config(NUM_FRAMES, cross_view_mode="random_pair")
+    model = GoodViewJEPAModel(config)
+    seen: dict[str, torch.Tensor] = {}
+
+    class _SpyPredictor(nn.Module):
+        def forward(self, frame_tokens, action_tokens):
+            seen["input"] = frame_tokens.detach().clone()
+            return torch.zeros_like(frame_tokens)
+
+    model.video_predictor = _SpyPredictor()
+    real_l1 = torch.nn.functional.l1_loss
+    monkeypatch.setattr(
+        torch.nn.functional,
+        "l1_loss",
+        lambda p, t, **k: (seen.__setitem__("target", t.detach().clone()), real_l1(p, t, **k))[1],
+    )
+    b, views = 64, 3
+    videos = _tagged_videos(b, views, NUM_FRAMES)
+    action_tokens = torch.zeros(b, (NUM_FRAMES - 1) * config.num_action_tokens_per_timestep, 8)
+    model._world_model_loss(videos, action_tokens)
+    hidden = model.video_encoder.config.hidden_size
+    src, dst = model.last_view_pairs
+    assert bool((src != dst).all())
+    assert set(src.tolist()) == {0, 1, 2} and set(dst.tolist()) == {0, 1, 2}
+    inputs, targets = _pair_tags(seen["input"], hidden), _pair_tags(seen["target"], hidden)
+    tokens_per_step = seen["input"].shape[1] // (NUM_FRAMES - 1)
+    for s in range(b):
+        steps_in = inputs[s][::tokens_per_step]
+        steps_out = targets[s][::tokens_per_step]
+        assert steps_in == [100 * s + 10 * int(src[s]) + f for f in range(NUM_FRAMES - 1)]
+        assert steps_out == [100 * s + 10 * int(dst[s]) + f + 1 for f in range(NUM_FRAMES - 1)]
+
+
+def test_mixed_switches_between_none_and_random_pair(patch_vla_jepa_external_models, monkeypatch) -> None:
+    config = h.make_goodview_config(NUM_FRAMES, cross_view_mode="mixed", mixed_none_prob=0.5)
+    model = GoodViewJEPAModel(config)
+    used = []
+    monkeypatch.setattr(model, "_random_pair_loss", lambda *a, **k: used.append("pair") or torch.zeros(()))
+    original = VLAJEPAModel._merge_views
+
+    def _spy_merge(embeddings, b, v):
+        used.append(f"merge{v}")
+        return original(embeddings, b, v)
+
+    monkeypatch.setattr(model, "_merge_views", _spy_merge)
+    action_tokens = torch.zeros(
+        2, (NUM_FRAMES - 1) * config.num_action_tokens_per_timestep, h.QWEN_HIDDEN_SIZE
+    )
+    h.set_seed_all(0)
+    for _ in range(40):
+        model._world_model_loss(torch.rand(2, 3, NUM_FRAMES, 3, 16, 16), action_tokens)
+    assert used.count("pair") > 5 and used.count("merge2") > 5  # both branches; "none" keeps 2 views
+
+
+def test_per_camera_jitter_changes_inputs_independently_not_videos(patch_vla_jepa_external_models) -> None:
+    h.set_seed_all(0)
+    policy = _two_camera_policy(per_camera_jitter=True, per_camera_jitter_prob=1.0)
+    policy.train()
+    batch = _two_camera_batch()
+    for key in (f"{OBS_IMAGES}.laptop", f"{OBS_IMAGES}.wrist"):
+        batch[key] = torch.full_like(batch[key], 0.5)
+    policy.config.per_camera_jitter = False
+    reference = policy._prepare_model_inputs(batch, training=True)
+    policy.config.per_camera_jitter = True
+    jittered = policy._prepare_model_inputs(batch, training=True)
+    for ref_views, views in zip(reference["images"], jittered["images"], strict=True):
+        assert all(not torch.equal(a, b) for a, b in zip(ref_views, views, strict=True))
+        assert not torch.equal(views[0], views[1])  # an independent draw per camera
+    assert torch.equal(reference["videos"], jittered["videos"])  # world-model clips stay clean
+    policy.eval()
+    for training in (True, False):
+        out = policy._prepare_model_inputs(batch, training=training)
+        for ref_views, views in zip(reference["images"], out["images"], strict=True):
+            assert all(torch.equal(a, b) for a, b in zip(ref_views, views, strict=True))
+
+
+def test_warmup_trains_only_the_new_layers_first(patch_vla_jepa_external_models) -> None:
+    from lerobot.policies.goodview_jepa.configuration_goodview_jepa import NEW_ACTION_LAYERS
+
+    h.set_seed_all(0)
+    policy = _two_camera_policy(warmup_new_layers_steps=1)
+    policy.train()
+
+    def grads():
+        policy.zero_grad()
+        loss, _ = policy.forward(_two_camera_batch())
+        loss.backward()
+        new, other = 0.0, 0.0
+        for name, p in policy.named_parameters():
+            if p.grad is None:
+                continue
+            if any(name.endswith(layer) for layer in NEW_ACTION_LAYERS):
+                new += float(p.grad.abs().sum())
+            else:
+                other += float(p.grad.abs().sum())
+        return new, other
+
+    new, other = grads()
+    assert new > 0 and other == 0
+    new, other = grads()
+    assert new > 0 and other > 0
+
+
+def test_new_options_default_off() -> None:
+    c = h.make_goodview_config(NUM_FRAMES)
+    assert (
+        not c.per_camera_jitter and c.warmup_new_layers_steps == 0 and c.cross_view_mode in ("future", "none")
+    )
