@@ -38,10 +38,14 @@ It adds the **OB-15** robot, a Meta Quest VR teleoperator, a co-training data pi
 | Quest VR teleop (`xlerobot_vr`) | ✅ In use | Controls head, lift, base, both arms and grippers at once. |
 | RealSense depth recording | ✅ In use | Depth costs loop rate. Tuned to 424×240 at ~10 Hz. |
 | Whole-body VR datasets → policy | ⚠️ Low success | Head, base and lift drift plus inaccurate grasps. |
-| Arms-only robot (`ob15_arms`) | 🧪 On branches | Fixed head/lift pose per dataset. Policy controls arms only. |
+| Arms-only robot (`ob15_arms`) | ✅ In use | Fixed head/lift pose per dataset. Policy controls arms only. Used for block passing. |
 | Co-training pipeline + workflow UI | 🧪 Built, in testing | Merge, align, retarget, weight and train from one UI. |
 | HVLA (dual-system VLA) | 🧪 Integrated | S2 VLM + S1 action policy. Runs at ~29 Hz on the S1 loop. |
-| DAgger / human-in-the-loop | 🧪 Fixes on branches | Rollout + VR takeover. Several bugs fixed for OB-15. |
+| DAgger / human-in-the-loop | ✅ In use | Rollout + VR takeover; takeover now starts from the arm's current pose. 19 corrections collected for block passing. |
+| VLA-JEPA / Good-View JEPA (`vla_jepa`, `goodview_jepa`) | ✅ In use | Block passing: 5/6 (none) and 3/4 (Good-View) at 7-step chunks; 30-step chunks run smoothly. The two tie so far. |
+| Guided RTC for VLA-JEPA | 🧪 Built, offline only | Chunk-switch jump 1.02° → 0.27° on held-out demos, error unchanged. Not yet run on the robot. |
+| X-VLA, MolmoAct2 baselines | ⚠️ Stalled on the robot | Both learned to hold still at the home pose from padded chunk ends. X-VLA retrained with padding masked; not yet robot-tested. |
+| Offline evaluation + stress tests (`scripts/ob15/`) | 🧪 Built, in testing | Held-out split, chunk jump, camera freeze / shift / lighting, sanity checks; the same perturbations in the policy server. |
 | GEM 7-DOF arm (`gem`, `bi_gem`) | 🧪 Experimental | ODrive + Feetech arm. Unit tests use mocked buses. |
 
 ✅ = used on the robot. ⚠️ = works, but results were poor. 🧪 = built, still being tested.
